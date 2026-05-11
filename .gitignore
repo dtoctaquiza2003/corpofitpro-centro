@@ -1,0 +1,26 @@
+# Entorno virtual
+venv/
+.venv/
+
+# Variables privadas
+.env
+
+# Firebase privado
+firebase/serviceAccountKey.json
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Archivos temporales
+.DS_Store
+Thumbs.db
+
+# VS Code
+.vscode/
+
+# Alembic cache
+.mypy_cache/
+.pytest_cache/
