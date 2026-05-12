@@ -188,6 +188,64 @@ def actualizar_usuario(
 
     return db_usuario
 
+@router.put("/me/perfil", response_model=UsuarioOut)
+def actualizar_mi_perfil(
+    usuario: UsuarioUpdate,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(get_current_user),
+):
+    db_usuario = db.query(Usuario).filter(Usuario.id == current_user.id).first()
+
+    if not db_usuario:
+        raise HTTPException(
+            status_code=404,
+            detail="Usuario no encontrado.",
+        )
+
+    if usuario.email is not None:
+        email_existente = (
+            db.query(Usuario)
+            .filter(
+                Usuario.email == usuario.email,
+                Usuario.id != current_user.id,
+            )
+            .first()
+        )
+
+        if email_existente:
+            raise HTTPException(
+                status_code=400,
+                detail="Ya existe otro usuario con ese email.",
+            )
+
+        db_usuario.email = usuario.email
+
+    if usuario.nombres is not None:
+        db_usuario.nombres = usuario.nombres
+
+    if usuario.apellidos is not None:
+        db_usuario.apellidos = usuario.apellidos
+
+    if "fotourl" in usuario.model_fields_set:
+        foto_anterior = db_usuario.fotourl
+        db_usuario.fotourl = usuario.fotourl
+
+        if usuario.fotourl is None and foto_anterior:
+            try:
+                eliminar_foto_usuario(foto_anterior)
+            except Exception as e:
+                print("No se pudo eliminar la foto anterior:", str(e))
+
+    # Importante:
+    if usuario.password:
+        db_usuario.passwordhash = get_password_hash(usuario.password)
+    # Eso queda solo para el endpoint del jefe.
+
+    db.commit()
+    db.refresh(db_usuario)
+
+    return db_usuario
+
 
 @router.delete("/{usuario_id}")
 def eliminar_usuario(
