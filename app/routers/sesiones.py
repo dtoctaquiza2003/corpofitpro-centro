@@ -28,10 +28,14 @@ def now_ecuador() -> datetime:
     return datetime.now(timezone(timedelta(hours=-5)))
 
 
-def build_sesion_out(sesion: SesionTerapia) -> SesionAtencionOut:
+def build_sesion_out(
+    sesion: SesionTerapia,
+    db: Session,
+) -> SesionAtencionOut:
     paciente_nombre = None
     tratamiento_nombre = None
     precio_sesion_aplicado = None
+    tratamientos_aplicados: list[str] = []
 
     if sesion.paciente:
         paciente_nombre = f"{sesion.paciente.nombres} {sesion.paciente.apellidos}"
@@ -43,6 +47,22 @@ def build_sesion_out(sesion: SesionTerapia) -> SesionAtencionOut:
             precio_sesion_aplicado = float(
                 sesion.tratamiento_paciente.precio_sesion_aplicado
             )
+
+    if sesion.id:
+        tratamientos_db = (
+            db.query(TipoTratamiento.nombre)
+            .join(
+                SesionTratamiento,
+                SesionTratamiento.tratamientoid == TipoTratamiento.id,
+            )
+            .filter(SesionTratamiento.sesionid == sesion.id)
+            .order_by(TipoTratamiento.nombre.asc())
+            .all()
+        )
+
+        tratamientos_aplicados = [
+            item.nombre for item in tratamientos_db if item.nombre
+        ]
 
     return SesionAtencionOut(
         id=sesion.id,
@@ -60,6 +80,7 @@ def build_sesion_out(sesion: SesionTerapia) -> SesionAtencionOut:
         tratamiento=tratamiento_nombre,
         precio_sesion_aplicado=precio_sesion_aplicado,
         estado="FINALIZADA" if sesion.horasalida else "EN_CURSO",
+        tratamientos=tratamientos_aplicados,
     )
 
 
@@ -323,7 +344,7 @@ def iniciar_sesion(
         .first()
     )
 
-    return build_sesion_out(nueva_sesion)
+    return build_sesion_out(nueva_sesion, db)
 
 
 @router.get("/en-curso", response_model=List[SesionAtencionOut])
@@ -345,7 +366,7 @@ def listar_sesiones_en_curso(
         .all()
     )
 
-    return [build_sesion_out(sesion) for sesion in sesiones]
+    return [build_sesion_out(sesion, db) for sesion in sesiones]
 
 @router.put("/{sesion_id}/finalizar", response_model=SesionAtencionOut)
 def finalizar_sesion(
@@ -393,20 +414,38 @@ def finalizar_sesion(
     sesion.horasalida = ahora.time().replace(microsecond=0)
     sesion.escaladolorsalida = data.escaladolorsalida
 
-    if data.tratamientos:
+    # Limpia tratamientos aplicados anteriores por seguridad
+    db.query(SesionTratamiento).filter(
+        SesionTratamiento.sesionid == sesion.id
+    ).delete()
+
+    tratamientos_ids = list(set(data.tratamientos or []))
+
+    if tratamientos_ids:
         tratamientos_validos = (
             db.query(TipoTratamiento)
             .filter(
-                TipoTratamiento.id.in_(data.tratamientos),
+                TipoTratamiento.id.in_(tratamientos_ids),
                 TipoTratamiento.activo == True,
             )
             .all()
         )
 
+        ids_validos = {tratamiento.id for tratamiento in tratamientos_validos}
+
+        ids_invalidos = set(tratamientos_ids) - ids_validos
+
+        if ids_invalidos:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Tratamientos inválidos: {list(ids_invalidos)}",
+            )
+
         for tratamiento in tratamientos_validos:
             sesion_tratamiento = SesionTratamiento(
                 sesionid=sesion.id,
                 tratamientoid=tratamiento.id,
+                intensidad=None,
             )
             db.add(sesion_tratamiento)
 
@@ -492,7 +531,7 @@ def finalizar_sesion(
         .first()
     )
 
-    return build_sesion_out(sesion)
+    return build_sesion_out(sesion, db)
 
 @router.get("/", response_model=List[SesionAtencionOut])
 def listar_sesiones(
@@ -537,4 +576,4 @@ def listar_sesiones(
         .all()
     )
 
-    return [build_sesion_out(sesion) for sesion in sesiones]
+    return [build_sesion_out(sesion, db) for sesion in sesiones]

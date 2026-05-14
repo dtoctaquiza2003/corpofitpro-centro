@@ -46,6 +46,7 @@ class SesionAtencionOut(BaseModel):
     precio_sesion_aplicado: Optional[float] = None
 
     estado: str
+    tratamientos: List[str] = Field(default_factory=list)
 
     model_config = ConfigDict(from_attributes=True)
 
