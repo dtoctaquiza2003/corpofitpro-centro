@@ -19,6 +19,7 @@ from ..schemas.sesion import (
     FinalizarSesionCreate,
     InicioSesionCreate,
     SesionAtencionOut,
+    TipoTratamientoOut,
 )
 
 router = APIRouter(prefix="/api/sesiones", tags=["sesiones"])
@@ -367,6 +368,20 @@ def listar_sesiones_en_curso(
     )
 
     return [build_sesion_out(sesion, db) for sesion in sesiones]
+
+@router.get("/tipos-tratamiento", response_model=List[TipoTratamientoOut])
+def listar_tipos_tratamiento(
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(get_current_user),
+):
+    tratamientos = (
+        db.query(TipoTratamiento)
+        .filter(TipoTratamiento.activo == True)
+        .order_by(TipoTratamiento.nombre.asc())
+        .all()
+    )
+
+    return tratamientos
 
 @router.put("/{sesion_id}/finalizar", response_model=SesionAtencionOut)
 def finalizar_sesion(

@@ -66,3 +66,10 @@ class SesionCreate(BaseModel):
 
 class SesionOut(SesionAtencionOut):
     pass
+
+class TipoTratamientoOut(BaseModel):
+    id: int
+    nombre: str
+    activo: bool
+
+    model_config = ConfigDict(from_attributes=True)
