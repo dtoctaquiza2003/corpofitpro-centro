@@ -1015,21 +1015,19 @@ def reporte_fisioterapeutas_semanal(
         pendiente = max(total_generado - total_pagado, 0.0)
 
         resultado.append(
-            resultado.append(
-                FisioSemanalOut(
-                    terapeutaid=tid,
-                    terapeuta=str(item["terapeuta"]),
-                    consultorioid=item.get("consultorioid"),
-                    consultorio=str(item.get("consultorio") or "Sin consultorio"),
-                    sesiones_realizadas=int(item["sesiones"]),
-                    total_generado=round(total_generado, 2),
-                    total_pagado_pacientes=round(total_pagado, 2),
-                    total_pendiente_pacientes=round(pendiente, 2),
-                    ganancia_fisio_total=round(total_generado * PORCENTAJE_FISIO, 2),
-                    ganancia_fisio_cobrada=round(total_pagado * PORCENTAJE_FISIO, 2),
-                    ganancia_fisio_pendiente=round(pendiente * PORCENTAJE_FISIO, 2),
-                )
-            )   
+            FisioSemanalOut(
+                terapeutaid=tid,
+                terapeuta=str(item["terapeuta"]),
+                consultorioid=item.get("consultorioid"),
+                consultorio=str(item.get("consultorio") or "Sin consultorio"),
+                sesiones_realizadas=int(item["sesiones"]),
+                total_generado=round(total_generado, 2),
+                total_pagado_pacientes=round(total_pagado, 2),
+                total_pendiente_pacientes=round(pendiente, 2),
+                ganancia_fisio_total=round(total_generado * PORCENTAJE_FISIO, 2),
+                ganancia_fisio_cobrada=round(total_pagado * PORCENTAJE_FISIO, 2),
+                ganancia_fisio_pendiente=round(pendiente * PORCENTAJE_FISIO, 2),
+            )
         )
 
     return sorted(
