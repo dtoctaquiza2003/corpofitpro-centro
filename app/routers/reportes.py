@@ -48,6 +48,9 @@ DIAS_SEMANA = [
     "Domingo",
 ]
 
+PORCENTAJE_FISIO = 0.35
+PORCENTAJE_CLINICA = 0.65
+
 
 def _nombre_usuario(usuario: Optional[Usuario]) -> str:
     if not usuario:
@@ -1012,19 +1015,21 @@ def reporte_fisioterapeutas_semanal(
         pendiente = max(total_generado - total_pagado, 0.0)
 
         resultado.append(
-            FisioSemanalOut(
-                terapeutaid=tid,
-                terapeuta=str(item["terapeuta"]),
-                consultorioid=item.get("consultorioid"),
-                consultorio=str(item.get("consultorio") or "Sin consultorio"),
-                sesiones_realizadas=int(item["sesiones"]),
-                total_generado=round(total_generado, 2),
-                total_pagado_pacientes=round(total_pagado, 2),
-                total_pendiente_pacientes=round(pendiente, 2),
-                ganancia_fisio_total=round(total_generado * 0.5, 2),
-                ganancia_fisio_cobrada=round(total_pagado * 0.5, 2),
-                ganancia_fisio_pendiente=round(pendiente * 0.5, 2),
-            )
+            resultado.append(
+                FisioSemanalOut(
+                    terapeutaid=tid,
+                    terapeuta=str(item["terapeuta"]),
+                    consultorioid=item.get("consultorioid"),
+                    consultorio=str(item.get("consultorio") or "Sin consultorio"),
+                    sesiones_realizadas=int(item["sesiones"]),
+                    total_generado=round(total_generado, 2),
+                    total_pagado_pacientes=round(total_pagado, 2),
+                    total_pendiente_pacientes=round(pendiente, 2),
+                    ganancia_fisio_total=round(total_generado * PORCENTAJE_FISIO, 2),
+                    ganancia_fisio_cobrada=round(total_pagado * PORCENTAJE_FISIO, 2),
+                    ganancia_fisio_pendiente=round(pendiente * PORCENTAJE_FISIO, 2),
+                )
+            )   
         )
 
     return sorted(
@@ -1147,9 +1152,9 @@ def reporte_fisioterapeuta_detalle(
                 total_generado=round(generado, 2),
                 pagado_paciente=round(pagado, 2),
                 pendiente_paciente=round(pendiente, 2),
-                ganancia_fisio=round(generado * 0.5, 2),
-                ganancia_cobrada=round(pagado * 0.5, 2),
-                ganancia_pendiente=round(pendiente * 0.5, 2),
+                ganancia_fisio=round(generado * PORCENTAJE_FISIO, 2),
+                ganancia_cobrada=round(pagado * PORCENTAJE_FISIO, 2),
+                ganancia_pendiente=round(pendiente * PORCENTAJE_FISIO, 2),
             )
         )
 
@@ -1276,12 +1281,12 @@ def reporte_clinicas_semanal(
                 total_generado=round(total_generado, 2),
                 total_pagado_pacientes=round(total_pagado, 2),
                 total_pendiente_pacientes=round(pendiente, 2),
-                ganancia_fisios_total=round(total_generado * 0.5, 2),
-                ganancia_fisios_cobrada=round(total_pagado * 0.5, 2),
-                ganancia_fisios_pendiente=round(pendiente * 0.5, 2),
-                ganancia_clinica_total=round(total_generado * 0.5, 2),
-                ganancia_clinica_cobrada=round(total_pagado * 0.5, 2),
-                ganancia_clinica_pendiente=round(pendiente * 0.5, 2),
+                ganancia_fisios_total=round(total_generado * PORCENTAJE_FISIO, 2),
+                ganancia_fisios_cobrada=round(total_pagado * PORCENTAJE_FISIO, 2),
+                ganancia_fisios_pendiente=round(pendiente * PORCENTAJE_FISIO, 2),
+                ganancia_clinica_total=round(total_generado * PORCENTAJE_CLINICA, 2),
+                ganancia_clinica_cobrada=round(total_pagado * PORCENTAJE_CLINICA, 2),
+                ganancia_clinica_pendiente=round(pendiente * PORCENTAJE_CLINICA, 2),
             )
         )
 
