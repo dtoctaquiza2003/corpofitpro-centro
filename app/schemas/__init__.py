@@ -13,3 +13,10 @@ from .diagnostico import DiagnosticoCreate, DiagnosticoOut
 from .tratamiento_paciente import TratamientoPacienteCreate, TratamientoPacienteOut
 from .tipo_terapia import TipoTerapiaCreate, TipoTerapiaOut
 from .notificacion import NotificacionOut, RegistrarDispositivoIn
+from .gimnasio import (
+    MembresiaGimnasioCreate,
+    MovimientoGimnasioCreate,
+    MembresiaGimnasioOut,
+    MovimientoGimnasioOut,
+    ResumenMembresiaGimnasioOut,
+)

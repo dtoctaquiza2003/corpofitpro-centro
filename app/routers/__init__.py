@@ -13,3 +13,4 @@ from .diagnosticos import router as diagnosticos_router
 from .tratamientos_paciente import router as tratamiento_paciente_router
 from .tipos_terapia import router as tipos_terapia_router
 from .notificaciones import router as notificaciones_router
+from .gimnasio import router as gimnasio_router

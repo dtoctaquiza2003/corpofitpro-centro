@@ -14,3 +14,4 @@ from .tratamiento_paciente import TratamientoPaciente
 from .tipo_terapia import TipoTerapia
 from .notificacion import Notificacion
 from .usuario_dispositivo import UsuarioDispositivo
+from .gimnasio import MembresiaGimnasio, MovimientoGimnasio
