@@ -26,6 +26,12 @@ class Pago(Base):
         nullable=True,
     )
 
+    membresiagimnasioid = Column(
+        Integer,
+        ForeignKey("membresias_gimnasio.id"),
+        nullable=True,
+    )
+
     monto = Column(Float, nullable=False)
     metodopago = Column(String(50), nullable=False)
 

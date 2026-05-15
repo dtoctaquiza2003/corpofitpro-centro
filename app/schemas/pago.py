@@ -8,6 +8,7 @@ class PagoCreate(BaseModel):
     pacienteid: int
     pacientepaqueteid: Optional[int] = None
     tratamientopacienteid: Optional[int] = None
+    membresiagimnasioid: Optional[int] = None
     monto: float = Field(..., gt=0)
     metodopago: str
 
@@ -27,6 +28,7 @@ class PagoOut(BaseModel):
     pacienteid: int
     pacientepaqueteid: Optional[int] = None
     tratamientopacienteid: Optional[int] = None
+    membresiagimnasioid: Optional[int] = None
     monto: float
     metodopago: Optional[str] = None
     fechapago: datetime
@@ -50,6 +52,8 @@ class PagoSimpleOut(BaseModel):
     monto: float
     metodopago: Optional[str] = None
     fechapago: datetime
+
+    membresiagimnasioid: Optional[int] = None
 
     numerocomprobante: Optional[str] = None
     comprobanteurl: Optional[str] = None
@@ -112,3 +116,23 @@ class CuentaTratamientoOut(BaseModel):
     activo: bool
 
     pagos: List[PagoSimpleOut] = Field(default_factory=list)
+
+class CuentaMembresiaGimnasioOut(BaseModel):
+    membresiagimnasioid: int
+    pacienteid: int
+    paciente: str
+
+    fechainicio: date
+    diascontratados: int
+    precio: Optional[float] = None
+    activo: bool
+    observaciones: Optional[str] = None
+
+    pagado_verificado: float
+    pendiente_verificacion: float
+    saldo: float
+    estado_pago: str
+
+    pagos: List[PagoSimpleOut] = Field(default_factory=list)
+
+    model_config = ConfigDict(from_attributes=True)

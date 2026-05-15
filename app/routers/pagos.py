@@ -6,6 +6,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 
 from app.schemas.pago import (
+    CuentaMembresiaGimnasioOut,
     CuentaPaqueteOut,
     CuentaTratamientoOut,
     PagoCreate,
@@ -19,6 +20,7 @@ from ..auth.permissions import (
     validar_consultorio_secretario,
 )
 from ..dependencies.db import get_db
+from ..models.gimnasio import MembresiaGimnasio
 from ..models.paciente import Paciente
 from ..models.paciente_paquete import PacientePaquete
 from ..models.pago import Pago
@@ -26,12 +28,11 @@ from ..models.paquete import Paquete
 from ..models.sesion_terapia import SesionTerapia
 from ..models.tratamiento_paciente import TratamientoPaciente
 from ..models.usuario import Usuario
+from ..services.notificacion_service import crear_notificacion_usuario
 from ..services.supabase_storage import (
     crear_url_firmada_comprobante,
     subir_comprobante_pago,
 )
-from typing import List, Optional
-from ..services.notificacion_service import crear_notificacion_usuario
 
 router = APIRouter(prefix="/api/pagos", tags=["pagos"])
 
@@ -159,14 +160,53 @@ def _validar_tratamiento_paciente(
     return tratamiento
 
 
+def _validar_membresia_gimnasio(
+    db: Session,
+    pacienteid: int,
+    membresiagimnasioid: Optional[int],
+) -> Optional[MembresiaGimnasio]:
+    if membresiagimnasioid is None:
+        return None
+
+    membresia = (
+        db.query(MembresiaGimnasio)
+        .filter(
+            MembresiaGimnasio.id == membresiagimnasioid,
+            MembresiaGimnasio.pacienteid == pacienteid,
+        )
+        .first()
+    )
+
+    if not membresia:
+        raise HTTPException(
+            status_code=400,
+            detail="La membresía de gimnasio no existe o no pertenece al paciente.",
+        )
+
+    return membresia
+
+
 def _validar_destino_pago(
     pacientepaqueteid: Optional[int],
     tratamientopacienteid: Optional[int],
+    membresiagimnasioid: Optional[int],
 ):
-    if pacientepaqueteid is not None and tratamientopacienteid is not None:
+    destinos = [
+        pacientepaqueteid is not None,
+        tratamientopacienteid is not None,
+        membresiagimnasioid is not None,
+    ]
+
+    if sum(destinos) == 0:
         raise HTTPException(
             status_code=400,
-            detail="El pago no puede pertenecer a un paquete y a un tratamiento al mismo tiempo.",
+            detail="Debe seleccionar paquete, tratamiento o membresía de gimnasio para registrar el pago.",
+        )
+
+    if sum(destinos) > 1:
+        raise HTTPException(
+            status_code=400,
+            detail="El pago solo puede pertenecer a un paquete, tratamiento o membresía de gimnasio.",
         )
 
 
@@ -207,6 +247,46 @@ def _validar_saldo_paquete(
         )
 
 
+def _validar_saldo_membresia_gimnasio(
+    db: Session,
+    membresia: Optional[MembresiaGimnasio],
+    monto: float,
+    excluir_pago_id: Optional[int] = None,
+):
+    if membresia is None:
+        return
+
+    precio = float(membresia.precio or 0)
+
+    if precio <= 0:
+        return
+
+    query = db.query(Pago).filter(Pago.membresiagimnasioid == membresia.id)
+
+    if excluir_pago_id is not None:
+        query = query.filter(Pago.id != excluir_pago_id)
+
+    pagos_actuales = query.all()
+
+    total_pagado_verificado = sum(
+        float(p.monto)
+        for p in pagos_actuales
+        if p.estadopago == 2
+    )
+
+    total_pendiente_verificacion = sum(
+        float(p.monto)
+        for p in pagos_actuales
+        if p.estadopago == 1
+    )
+
+    if total_pagado_verificado + total_pendiente_verificacion + float(monto) > precio:
+        raise HTTPException(
+            status_code=400,
+            detail="El abono supera el saldo pendiente de la membresía de gimnasio.",
+        )
+
+
 def now_ecuador() -> datetime:
     return datetime.now(timezone(timedelta(hours=-5)))
 
@@ -223,7 +303,6 @@ def _obtener_usuarios_verificadores_pago(
     usuarios: list[Usuario] = []
     usuarios_ids = set()
 
-    # Secretarios del consultorio del paciente
     secretarios = (
         db.query(Usuario)
         .filter(
@@ -239,7 +318,6 @@ def _obtener_usuarios_verificadores_pago(
             usuarios.append(secretario)
             usuarios_ids.add(secretario.id)
 
-    # Jefes activos
     jefes = (
         db.query(Usuario)
         .filter(
@@ -359,6 +437,7 @@ def _notificar_resultado_pago_transferencia(
     )
 
     db.flush()
+
 
 # ============================================================
 # LISTAR PAGOS
@@ -495,6 +574,11 @@ def listar_cuentas_paquetes(
                         numerocomprobante=pago.numerocomprobante,
                         comprobanteurl=pago.comprobanteurl,
                         estadopago=pago.estadopago,
+                        membresiagimnasioid=pago.membresiagimnasioid,
+                        creado_por_id=pago.creado_por_id,
+                        verificado_por_id=pago.verificado_por_id,
+                        fecha_verificacion=pago.fecha_verificacion,
+                        motivo_rechazo=pago.motivo_rechazo,
                     )
                     for pago in pagos
                 ],
@@ -638,6 +722,123 @@ def listar_cuentas_tratamientos(
                         numerocomprobante=pago.numerocomprobante,
                         comprobanteurl=pago.comprobanteurl,
                         estadopago=pago.estadopago,
+                        membresiagimnasioid=pago.membresiagimnasioid,
+                        creado_por_id=pago.creado_por_id,
+                        verificado_por_id=pago.verificado_por_id,
+                        fecha_verificacion=pago.fecha_verificacion,
+                        motivo_rechazo=pago.motivo_rechazo,
+                    )
+                    for pago in pagos
+                ],
+            )
+        )
+
+    return resultado
+
+
+# ============================================================
+# CUENTAS POR GIMNASIO
+# ============================================================
+
+@router.get("/cuentas-gimnasio", response_model=List[CuentaMembresiaGimnasioOut])
+def listar_cuentas_gimnasio(
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(get_current_user),
+):
+    query = (
+        db.query(MembresiaGimnasio, Paciente)
+        .join(Paciente, Paciente.id == MembresiaGimnasio.pacienteid)
+    )
+
+    if current_user.rol == 2:
+        query = query.filter(Paciente.terapeutaasignadoid == current_user.id)
+
+    elif current_user.rol == 1:
+        validar_consultorio_secretario(
+            current_user,
+            current_user.consultorioid,
+        )
+
+        query = query.filter(
+            Paciente.consultorioid == current_user.consultorioid
+        )
+
+    elif current_user.rol == 3:
+        pass
+
+    else:
+        raise HTTPException(
+            status_code=403,
+            detail="No autorizado",
+        )
+
+    membresias = (
+        query.order_by(
+            MembresiaGimnasio.activo.desc(),
+            MembresiaGimnasio.fechainicio.desc(),
+            MembresiaGimnasio.id.desc(),
+        )
+        .all()
+    )
+
+    resultado = []
+
+    for membresia, paciente in membresias:
+        precio = float(membresia.precio or 0)
+
+        pagos = (
+            db.query(Pago)
+            .filter(Pago.membresiagimnasioid == membresia.id)
+            .order_by(Pago.fechapago.asc())
+            .all()
+        )
+
+        pagado_verificado = sum(
+            float(pago.monto)
+            for pago in pagos
+            if pago.estadopago == 2
+        )
+
+        pendiente_verificacion = sum(
+            float(pago.monto)
+            for pago in pagos
+            if pago.estadopago == 1
+        )
+
+        saldo = max(precio - pagado_verificado, 0)
+
+        resultado.append(
+            CuentaMembresiaGimnasioOut(
+                membresiagimnasioid=membresia.id,
+                pacienteid=paciente.id,
+                paciente=f"{paciente.nombres} {paciente.apellidos}",
+                fechainicio=membresia.fechainicio,
+                diascontratados=int(membresia.diascontratados or 20),
+                precio=precio,
+                activo=membresia.activo,
+                observaciones=membresia.observaciones,
+                pagado_verificado=pagado_verificado,
+                pendiente_verificacion=pendiente_verificacion,
+                saldo=saldo,
+                estado_pago=_estado_cuenta(
+                    total_generado=precio,
+                    pagado=pagado_verificado,
+                    saldo=saldo,
+                ),
+                pagos=[
+                    PagoSimpleOut(
+                        id=pago.id,
+                        monto=float(pago.monto),
+                        metodopago=pago.metodopago,
+                        fechapago=pago.fechapago,
+                        numerocomprobante=pago.numerocomprobante,
+                        comprobanteurl=pago.comprobanteurl,
+                        estadopago=pago.estadopago,
+                        membresiagimnasioid=pago.membresiagimnasioid,
+                        creado_por_id=pago.creado_por_id,
+                        verificado_por_id=pago.verificado_por_id,
+                        fecha_verificacion=pago.fecha_verificacion,
+                        motivo_rechazo=pago.motivo_rechazo,
                     )
                     for pago in pagos
                 ],
@@ -694,6 +895,7 @@ def registrar_pago(
     _validar_destino_pago(
         pacientepaqueteid=pago.pacientepaqueteid,
         tratamientopacienteid=pago.tratamientopacienteid,
+        membresiagimnasioid=pago.membresiagimnasioid,
     )
 
     _validar_paciente(
@@ -714,6 +916,12 @@ def registrar_pago(
         tratamientopacienteid=pago.tratamientopacienteid,
     )
 
+    membresia_gimnasio = _validar_membresia_gimnasio(
+        db=db,
+        pacienteid=pago.pacienteid,
+        membresiagimnasioid=pago.membresiagimnasioid,
+    )
+
     metodo = (pago.metodopago or "").strip()
 
     if not metodo:
@@ -731,6 +939,12 @@ def registrar_pago(
     _validar_saldo_paquete(
         db=db,
         paciente_paquete=paciente_paquete,
+        monto=pago.monto,
+    )
+
+    _validar_saldo_membresia_gimnasio(
+        db=db,
+        membresia=membresia_gimnasio,
         monto=pago.monto,
     )
 
@@ -771,6 +985,7 @@ async def registrar_pago_con_comprobante(
     metodopago: str = Form(...),
     pacientepaqueteid: Optional[int] = Form(None),
     tratamientopacienteid: Optional[int] = Form(None),
+    membresiagimnasioid: Optional[int] = Form(None),
     numerocomprobante: Optional[str] = Form(None),
     comprobante: Optional[UploadFile] = File(None),
     db: Session = Depends(get_db),
@@ -779,12 +994,13 @@ async def registrar_pago_con_comprobante(
     _validar_destino_pago(
         pacientepaqueteid=pacientepaqueteid,
         tratamientopacienteid=tratamientopacienteid,
+        membresiagimnasioid=membresiagimnasioid,
     )
 
     paciente = _validar_paciente(
-    db=db,
-    pacienteid=pacienteid,
-    current_user=current_user,
+        db=db,
+        pacienteid=pacienteid,
+        current_user=current_user,
     )
 
     if monto <= 0:
@@ -813,9 +1029,21 @@ async def registrar_pago_con_comprobante(
         tratamientopacienteid=tratamientopacienteid,
     )
 
+    membresia_gimnasio = _validar_membresia_gimnasio(
+        db=db,
+        pacienteid=pacienteid,
+        membresiagimnasioid=membresiagimnasioid,
+    )
+
     _validar_saldo_paquete(
         db=db,
         paciente_paquete=paciente_paquete,
+        monto=monto,
+    )
+
+    _validar_saldo_membresia_gimnasio(
+        db=db,
+        membresia=membresia_gimnasio,
         monto=monto,
     )
 
@@ -851,6 +1079,7 @@ async def registrar_pago_con_comprobante(
         pacienteid=pacienteid,
         pacientepaqueteid=pacientepaqueteid,
         tratamientopacienteid=tratamientopacienteid,
+        membresiagimnasioid=membresiagimnasioid,
         monto=monto,
         metodopago=metodo,
         numerocomprobante=numerocomprobante.strip() if numerocomprobante else None,
