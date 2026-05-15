@@ -188,6 +188,7 @@ def _calcular_resumen(
 
     puede_registrar_hoy = (
         membresia.activo
+        and hoy >= membresia.fechainicio
         and _es_dia_habil(hoy)
         and dias_restantes > 0
         and hoy <= fecha_fin_estimada
@@ -196,6 +197,8 @@ def _calcular_resumen(
 
     if not _es_dia_habil(hoy):
         mensaje = "Hoy no cuenta como día de gimnasio porque es fin de semana."
+    elif hoy < membresia.fechainicio:
+        mensaje = "La membresía todavía no inicia."
     elif dias_restantes <= 0:
         mensaje = "La membresía ya no tiene días disponibles."
     elif hoy > fecha_fin_estimada:
@@ -401,6 +404,12 @@ def registrar_movimiento_gimnasio(
         raise HTTPException(
             status_code=400,
             detail="El paciente no tiene una membresía de gimnasio activa.",
+        )
+    
+    if fecha_movimiento < membresia.fechainicio:
+        raise HTTPException(
+            status_code=400,
+            detail="No se puede registrar gimnasio antes de la fecha de inicio de la membresía.",
         )
 
     resumen = _calcular_resumen(
