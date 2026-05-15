@@ -1,4 +1,4 @@
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime, timezone
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -23,6 +23,9 @@ router = APIRouter(prefix="/api/gimnasio", tags=["gimnasio"])
 
 TIPO_ASISTENCIA_GIMNASIO = 1
 TIPO_TERAPIA_REEMPLAZA_GIMNASIO = 2
+
+def fecha_ecuador() -> date:
+    return datetime.now(timezone(timedelta(hours=-5))).date()
 
 
 def _es_dia_habil(fecha: date) -> bool:
@@ -127,7 +130,7 @@ def _calcular_resumen(
     membresia: MembresiaGimnasio,
     fecha_referencia: Optional[date] = None,
 ) -> ResumenMembresiaGimnasioOut:
-    hoy = fecha_referencia or date.today()
+    hoy = fecha_referencia or fecha_ecuador()
 
     movimientos = (
         db.query(MovimientoGimnasio)
@@ -220,6 +223,8 @@ def _calcular_resumen(
         puede_registrar_hoy=puede_registrar_hoy,
         mensaje=mensaje,
     )
+
+
 
 
 @router.post("/membresias", response_model=MembresiaGimnasioOut)
@@ -379,7 +384,7 @@ def registrar_movimiento_gimnasio(
         current_user=current_user,
     )
 
-    fecha_movimiento = data.fecha or date.today()
+    fecha_movimiento = data.fecha or fecha_ecuador()
 
     if not _es_dia_habil(fecha_movimiento):
         raise HTTPException(
