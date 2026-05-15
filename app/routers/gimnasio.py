@@ -178,11 +178,17 @@ def _calcular_resumen(
         0,
     )
 
+    movimiento_hoy = next(
+    (m for m in movimientos if m.fecha == hoy),
+    None,
+)
+
     puede_registrar_hoy = (
         membresia.activo
         and _es_dia_habil(hoy)
         and dias_restantes > 0
         and hoy <= fecha_fin_estimada
+        and movimiento_hoy is None
     )
 
     if not _es_dia_habil(hoy):
@@ -191,6 +197,13 @@ def _calcular_resumen(
         mensaje = "La membresía ya no tiene días disponibles."
     elif hoy > fecha_fin_estimada:
         mensaje = "La membresía ya finalizó."
+    elif movimiento_hoy is not None:
+        if movimiento_hoy.tipo == TIPO_ASISTENCIA_GIMNASIO:
+            mensaje = "Ya se registró la asistencia de gimnasio de hoy."
+        elif movimiento_hoy.tipo == TIPO_TERAPIA_REEMPLAZA_GIMNASIO:
+            mensaje = "Hoy ya fue aplazado porque una terapia reemplazó el gimnasio."
+        else:
+            mensaje = "Ya existe un registro de gimnasio para hoy."
     else:
         mensaje = "La membresía está activa."
 
