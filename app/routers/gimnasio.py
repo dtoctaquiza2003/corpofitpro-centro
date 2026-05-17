@@ -260,7 +260,10 @@ def crear_membresia_gimnasio(
     )
 
     if membresia_activa:
-        membresia_activa.activo = False
+        raise HTTPException(
+            status_code=400,
+            detail="El paciente ya tiene una membresía de gimnasio activa. Desactiva o finaliza la membresía actual antes de crear otra.",
+        )
 
     nueva = MembresiaGimnasio(
         pacienteid=paciente.id,
