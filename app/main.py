@@ -22,6 +22,7 @@ from .routers import (
     tipos_terapia_router,
     notificaciones_router,
     gimnasio_router,
+    pacientes_compartidos_router,
 )
 
 # Crear la aplicación FastAPI
@@ -58,6 +59,7 @@ app.include_router(tratamiento_paciente_router)
 app.include_router(tipos_terapia_router)
 app.include_router(notificaciones_router)
 app.include_router(gimnasio_router)
+app.include_router(pacientes_compartidos_router)
 
 # Endpoint de prueba
 @app.get("/")

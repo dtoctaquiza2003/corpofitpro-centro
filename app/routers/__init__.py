@@ -14,3 +14,4 @@ from .tratamientos_paciente import router as tratamiento_paciente_router
 from .tipos_terapia import router as tipos_terapia_router
 from .notificaciones import router as notificaciones_router
 from .gimnasio import router as gimnasio_router
+from .pacientes_compartidos import router as pacientes_compartidos_router

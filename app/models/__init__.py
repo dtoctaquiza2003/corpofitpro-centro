@@ -15,3 +15,4 @@ from .tipo_terapia import TipoTerapia
 from .notificacion import Notificacion
 from .usuario_dispositivo import UsuarioDispositivo
 from .gimnasio import MembresiaGimnasio, MovimientoGimnasio
+from .paciente_terapeuta_compartido import PacienteTerapeutaCompartido

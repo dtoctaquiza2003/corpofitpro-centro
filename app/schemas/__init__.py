@@ -20,3 +20,4 @@ from .gimnasio import (
     MovimientoGimnasioOut,
     ResumenMembresiaGimnasioOut,
 )
+from.paciente_compartido import PacienteCompartidoCreate, PacienteCompartidoOut
