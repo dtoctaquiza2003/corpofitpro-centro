@@ -24,6 +24,7 @@ from ..schemas.sesion import (
 )
 from ..models.paciente_terapeuta_compartido import PacienteTerapeutaCompartido
 from ..models.transferencia import Transferencia
+from app.models import tratamiento
 
 
 router = APIRouter(prefix="/api/sesiones", tags=["sesiones"])
@@ -213,6 +214,43 @@ def obtener_tratamiento_activo(
         )
 
     return tratamientos[0]
+
+def _ya_tiene_sesion_hoy_para_patologia(
+    db: Session,
+    paciente_id: int,
+    tratamiento: TratamientoPaciente,
+) -> bool:
+    hoy = now_ecuador().date()
+
+    # Si el tratamiento pertenece a un diagnóstico/patología,
+    # se bloquea cualquier otro tratamiento del mismo diagnóstico en el mismo día.
+    if tratamiento.diagnosticoid is not None:
+        return (
+            db.query(SesionTerapia.id)
+            .join(
+                TratamientoPaciente,
+                TratamientoPaciente.id == SesionTerapia.tratamientopacienteid,
+            )
+            .filter(
+                SesionTerapia.pacienteid == paciente_id,
+                SesionTerapia.fecha == hoy,
+                TratamientoPaciente.diagnosticoid == tratamiento.diagnosticoid,
+            )
+            .first()
+            is not None
+        )
+
+    # Si no tiene diagnóstico, se bloquea por tratamiento específico.
+    return (
+        db.query(SesionTerapia.id)
+        .filter(
+            SesionTerapia.pacienteid == paciente_id,
+            SesionTerapia.fecha == hoy,
+            SesionTerapia.tratamientopacienteid == tratamiento.id,
+        )
+        .first()
+        is not None
+    )
 
 def validar_sesiones_disponibles_para_tratamiento(
     db: Session,
@@ -424,6 +462,20 @@ def iniciar_sesion(
         paciente_id=data.pacienteid,
         tratamiento_id=data.tratamientopacienteid,
     )
+
+    if _ya_tiene_sesion_hoy_para_patologia(
+        db=db,
+        paciente_id=paciente.id,
+        tratamiento=tratamiento_activo,
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Este paciente ya tiene una sesión registrada hoy para esta patología. "
+                "Solo se permite una sesión diaria por patología."
+            ),
+        )
+
 
     validar_sesiones_disponibles_para_tratamiento(
         db=db,
@@ -768,7 +820,7 @@ def obtener_resumen_tratamiento_sesion(
         )
 
     sesiones_realizadas = (
-        db.query(SesionTerapia)
+        db.query(SesionTerapia.id)
         .filter(
             SesionTerapia.tratamientopacienteid == tratamiento.id,
             SesionTerapia.pacienteid == tratamiento.pacienteid,
@@ -783,10 +835,24 @@ def obtener_resumen_tratamiento_sesion(
     if sesiones_estimadas is not None:
         sesiones_restantes = max(sesiones_estimadas - sesiones_realizadas, 0)
 
+    tiene_sesion_hoy = _ya_tiene_sesion_hoy_para_patologia(
+        db=db,
+        paciente_id=tratamiento.pacienteid,
+        tratamiento=tratamiento,
+    )
+
     return {
         "tratamientopacienteid": tratamiento.id,
         "pacienteid": tratamiento.pacienteid,
         "sesiones_estimadas": sesiones_estimadas,
         "sesiones_realizadas": sesiones_realizadas,
         "sesiones_restantes": sesiones_restantes,
+        "tiene_sesion_hoy": tiene_sesion_hoy,
+        "bloqueado_hoy": tiene_sesion_hoy,
+        "mensaje_bloqueo": (
+            "Ya se registró una sesión hoy para esta patología."
+            if tiene_sesion_hoy
+            else None
+        ),
     }
+
