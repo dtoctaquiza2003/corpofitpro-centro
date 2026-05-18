@@ -5,9 +5,9 @@ from .core.config import settings
 
 engine = create_engine(
     settings.DATABASE_URL,
-    pool_size=3,
+    pool_size=4,
     max_overflow=2,
-    pool_timeout=30,
+    pool_timeout=45,
     pool_recycle=180,
     pool_pre_ping=True,
     echo=False,
