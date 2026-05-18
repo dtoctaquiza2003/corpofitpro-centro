@@ -723,3 +723,70 @@ def listar_sesiones(
     )
 
     return [build_sesion_out(sesion, db) for sesion in sesiones]
+
+@router.get("/tratamiento-resumen/{tratamiento_paciente_id}")
+def obtener_resumen_tratamiento_sesion(
+    tratamiento_paciente_id: int,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(get_current_terapeuta),
+):
+    tratamiento = (
+        db.query(TratamientoPaciente)
+        .filter(
+            TratamientoPaciente.id == tratamiento_paciente_id,
+            TratamientoPaciente.activo == True,
+        )
+        .first()
+    )
+
+    if not tratamiento:
+        raise HTTPException(
+            status_code=404,
+            detail="Tratamiento no encontrado o inactivo.",
+        )
+
+    paciente = (
+        db.query(Paciente)
+        .filter(Paciente.id == tratamiento.pacienteid)
+        .first()
+    )
+
+    if not paciente:
+        raise HTTPException(
+            status_code=404,
+            detail="Paciente no encontrado.",
+        )
+
+    if not _terapeuta_puede_atender_paciente(
+        db=db,
+        paciente=paciente,
+        current_user=current_user,
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="No autorizado para consultar este tratamiento.",
+        )
+
+    sesiones_realizadas = (
+        db.query(SesionTerapia)
+        .filter(
+            SesionTerapia.tratamientopacienteid == tratamiento.id,
+            SesionTerapia.pacienteid == tratamiento.pacienteid,
+            SesionTerapia.horasalida != None,
+        )
+        .count()
+    )
+
+    sesiones_estimadas = tratamiento.sesiones_estimadas
+
+    sesiones_restantes = None
+    if sesiones_estimadas is not None:
+        sesiones_restantes = max(sesiones_estimadas - sesiones_realizadas, 0)
+
+    return {
+        "tratamientopacienteid": tratamiento.id,
+        "pacienteid": tratamiento.pacienteid,
+        "sesiones_estimadas": sesiones_estimadas,
+        "sesiones_realizadas": sesiones_realizadas,
+        "sesiones_restantes": sesiones_restantes,
+    }
