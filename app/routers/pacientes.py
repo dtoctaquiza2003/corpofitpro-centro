@@ -1,4 +1,5 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import or_
 from sqlalchemy.orm import Session, joinedload
 from typing import List, Optional
 from pydantic import BaseModel
@@ -9,7 +10,7 @@ from ..models.paciente import Paciente
 from ..models.usuario import Usuario
 from ..models.transferencia import Transferencia
 from ..auth.dependencies import get_current_user, get_current_secretary
-from ..schemas.paciente import PacienteCreate, PacienteOut
+from ..schemas.paciente import PacienteCreate, PacienteOut, PacientesPageOut
 from ..auth.permissions import (
     validar_acceso_paciente_por_rol,
     validar_consultorio_secretario,
@@ -86,9 +87,172 @@ def validar_terapeutas_para_secretario(
     validar_consultorio_secretario(current_user, destino.consultorioid)
 
 
+
+def _aplicar_busqueda_pacientes(query, search: Optional[str]):
+    if not search or not search.strip():
+        return query
+
+    term = f"%{search.strip()}%"
+
+    return query.filter(
+        or_(
+            Paciente.nombres.ilike(term),
+            Paciente.apellidos.ilike(term),
+            Paciente.cedula.ilike(term),
+            Paciente.telefono.ilike(term),
+            Paciente.historiaclinicaid.ilike(term),
+        )
+    )
+
+
 # ============================================================
 # LISTAR PACIENTES
 # ============================================================
+
+
+@router.get("/paginado", response_model=PacientesPageOut)
+def listar_pacientes_paginado(
+    terapeuta_id: Optional[int] = Query(None),
+    consultorio_id: Optional[int] = Query(None),
+    search: Optional[str] = Query(None),
+    limit: int = Query(20, ge=1, le=50),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(get_current_user),
+):
+    """
+    Lista liviana y paginada para la pantalla de pacientes.
+
+    Evita traer todos los pacientes cuando la clínica ya tiene muchos registros.
+    Mantiene las reglas por rol:
+    - Terapeuta: solo sus pacientes asignados.
+    - Secretario: solo pacientes de su consultorio.
+    - Jefe: todos o filtrados por consultorio/terapeuta.
+    """
+
+    if current_user.rol == 2:
+        query = db.query(Paciente).filter(
+            Paciente.terapeutaasignadoid == current_user.id
+        )
+
+        query = _aplicar_busqueda_pacientes(query, search)
+
+        total = query.count()
+
+        pacientes = (
+            query.order_by(Paciente.apellidos.asc(), Paciente.nombres.asc())
+            .offset(offset)
+            .limit(limit)
+            .all()
+        )
+
+        paciente_ids = [p.id for p in pacientes]
+        cedidos_ids = set()
+        motivo_map = {}
+
+        if paciente_ids:
+            transferencias = (
+                db.query(Transferencia)
+                .filter(
+                    Transferencia.terapeuta_destino_id == current_user.id,
+                    Transferencia.activo == True,
+                )
+                .options(joinedload(Transferencia.pacientes))
+                .all()
+            )
+
+            for transferencia in transferencias:
+                for paciente in transferencia.pacientes:
+                    if paciente.id in paciente_ids:
+                        cedidos_ids.add(paciente.id)
+                        motivo_map[paciente.id] = transferencia.motivo
+
+        items = [
+            _paciente_to_out(
+                paciente,
+                paciente.id in cedidos_ids,
+                motivo_map.get(paciente.id),
+            )
+            for paciente in pacientes
+        ]
+
+        return PacientesPageOut(
+            items=items,
+            total=total,
+            limit=limit,
+            offset=offset,
+            has_more=(offset + len(items)) < total,
+        )
+
+    if current_user.rol == 1:
+        validar_consultorio_secretario(
+            current_user,
+            current_user.consultorioid,
+        )
+
+        query = db.query(Paciente).filter(
+            Paciente.consultorioid == current_user.consultorioid
+        )
+
+        if terapeuta_id:
+            query = query.filter(Paciente.terapeutaasignadoid == terapeuta_id)
+
+        query = _aplicar_busqueda_pacientes(query, search)
+
+        total = query.count()
+
+        pacientes = (
+            query.order_by(Paciente.apellidos.asc(), Paciente.nombres.asc())
+            .offset(offset)
+            .limit(limit)
+            .all()
+        )
+
+        items = [_paciente_to_out(paciente) for paciente in pacientes]
+
+        return PacientesPageOut(
+            items=items,
+            total=total,
+            limit=limit,
+            offset=offset,
+            has_more=(offset + len(items)) < total,
+        )
+
+    if current_user.rol == 3:
+        query = db.query(Paciente)
+
+        if terapeuta_id:
+            query = query.filter(Paciente.terapeutaasignadoid == terapeuta_id)
+
+        if consultorio_id:
+            query = query.filter(Paciente.consultorioid == consultorio_id)
+
+        query = _aplicar_busqueda_pacientes(query, search)
+
+        total = query.count()
+
+        pacientes = (
+            query.order_by(Paciente.apellidos.asc(), Paciente.nombres.asc())
+            .offset(offset)
+            .limit(limit)
+            .all()
+        )
+
+        items = [_paciente_to_out(paciente) for paciente in pacientes]
+
+        return PacientesPageOut(
+            items=items,
+            total=total,
+            limit=limit,
+            offset=offset,
+            has_more=(offset + len(items)) < total,
+        )
+
+    raise HTTPException(
+        status_code=403,
+        detail="No autorizado para listar pacientes.",
+    )
+
 
 @router.get("/", response_model=List[PacienteOut])
 def listar_pacientes(

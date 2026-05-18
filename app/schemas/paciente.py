@@ -1,6 +1,6 @@
 from pydantic import BaseModel, Field, field_validator
 from datetime import date, datetime
-from typing import Optional
+from typing import List, Optional
 
 
 class PacienteBase(BaseModel):
@@ -53,3 +53,11 @@ class PacienteOut(PacienteBase):
 
     class Config:
         from_attributes = True
+
+
+class PacientesPageOut(BaseModel):
+    items: List[PacienteOut] = Field(default_factory=list)
+    total: int = 0
+    limit: int = 20
+    offset: int = 0
+    has_more: bool = False
