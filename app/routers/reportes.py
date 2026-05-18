@@ -5,6 +5,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import Date, cast, func
 from sqlalchemy.orm import Session, joinedload
 
+from ..models.alerta import Alerta
+from ..models.notificacion import Notificacion
+from ..models.transferencia import Transferencia
 from ..auth.dependencies import get_current_secretary, get_current_user
 from ..dependencies.db import get_db
 from ..models.consultorio import Consultorio
@@ -15,6 +18,7 @@ from ..models.tratamiento_paciente import TratamientoPaciente
 from ..models.usuario import Usuario
 from ..schemas.reporte import (
     ClinicaSemanalOut,
+    DashboardLiteOut,
     DashboardResumenOut,
     FisioDetalleOut,
     FisioDetallePacienteOut,
@@ -629,6 +633,126 @@ def dashboard_resumen(
         saldo_pendiente_total=round(saldo_pendiente_total, 2),
         transferencias_pendientes=transferencias_pendientes,
         saldo_a_favor_total=round(saldo_a_favor_total, 2),
+    )
+
+@router.get("/dashboard-lite", response_model=DashboardLiteOut)
+def dashboard_lite(
+    consultorioid: Optional[int] = Query(None),
+    terapeutaid: Optional[int] = Query(None),
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(get_current_user),
+):
+    resumen = dashboard_resumen(
+        consultorioid=consultorioid,
+        terapeutaid=terapeutaid,
+        db=db,
+        current_user=current_user,
+    )
+
+    # Alertas no leídas
+    alertas_query = db.query(Alerta).join(
+        Paciente,
+        Paciente.id == Alerta.paciente_id,
+    ).filter(
+        Alerta.leida == False,
+    )
+
+    if current_user.rol == 2:
+        alertas_query = alertas_query.filter(
+            Paciente.terapeutaasignadoid == current_user.id,
+        )
+
+    elif current_user.rol == 1:
+        if current_user.consultorioid is None:
+            raise HTTPException(
+                status_code=403,
+                detail="El secretario no tiene consultorio asignado.",
+            )
+
+        alertas_query = alertas_query.filter(
+            Paciente.consultorioid == current_user.consultorioid,
+        )
+
+    elif current_user.rol == 3:
+        if consultorioid is not None:
+            alertas_query = alertas_query.filter(
+                Paciente.consultorioid == consultorioid,
+            )
+
+    else:
+        raise HTTPException(
+            status_code=403,
+            detail="No autorizado",
+        )
+
+    alertas_no_leidas = alertas_query.count()
+
+    # Notificaciones no leídas del usuario actual
+    notificaciones_no_leidas = (
+        db.query(Notificacion)
+        .filter(
+            Notificacion.usuarioid == current_user.id,
+            Notificacion.leida == False,
+        )
+        .count()
+    )
+
+    # Cesiones activas
+    cesiones_query = db.query(Transferencia).filter(
+        Transferencia.activo == True,
+    )
+
+    if current_user.rol == 1:
+        if current_user.consultorioid is None:
+            raise HTTPException(
+                status_code=403,
+                detail="El secretario no tiene consultorio asignado.",
+            )
+
+        terapeutas_ids = [
+            row.id
+            for row in db.query(Usuario.id)
+            .filter(
+                Usuario.rol == 2,
+                Usuario.activo == True,
+                Usuario.consultorioid == current_user.consultorioid,
+            )
+            .all()
+        ]
+
+        cesiones_query = cesiones_query.filter(
+            Transferencia.terapeuta_origen_id.in_(terapeutas_ids),
+            Transferencia.terapeuta_destino_id.in_(terapeutas_ids),
+        )
+
+    elif current_user.rol == 2:
+        cesiones_query = cesiones_query.filter(
+            Transferencia.terapeuta_destino_id == current_user.id,
+        )
+
+    elif current_user.rol == 3:
+        pass
+
+    else:
+        raise HTTPException(
+            status_code=403,
+            detail="No autorizado",
+        )
+
+    cesiones_activas = cesiones_query.count()
+
+    return DashboardLiteOut(
+        sesiones_hoy=resumen.sesiones_hoy,
+        pacientes_atendidos_hoy=resumen.pacientes_atendidos_hoy,
+        tratamientos_activos=resumen.tratamientos_activos,
+        ingresos_hoy=resumen.ingresos_hoy,
+        cuentas_pendientes=resumen.cuentas_pendientes,
+        saldo_pendiente_total=resumen.saldo_pendiente_total,
+        transferencias_pendientes=resumen.transferencias_pendientes,
+        saldo_a_favor_total=resumen.saldo_a_favor_total,
+        alertas_no_leidas=alertas_no_leidas,
+        notificaciones_no_leidas=notificaciones_no_leidas,
+        cesiones_activas=cesiones_activas,
     )
 
 

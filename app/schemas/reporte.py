@@ -63,6 +63,11 @@ class DashboardResumenOut(BaseModel):
     transferencias_pendientes: int = 0
     saldo_a_favor_total: float = 0
 
+class DashboardLiteOut(DashboardResumenOut):
+    alertas_no_leidas: int = 0
+    notificaciones_no_leidas: int = 0
+    cesiones_activas: int = 0
+
 
 # -----------------------------------------------------------------------------
 # Reporte general de terapias
