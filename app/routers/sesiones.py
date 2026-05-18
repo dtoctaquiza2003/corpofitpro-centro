@@ -214,6 +214,38 @@ def obtener_tratamiento_activo(
 
     return tratamientos[0]
 
+def validar_sesiones_disponibles_para_tratamiento(
+    db: Session,
+    tratamiento: TratamientoPaciente,
+) -> None:
+    """
+    Evita iniciar nuevas atenciones cuando el tratamiento ya llegó al número
+    de sesiones estimadas. Esta validación queda en backend para que el front
+    no tenga que cargar todas las sesiones generales solo para calcularlo.
+    """
+    if tratamiento.sesiones_estimadas is None or tratamiento.sesiones_estimadas <= 0:
+        return
+
+    sesiones_realizadas = (
+        db.query(SesionTerapia.id)
+        .filter(
+            SesionTerapia.pacienteid == tratamiento.pacienteid,
+            SesionTerapia.tratamientopacienteid == tratamiento.id,
+            SesionTerapia.horasalida != None,
+        )
+        .count()
+    )
+
+    if sesiones_realizadas >= tratamiento.sesiones_estimadas:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Este tratamiento ya no tiene sesiones disponibles. "
+                "No se puede iniciar una nueva atención."
+            ),
+        )
+
+
 def _nombre_paciente(paciente: Paciente | None) -> str:
     if not paciente:
         return "Paciente"
@@ -391,6 +423,11 @@ def iniciar_sesion(
         db=db,
         paciente_id=data.pacienteid,
         tratamiento_id=data.tratamientopacienteid,
+    )
+
+    validar_sesiones_disponibles_para_tratamiento(
+        db=db,
+        tratamiento=tratamiento_activo,
     )
 
     ahora = now_ecuador()
