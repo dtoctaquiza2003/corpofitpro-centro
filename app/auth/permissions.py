@@ -1,9 +1,15 @@
+from datetime import date
 from typing import Optional
 
 from fastapi import HTTPException
 
 from ..models.paciente import Paciente
 from ..models.usuario import Usuario
+
+from sqlalchemy import or_
+from sqlalchemy.orm import Session
+
+from ..models.paciente_terapeuta_compartido import PacienteTerapeutaCompartido
 
 
 def es_secretario(current_user: Usuario) -> bool:
@@ -69,9 +75,34 @@ def validar_secretario_puede_usar_consultorio(
     validar_consultorio_secretario(current_user, consultorioid)
 
 
+def terapeuta_tiene_paciente_compartido_activo(
+    db: Session,
+    paciente: Paciente,
+    current_user: Usuario,
+) -> bool:
+    if not es_terapeuta(current_user):
+        return False
+
+    existe = (
+        db.query(PacienteTerapeutaCompartido.id)
+        .filter(
+            PacienteTerapeutaCompartido.pacienteid == paciente.id,
+            PacienteTerapeutaCompartido.terapeutaid == current_user.id,
+            PacienteTerapeutaCompartido.activo == True,
+            or_(
+                PacienteTerapeutaCompartido.fecha_fin == None,
+                PacienteTerapeutaCompartido.fecha_fin >= date.today(),
+            ),
+        )
+        .first()
+    )
+
+    return existe is not None
+
 def validar_acceso_paciente_por_rol(
     paciente: Paciente,
     current_user: Usuario,
+    db: Optional[Session] = None,
 ) -> None:
     """
     Valida acceso a un paciente específico según el rol.
@@ -97,12 +128,20 @@ def validar_acceso_paciente_por_rol(
         return
 
     if es_terapeuta(current_user):
-        if paciente.terapeutaasignadoid != current_user.id:
-            raise HTTPException(
-                status_code=403,
-                detail="No autorizado para acceder a este paciente.",
-            )
-        return
+        if paciente.terapeutaasignadoid == current_user.id:
+            return
+
+        if db is not None and terapeuta_tiene_paciente_compartido_activo(
+            db=db,
+            paciente=paciente,
+            current_user=current_user,
+        ):
+            return
+
+        raise HTTPException(
+            status_code=403,
+            detail="No autorizado para acceder a este paciente.",
+        )
 
     raise HTTPException(
         status_code=403,

@@ -2,6 +2,7 @@ from datetime import datetime, timezone, timedelta
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import or_
 from sqlalchemy.orm import Session, joinedload
 
 from ..services.notificacion_service import crear_notificacion_usuario
@@ -21,12 +22,97 @@ from ..schemas.sesion import (
     SesionAtencionOut,
     TipoTratamientoOut,
 )
+from ..models.paciente_terapeuta_compartido import PacienteTerapeutaCompartido
+from ..models.transferencia import Transferencia
+
 
 router = APIRouter(prefix="/api/sesiones", tags=["sesiones"])
 
 
 def now_ecuador() -> datetime:
     return datetime.now(timezone(timedelta(hours=-5)))
+
+
+def _tiene_autorizacion_compartida_activa(
+    db: Session,
+    paciente_id: int,
+    terapeuta_id: int,
+) -> bool:
+    hoy = now_ecuador().date()
+
+    existe = (
+        db.query(PacienteTerapeutaCompartido.id)
+        .filter(
+            PacienteTerapeutaCompartido.pacienteid == paciente_id,
+            PacienteTerapeutaCompartido.terapeutaid == terapeuta_id,
+            PacienteTerapeutaCompartido.activo == True,
+            or_(
+                PacienteTerapeutaCompartido.fecha_inicio == None,
+                PacienteTerapeutaCompartido.fecha_inicio <= hoy,
+            ),
+            or_(
+                PacienteTerapeutaCompartido.fecha_fin == None,
+                PacienteTerapeutaCompartido.fecha_fin >= hoy,
+            ),
+        )
+        .first()
+    )
+
+    return existe is not None
+
+
+def _tiene_cesion_temporal_activa(
+    db: Session,
+    paciente_id: int,
+    terapeuta_id: int,
+) -> bool:
+    transferencias = (
+        db.query(Transferencia)
+        .filter(
+            Transferencia.terapeuta_destino_id == terapeuta_id,
+            Transferencia.activo == True,
+        )
+        .options(joinedload(Transferencia.pacientes))
+        .all()
+    )
+
+    for transferencia in transferencias:
+        for paciente in transferencia.pacientes:
+            if paciente.id == paciente_id:
+                return True
+
+    return False
+
+
+def _terapeuta_puede_atender_paciente(
+    db: Session,
+    paciente: Paciente,
+    current_user: Usuario,
+) -> bool:
+    if current_user.rol != 2:
+        return False
+
+    # 1. Paciente propio
+    if paciente.terapeutaasignadoid == current_user.id:
+        return True
+
+    # 2. Paciente compartido excepcionalmente
+    if _tiene_autorizacion_compartida_activa(
+        db=db,
+        paciente_id=paciente.id,
+        terapeuta_id=current_user.id,
+    ):
+        return True
+
+    # 3. Paciente cedido temporalmente
+    if _tiene_cesion_temporal_activa(
+        db=db,
+        paciente_id=paciente.id,
+        terapeuta_id=current_user.id,
+    ):
+        return True
+
+    return False
 
 
 def build_sesion_out(
@@ -259,6 +345,7 @@ def _notificar_alerta_clinica(
     response_model=SesionAtencionOut,
     status_code=status.HTTP_201_CREATED,
 )
+
 def iniciar_sesion(
     data: InicioSesionCreate,
     db: Session = Depends(get_db),
@@ -272,10 +359,17 @@ def iniciar_sesion(
             detail="Paciente no encontrado",
         )
 
-    if paciente.terapeutaasignadoid != current_user.id:
+    if not _terapeuta_puede_atender_paciente(
+        db=db,
+        paciente=paciente,
+        current_user=current_user,
+    ):
         raise HTTPException(
             status_code=403,
-            detail="No puedes atender a un paciente que no está asignado a ti",
+            detail=(
+                "No puedes atender este paciente. "
+                "Debe estar asignado a ti, compartido contigo o cedido temporalmente."
+            ),
         )
 
     sesion_abierta = (

@@ -1,3 +1,5 @@
+from datetime import date
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import or_
 from sqlalchemy.orm import Session, joinedload
@@ -9,6 +11,7 @@ from ..dependencies.db import get_db
 from ..models.paciente import Paciente
 from ..models.usuario import Usuario
 from ..models.transferencia import Transferencia
+from ..models.paciente_terapeuta_compartido import PacienteTerapeutaCompartido
 from ..auth.dependencies import get_current_user, get_current_secretary
 from ..schemas.paciente import PacienteCreate, PacienteOut, PacientesPageOut
 from ..auth.permissions import (
@@ -35,10 +38,14 @@ def _paciente_to_out(
     paciente: Paciente,
     es_cedido: bool = False,
     motivo_cesion: Optional[str] = None,
+    es_compartido: bool = False,
+    motivo_compartido: Optional[str] = None,
 ) -> PacienteOut:
     data = {c.name: getattr(paciente, c.name) for c in paciente.__table__.columns}
     data["es_cedido"] = es_cedido
     data["motivo_cesion"] = motivo_cesion
+    data["es_compartido"] = es_compartido
+    data["motivo_compartido"] = motivo_compartido
     return PacienteOut(**data)
 
 
@@ -105,6 +112,88 @@ def _aplicar_busqueda_pacientes(query, search: Optional[str]):
     )
 
 
+def _compartidos_activos_query(db: Session, terapeuta_id: int):
+    hoy = date.today()
+
+    return db.query(PacienteTerapeutaCompartido).filter(
+        PacienteTerapeutaCompartido.terapeutaid == terapeuta_id,
+        PacienteTerapeutaCompartido.activo == True,
+        or_(
+            PacienteTerapeutaCompartido.fecha_inicio == None,
+            PacienteTerapeutaCompartido.fecha_inicio <= hoy,
+        ),
+        or_(
+            PacienteTerapeutaCompartido.fecha_fin == None,
+            PacienteTerapeutaCompartido.fecha_fin >= hoy,
+        ),
+    )
+
+
+def _compartidos_subquery(db: Session, terapeuta_id: int):
+    return _compartidos_activos_query(db, terapeuta_id).with_entities(
+        PacienteTerapeutaCompartido.pacienteid
+    )
+
+
+def _motivos_compartidos_para_pacientes(
+    db: Session,
+    terapeuta_id: int,
+    paciente_ids: List[int],
+) -> dict[int, Optional[str]]:
+    if not paciente_ids:
+        return {}
+
+    rows = (
+        _compartidos_activos_query(db, terapeuta_id)
+        .filter(PacienteTerapeutaCompartido.pacienteid.in_(paciente_ids))
+        .all()
+    )
+
+    return {row.pacienteid: row.motivo for row in rows}
+
+
+def _cedidos_para_terapeuta(
+    db: Session,
+    terapeuta_id: int,
+    paciente_ids: Optional[List[int]] = None,
+) -> tuple[set[int], dict[int, Optional[str]]]:
+    transferencias = (
+        db.query(Transferencia)
+        .filter(
+            Transferencia.terapeuta_destino_id == terapeuta_id,
+            Transferencia.activo == True,
+        )
+        .options(joinedload(Transferencia.pacientes))
+        .all()
+    )
+
+    allowed_ids = set(paciente_ids or [])
+    cedidos_ids: set[int] = set()
+    motivo_map: dict[int, Optional[str]] = {}
+
+    for transferencia in transferencias:
+        for paciente in transferencia.pacientes:
+            if paciente_ids is not None and paciente.id not in allowed_ids:
+                continue
+
+            cedidos_ids.add(paciente.id)
+            motivo_map[paciente.id] = transferencia.motivo
+
+    return cedidos_ids, motivo_map
+
+
+def _paciente_compartido_activo(
+    db: Session,
+    paciente_id: int,
+    terapeuta_id: int,
+) -> Optional[PacienteTerapeutaCompartido]:
+    return (
+        _compartidos_activos_query(db, terapeuta_id)
+        .filter(PacienteTerapeutaCompartido.pacienteid == paciente_id)
+        .first()
+    )
+
+
 # ============================================================
 # LISTAR PACIENTES
 # ============================================================
@@ -115,7 +204,7 @@ def listar_pacientes_paginado(
     terapeuta_id: Optional[int] = Query(None),
     consultorio_id: Optional[int] = Query(None),
     search: Optional[str] = Query(None),
-    limit: int = Query(20, ge=1, le=50),
+    limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
     current_user: Usuario = Depends(get_current_user),
@@ -123,68 +212,27 @@ def listar_pacientes_paginado(
     """
     Lista liviana y paginada para la pantalla de pacientes.
 
-    Evita traer todos los pacientes cuando la clínica ya tiene muchos registros.
-    Mantiene las reglas por rol:
-    - Terapeuta: solo sus pacientes asignados.
-    - Secretario: solo pacientes de su consultorio.
-    - Jefe: todos o filtrados por consultorio/terapeuta.
+    Incluye casos excepcionales de pacientes compartidos:
+    - Terapeuta: ve pacientes principales + pacientes compartidos activos.
+    - Secretario/Jefe con terapeuta_id: ve pacientes principales + compartidos de ese terapeuta.
     """
 
+    terapeuta_para_compartidos: Optional[int] = None
+
     if current_user.rol == 2:
+        terapeuta_para_compartidos = current_user.id
+        compartidos_subq = _compartidos_subquery(db, current_user.id)
+
         query = db.query(Paciente).filter(
-            Paciente.terapeutaasignadoid == current_user.id
+            or_(
+                Paciente.terapeutaasignadoid == current_user.id,
+                Paciente.id.in_(compartidos_subq),
+            )
         )
 
         query = _aplicar_busqueda_pacientes(query, search)
 
-        total = query.count()
-
-        pacientes = (
-            query.order_by(Paciente.apellidos.asc(), Paciente.nombres.asc())
-            .offset(offset)
-            .limit(limit)
-            .all()
-        )
-
-        paciente_ids = [p.id for p in pacientes]
-        cedidos_ids = set()
-        motivo_map = {}
-
-        if paciente_ids:
-            transferencias = (
-                db.query(Transferencia)
-                .filter(
-                    Transferencia.terapeuta_destino_id == current_user.id,
-                    Transferencia.activo == True,
-                )
-                .options(joinedload(Transferencia.pacientes))
-                .all()
-            )
-
-            for transferencia in transferencias:
-                for paciente in transferencia.pacientes:
-                    if paciente.id in paciente_ids:
-                        cedidos_ids.add(paciente.id)
-                        motivo_map[paciente.id] = transferencia.motivo
-
-        items = [
-            _paciente_to_out(
-                paciente,
-                paciente.id in cedidos_ids,
-                motivo_map.get(paciente.id),
-            )
-            for paciente in pacientes
-        ]
-
-        return PacientesPageOut(
-            items=items,
-            total=total,
-            limit=limit,
-            offset=offset,
-            has_more=(offset + len(items)) < total,
-        )
-
-    if current_user.rol == 1:
+    elif current_user.rol == 1:
         validar_consultorio_secretario(
             current_user,
             current_user.consultorioid,
@@ -195,62 +243,91 @@ def listar_pacientes_paginado(
         )
 
         if terapeuta_id:
-            query = query.filter(Paciente.terapeutaasignadoid == terapeuta_id)
+            terapeuta_para_compartidos = terapeuta_id
+            compartidos_subq = _compartidos_subquery(db, terapeuta_id)
+            query = query.filter(
+                or_(
+                    Paciente.terapeutaasignadoid == terapeuta_id,
+                    Paciente.id.in_(compartidos_subq),
+                )
+            )
 
         query = _aplicar_busqueda_pacientes(query, search)
 
-        total = query.count()
-
-        pacientes = (
-            query.order_by(Paciente.apellidos.asc(), Paciente.nombres.asc())
-            .offset(offset)
-            .limit(limit)
-            .all()
-        )
-
-        items = [_paciente_to_out(paciente) for paciente in pacientes]
-
-        return PacientesPageOut(
-            items=items,
-            total=total,
-            limit=limit,
-            offset=offset,
-            has_more=(offset + len(items)) < total,
-        )
-
-    if current_user.rol == 3:
+    elif current_user.rol == 3:
         query = db.query(Paciente)
 
         if terapeuta_id:
-            query = query.filter(Paciente.terapeutaasignadoid == terapeuta_id)
+            terapeuta_para_compartidos = terapeuta_id
+            compartidos_subq = _compartidos_subquery(db, terapeuta_id)
+            query = query.filter(
+                or_(
+                    Paciente.terapeutaasignadoid == terapeuta_id,
+                    Paciente.id.in_(compartidos_subq),
+                )
+            )
 
         if consultorio_id:
             query = query.filter(Paciente.consultorioid == consultorio_id)
 
         query = _aplicar_busqueda_pacientes(query, search)
 
-        total = query.count()
-
-        pacientes = (
-            query.order_by(Paciente.apellidos.asc(), Paciente.nombres.asc())
-            .offset(offset)
-            .limit(limit)
-            .all()
+    else:
+        raise HTTPException(
+            status_code=403,
+            detail="No autorizado para listar pacientes.",
         )
 
-        items = [_paciente_to_out(paciente) for paciente in pacientes]
+    total = query.count()
 
-        return PacientesPageOut(
-            items=items,
-            total=total,
-            limit=limit,
-            offset=offset,
-            has_more=(offset + len(items)) < total,
+    pacientes = (
+        query.order_by(Paciente.apellidos.asc(), Paciente.nombres.asc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+
+    paciente_ids = [p.id for p in pacientes]
+
+    cedidos_ids: set[int] = set()
+    motivo_cesion_map: dict[int, Optional[str]] = {}
+
+    compartidos_map: dict[int, Optional[str]] = {}
+
+    if terapeuta_para_compartidos is not None:
+        compartidos_map = _motivos_compartidos_para_pacientes(
+            db,
+            terapeuta_para_compartidos,
+            paciente_ids,
         )
 
-    raise HTTPException(
-        status_code=403,
-        detail="No autorizado para listar pacientes.",
+    if current_user.rol == 2:
+        cedidos_ids, motivo_cesion_map = _cedidos_para_terapeuta(
+            db,
+            current_user.id,
+            paciente_ids,
+        )
+
+    items = [
+        _paciente_to_out(
+            paciente,
+            es_cedido=paciente.id in cedidos_ids,
+            motivo_cesion=motivo_cesion_map.get(paciente.id),
+            es_compartido=(
+                paciente.id in compartidos_map
+                and paciente.terapeutaasignadoid != terapeuta_para_compartidos
+            ),
+            motivo_compartido=compartidos_map.get(paciente.id),
+        )
+        for paciente in pacientes
+    ]
+
+    return PacientesPageOut(
+        items=items,
+        total=total,
+        limit=limit,
+        offset=offset,
+        has_more=(offset + len(items)) < total,
     )
 
 
@@ -260,41 +337,49 @@ def listar_pacientes(
     db: Session = Depends(get_db),
     current_user: Usuario = Depends(get_current_user),
 ):
-    # TERAPEUTA: solo ve sus pacientes asignados
+    # TERAPEUTA: ve pacientes principales + compartidos activos + cedidos temporales
     if current_user.rol == 2:
-        propios = (
+        compartidos_subq = _compartidos_subquery(db, current_user.id)
+
+        pacientes = (
             db.query(Paciente)
-            .filter(Paciente.terapeutaasignadoid == current_user.id)
+            .filter(
+                or_(
+                    Paciente.terapeutaasignadoid == current_user.id,
+                    Paciente.id.in_(compartidos_subq),
+                )
+            )
             .order_by(Paciente.apellidos.asc(), Paciente.nombres.asc())
             .all()
         )
 
-        transferencias = (
-            db.query(Transferencia)
-            .filter(
-                Transferencia.terapeuta_destino_id == current_user.id,
-                Transferencia.activo == True,
-            )
-            .options(joinedload(Transferencia.pacientes))
-            .all()
+        paciente_ids = [p.id for p in pacientes]
+
+        cedidos_ids, motivo_cesion_map = _cedidos_para_terapeuta(
+            db,
+            current_user.id,
+            paciente_ids,
         )
 
-        cedidos_ids = set()
-        motivo_map = {}
+        compartidos_map = _motivos_compartidos_para_pacientes(
+            db,
+            current_user.id,
+            paciente_ids,
+        )
 
-        for transferencia in transferencias:
-            for paciente in transferencia.pacientes:
-                cedidos_ids.add(paciente.id)
-                motivo_map[paciente.id] = transferencia.motivo
-
-        resultado = []
-
-        for paciente in propios:
-            es_cedido = paciente.id in cedidos_ids
-            motivo = motivo_map.get(paciente.id) if es_cedido else None
-            resultado.append(_paciente_to_out(paciente, es_cedido, motivo))
-
-        return resultado
+        return [
+            _paciente_to_out(
+                paciente,
+                es_cedido=paciente.id in cedidos_ids,
+                motivo_cesion=motivo_cesion_map.get(paciente.id),
+                es_compartido=(
+                    paciente.id in compartidos_map
+                    and paciente.terapeutaasignadoid != current_user.id
+                ),
+                motivo_compartido=compartidos_map.get(paciente.id),
+            )
+            for paciente in pacientes
+        ]
 
     # SECRETARIO: solo ve pacientes de su consultorio
     if current_user.rol == 1:
@@ -307,29 +392,80 @@ def listar_pacientes(
             Paciente.consultorioid == current_user.consultorioid
         )
 
+        compartidos_map: dict[int, Optional[str]] = {}
+
         if terapeuta_id:
-            query = query.filter(Paciente.terapeutaasignadoid == terapeuta_id)
+            compartidos_subq = _compartidos_subquery(db, terapeuta_id)
+            query = query.filter(
+                or_(
+                    Paciente.terapeutaasignadoid == terapeuta_id,
+                    Paciente.id.in_(compartidos_subq),
+                )
+            )
 
         pacientes = query.order_by(
             Paciente.apellidos.asc(),
             Paciente.nombres.asc(),
         ).all()
 
-        return [_paciente_to_out(paciente) for paciente in pacientes]
+        if terapeuta_id:
+            compartidos_map = _motivos_compartidos_para_pacientes(
+                db,
+                terapeuta_id,
+                [p.id for p in pacientes],
+            )
 
-    # JEFE: ve todos los pacientes
+        return [
+            _paciente_to_out(
+                paciente,
+                es_compartido=(
+                    terapeuta_id is not None
+                    and paciente.id in compartidos_map
+                    and paciente.terapeutaasignadoid != terapeuta_id
+                ),
+                motivo_compartido=compartidos_map.get(paciente.id),
+            )
+            for paciente in pacientes
+        ]
+
+    # JEFE: ve todos los pacientes, o principales + compartidos si filtra por terapeuta
     if current_user.rol == 3:
         query = db.query(Paciente)
+        compartidos_map: dict[int, Optional[str]] = {}
 
         if terapeuta_id:
-            query = query.filter(Paciente.terapeutaasignadoid == terapeuta_id)
+            compartidos_subq = _compartidos_subquery(db, terapeuta_id)
+            query = query.filter(
+                or_(
+                    Paciente.terapeutaasignadoid == terapeuta_id,
+                    Paciente.id.in_(compartidos_subq),
+                )
+            )
 
         pacientes = query.order_by(
             Paciente.apellidos.asc(),
             Paciente.nombres.asc(),
         ).all()
 
-        return [_paciente_to_out(paciente) for paciente in pacientes]
+        if terapeuta_id:
+            compartidos_map = _motivos_compartidos_para_pacientes(
+                db,
+                terapeuta_id,
+                [p.id for p in pacientes],
+            )
+
+        return [
+            _paciente_to_out(
+                paciente,
+                es_compartido=(
+                    terapeuta_id is not None
+                    and paciente.id in compartidos_map
+                    and paciente.terapeutaasignadoid != terapeuta_id
+                ),
+                motivo_compartido=compartidos_map.get(paciente.id),
+            )
+            for paciente in pacientes
+        ]
 
     raise HTTPException(
         status_code=403,
@@ -359,14 +495,14 @@ def listar_pacientes_por_terapeuta(
             detail="Terapeuta no encontrado",
         )
 
-    # TERAPEUTA: solo puede consultar sus propios pacientes
+    # TERAPEUTA: solo puede consultar sus propios pacientes y compartidos consigo.
     if current_user.rol == 2 and current_user.id != terapeuta_id:
         raise HTTPException(
             status_code=403,
             detail="No autorizado",
         )
 
-    # SECRETARIO: solo puede consultar terapeutas de su consultorio
+    # SECRETARIO: solo puede consultar terapeutas de su consultorio.
     if current_user.rol == 1:
         validar_consultorio_secretario(
             current_user,
@@ -379,14 +515,37 @@ def listar_pacientes_por_terapeuta(
             detail="No autorizado",
         )
 
+    compartidos_subq = _compartidos_subquery(db, terapeuta_id)
+
     pacientes = (
         db.query(Paciente)
-        .filter(Paciente.terapeutaasignadoid == terapeuta_id)
+        .filter(
+            or_(
+                Paciente.terapeutaasignadoid == terapeuta_id,
+                Paciente.id.in_(compartidos_subq),
+            )
+        )
         .order_by(Paciente.apellidos.asc(), Paciente.nombres.asc())
         .all()
     )
 
-    return [_paciente_to_out(paciente) for paciente in pacientes]
+    compartidos_map = _motivos_compartidos_para_pacientes(
+        db,
+        terapeuta_id,
+        [p.id for p in pacientes],
+    )
+
+    return [
+        _paciente_to_out(
+            paciente,
+            es_compartido=(
+                paciente.id in compartidos_map
+                and paciente.terapeutaasignadoid != terapeuta_id
+            ),
+            motivo_compartido=compartidos_map.get(paciente.id),
+        )
+        for paciente in pacientes
+    ]
 
 
 # ============================================================
@@ -775,6 +934,23 @@ def obtener_paciente(
             status_code=404,
             detail="Paciente no encontrado",
         )
+
+    if current_user.rol == 2:
+        compartido = _paciente_compartido_activo(
+            db,
+            paciente.id,
+            current_user.id,
+        )
+
+        if (
+            paciente.terapeutaasignadoid != current_user.id
+            and compartido is not None
+        ):
+            return _paciente_to_out(
+                paciente,
+                es_compartido=True,
+                motivo_compartido=compartido.motivo,
+            )
 
     validar_acceso_paciente_por_rol(paciente, current_user)
 

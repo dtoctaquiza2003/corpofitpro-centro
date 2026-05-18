@@ -50,6 +50,8 @@ class PacienteOut(PacienteBase):
     fechaalta: Optional[date] = None
     es_cedido: bool = False
     motivo_cesion: Optional[str] = None
+    es_compartido: bool = False
+    motivo_compartido: Optional[str] = None
 
     class Config:
         from_attributes = True

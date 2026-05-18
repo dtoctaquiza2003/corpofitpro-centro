@@ -109,7 +109,6 @@ def compartir_paciente(
     # y con terapeutas de su mismo consultorio.
     if current_user.rol == 1:
         validar_consultorio_secretario(current_user, paciente.consultorioid)
-        validar_consultorio_secretario(current_user, terapeuta.consultorioid)
 
     # Jefe puede compartir entre consultorios si lo necesita.
     if current_user.rol not in (1, 3):
@@ -192,7 +191,7 @@ def listar_compartidos_por_paciente(
 ):
     paciente = _obtener_paciente(db, pacienteid)
 
-    validar_acceso_paciente_por_rol(paciente, current_user)
+    validar_acceso_paciente_por_rol(paciente, current_user, db=db)
 
     rows = (
         db.query(PacienteTerapeutaCompartido, Usuario)
@@ -277,7 +276,6 @@ def desactivar_paciente_compartido(
 
     if current_user.rol == 1:
         validar_consultorio_secretario(current_user, paciente.consultorioid)
-        validar_consultorio_secretario(current_user, terapeuta.consultorioid)
 
     if current_user.rol not in (1, 3):
         raise HTTPException(
