@@ -921,6 +921,33 @@ def crear_paciente(
 # IMPORTANTE: van después de /transferir y /transferir/seleccionados
 # ============================================================
 
+@router.get("/buscar-por-cedula/{cedula}", response_model=PacienteOut)
+def buscar_paciente_por_cedula(
+    cedula: str,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(get_current_user),
+):
+    paciente = (
+        db.query(Paciente)
+        .filter(Paciente.cedula == cedula)
+        .first()
+    )
+
+    if not paciente:
+        raise HTTPException(
+            status_code=404,
+            detail="Paciente no encontrado.",
+        )
+
+    validar_acceso_paciente_por_rol(
+        paciente,
+        current_user,
+        db=db,
+    )
+
+    return _paciente_to_out(paciente)
+
+
 @router.get("/{paciente_id}", response_model=PacienteOut)
 def obtener_paciente(
     paciente_id: int,
