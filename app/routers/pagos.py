@@ -1,3 +1,4 @@
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
@@ -635,18 +636,45 @@ def listar_cuentas_tratamientos(
         .all()
     )
 
+    if not tratamientos:
+        return []
+
+    tratamiento_ids = [tratamiento.id for tratamiento, _ in tratamientos]
+
+    sesiones_rows = (
+        db.query(
+            SesionTerapia.tratamientopacienteid,
+            func.count(SesionTerapia.id),
+        )
+        .filter(
+            SesionTerapia.tratamientopacienteid.in_(tratamiento_ids),
+            SesionTerapia.horasalida != None,
+        )
+        .group_by(SesionTerapia.tratamientopacienteid)
+        .all()
+    )
+
+    sesiones_por_tratamiento = {
+        tratamiento_id: int(total or 0)
+        for tratamiento_id, total in sesiones_rows
+    }
+
+    pagos_rows = (
+        db.query(Pago)
+        .filter(Pago.tratamientopacienteid.in_(tratamiento_ids))
+        .order_by(Pago.fechapago.asc())
+        .all()
+    )
+
+    pagos_por_tratamiento = defaultdict(list)
+
+    for pago in pagos_rows:
+        pagos_por_tratamiento[pago.tratamientopacienteid].append(pago)
+
     resultado = []
 
     for tratamiento, paciente in tratamientos:
-        sesiones_realizadas = (
-            db.query(func.count(SesionTerapia.id))
-            .filter(
-                SesionTerapia.tratamientopacienteid == tratamiento.id,
-                SesionTerapia.horasalida != None,
-            )
-            .scalar()
-            or 0
-        )
+        sesiones_realizadas = sesiones_por_tratamiento.get(tratamiento.id, 0)
 
         precio_aplicado = (
             float(tratamiento.precio_sesion_aplicado)
@@ -656,26 +684,27 @@ def listar_cuentas_tratamientos(
 
         total_generado = float(sesiones_realizadas) * precio_aplicado
 
-        pagos = (
-            db.query(Pago)
-            .filter(Pago.tratamientopacienteid == tratamiento.id)
-            .order_by(Pago.fechapago.asc())
-            .all()
-        )
+        pagos = pagos_por_tratamiento.get(tratamiento.id, [])
+
+        pagos_no_anulados = [
+            pago for pago in pagos if not bool(pago.anulado)
+        ]
 
         pagado_verificado = sum(
-            float(pago.monto)
-            for pago in pagos
+            float(pago.monto or 0)
+            for pago in pagos_no_anulados
             if pago.estadopago == 2
         )
 
         pendiente_verificacion = sum(
-            float(pago.monto)
-            for pago in pagos
+            float(pago.monto or 0)
+            for pago in pagos_no_anulados
             if pago.estadopago == 1
         )
 
-        saldo = max(total_generado - pagado_verificado, 0)
+        saldo_real = total_generado - pagado_verificado
+        saldo = max(saldo_real, 0)
+        saldo_favor = max(pagado_verificado - total_generado, 0)
 
         nombre_tipo_terapia = None
 
@@ -706,6 +735,7 @@ def listar_cuentas_tratamientos(
                 pagado_verificado=pagado_verificado,
                 pendiente_verificacion=pendiente_verificacion,
                 saldo=saldo,
+                saldo_favor=saldo_favor,
                 estado_pago=_estado_cuenta(
                     total_generado=total_generado,
                     pagado=pagado_verificado,
@@ -717,7 +747,7 @@ def listar_cuentas_tratamientos(
                 pagos=[
                     PagoSimpleOut(
                         id=pago.id,
-                        monto=float(pago.monto),
+                        monto=float(pago.monto or 0),
                         metodopago=pago.metodopago,
                         fechapago=pago.fechapago,
                         numerocomprobante=pago.numerocomprobante,
@@ -728,6 +758,12 @@ def listar_cuentas_tratamientos(
                         verificado_por_id=pago.verificado_por_id,
                         fecha_verificacion=pago.fecha_verificacion,
                         motivo_rechazo=pago.motivo_rechazo,
+
+                        # IMPORTANTE PARA QUE FLUTTER LO MUESTRE BIEN
+                        anulado=bool(pago.anulado),
+                        anulado_por_id=pago.anulado_por_id,
+                        fecha_anulacion=pago.fecha_anulacion,
+                        motivo_anulacion=pago.motivo_anulacion,
                     )
                     for pago in pagos
                 ],
@@ -735,7 +771,6 @@ def listar_cuentas_tratamientos(
         )
 
     return resultado
-
 
 # ============================================================
 # CUENTAS POR GIMNASIO
@@ -782,31 +817,49 @@ def listar_cuentas_gimnasio(
         .all()
     )
 
+    if not membresias:
+        return []
+
+    membresia_ids = [membresia.id for membresia, _ in membresias]
+
+    pagos_rows = (
+        db.query(Pago)
+        .filter(Pago.membresiagimnasioid.in_(membresia_ids))
+        .order_by(Pago.fechapago.asc())
+        .all()
+    )
+
+    pagos_por_membresia = defaultdict(list)
+
+    for pago in pagos_rows:
+        pagos_por_membresia[pago.membresiagimnasioid].append(pago)
+
     resultado = []
 
     for membresia, paciente in membresias:
         precio = float(membresia.precio or 0)
 
-        pagos = (
-            db.query(Pago)
-            .filter(Pago.membresiagimnasioid == membresia.id)
-            .order_by(Pago.fechapago.asc())
-            .all()
-        )
+        pagos = pagos_por_membresia.get(membresia.id, [])
+
+        pagos_no_anulados = [
+            pago for pago in pagos if not bool(pago.anulado)
+        ]
 
         pagado_verificado = sum(
-            float(pago.monto)
-            for pago in pagos
+            float(pago.monto or 0)
+            for pago in pagos_no_anulados
             if pago.estadopago == 2
         )
 
         pendiente_verificacion = sum(
-            float(pago.monto)
-            for pago in pagos
+            float(pago.monto or 0)
+            for pago in pagos_no_anulados
             if pago.estadopago == 1
         )
 
-        saldo = max(precio - pagado_verificado, 0)
+        saldo_real = precio - pagado_verificado
+        saldo = max(saldo_real, 0)
+        saldo_favor = max(pagado_verificado - precio, 0)
 
         resultado.append(
             CuentaMembresiaGimnasioOut(
@@ -821,6 +874,7 @@ def listar_cuentas_gimnasio(
                 pagado_verificado=pagado_verificado,
                 pendiente_verificacion=pendiente_verificacion,
                 saldo=saldo,
+                saldo_favor=saldo_favor,
                 estado_pago=_estado_cuenta(
                     total_generado=precio,
                     pagado=pagado_verificado,
@@ -829,7 +883,7 @@ def listar_cuentas_gimnasio(
                 pagos=[
                     PagoSimpleOut(
                         id=pago.id,
-                        monto=float(pago.monto),
+                        monto=float(pago.monto or 0),
                         metodopago=pago.metodopago,
                         fechapago=pago.fechapago,
                         numerocomprobante=pago.numerocomprobante,
@@ -840,6 +894,10 @@ def listar_cuentas_gimnasio(
                         verificado_por_id=pago.verificado_por_id,
                         fecha_verificacion=pago.fecha_verificacion,
                         motivo_rechazo=pago.motivo_rechazo,
+                        anulado=bool(pago.anulado),
+                        anulado_por_id=pago.anulado_por_id,
+                        fecha_anulacion=pago.fecha_anulacion,
+                        motivo_anulacion=pago.motivo_anulacion,
                     )
                     for pago in pagos
                 ],

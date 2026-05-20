@@ -9,6 +9,7 @@ class PagoCreate(BaseModel):
     pacientepaqueteid: Optional[int] = None
     tratamientopacienteid: Optional[int] = None
     membresiagimnasioid: Optional[int] = None
+
     monto: float = Field(..., gt=0)
     metodopago: str
 
@@ -29,12 +30,17 @@ class PagoOut(BaseModel):
     pacientepaqueteid: Optional[int] = None
     tratamientopacienteid: Optional[int] = None
     membresiagimnasioid: Optional[int] = None
+
     monto: float
     metodopago: Optional[str] = None
     fechapago: datetime
 
     numerocomprobante: Optional[str] = None
     comprobanteurl: Optional[str] = None
+
+    # 1 = Pendiente
+    # 2 = Verificado
+    # 3 = Rechazado
     estadopago: Optional[int] = 2
 
     creado_por_id: Optional[int] = None
@@ -42,14 +48,13 @@ class PagoOut(BaseModel):
     fecha_verificacion: Optional[datetime] = None
     motivo_rechazo: Optional[str] = None
 
+    # Anulación
     anulado: bool = False
     anulado_por_id: Optional[int] = None
     fecha_anulacion: Optional[datetime] = None
     motivo_anulacion: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
-
-    
 
 
 class PagoSimpleOut(BaseModel):
@@ -62,6 +67,10 @@ class PagoSimpleOut(BaseModel):
 
     numerocomprobante: Optional[str] = None
     comprobanteurl: Optional[str] = None
+
+    # 1 = Pendiente
+    # 2 = Verificado
+    # 3 = Rechazado
     estadopago: Optional[int] = 2
 
     creado_por_id: Optional[int] = None
@@ -69,12 +78,14 @@ class PagoSimpleOut(BaseModel):
     fecha_verificacion: Optional[datetime] = None
     motivo_rechazo: Optional[str] = None
 
+    # Anulación
     anulado: bool = False
     anulado_por_id: Optional[int] = None
     fecha_anulacion: Optional[datetime] = None
     motivo_anulacion: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
+
 
 class CuentaPaqueteOut(BaseModel):
     pacientepaqueteid: int
@@ -117,6 +128,7 @@ class CuentaTratamientoOut(BaseModel):
     pagado_verificado: float
     pendiente_verificacion: float
     saldo: float
+    saldo_favor: float = 0
     estado_pago: str
 
     motivo_precio_especial: Optional[str] = None
@@ -125,6 +137,7 @@ class CuentaTratamientoOut(BaseModel):
     activo: bool
 
     pagos: List[PagoSimpleOut] = Field(default_factory=list)
+
 
 class CuentaMembresiaGimnasioOut(BaseModel):
     membresiagimnasioid: int
@@ -140,11 +153,13 @@ class CuentaMembresiaGimnasioOut(BaseModel):
     pagado_verificado: float
     pendiente_verificacion: float
     saldo: float
+    saldo_favor: float = 0
     estado_pago: str
 
     pagos: List[PagoSimpleOut] = Field(default_factory=list)
 
     model_config = ConfigDict(from_attributes=True)
+
 
 class PagoAnularRequest(BaseModel):
     motivo_anulacion: str = Field(..., min_length=5, max_length=500)
