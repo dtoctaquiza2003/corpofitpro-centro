@@ -21,3 +21,4 @@ from .gimnasio import (
     ResumenMembresiaGimnasioOut,
 )
 from.paciente_compartido import PacienteCompartidoCreate, PacienteCompartidoOut
+from .permiso_temporal import PermisoTemporalCreate, PermisoTemporalOut, PermisoTemporalEstadoOut

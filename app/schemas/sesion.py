@@ -8,10 +8,23 @@ class InicioSesionCreate(BaseModel):
     pacienteid: int
     escaladolorentrada: int = Field(..., ge=0, le=10)
 
-    # Nuevo flujo.
-    # Si el paciente solo tiene un tratamiento activo, puede omitirse.
-    # Si tiene varios, el backend pedirá seleccionar uno.
+    # Si se manda, permite registrar una sesión en una fecha específica.
+    # Si no se manda, se usa la fecha actual de Ecuador.
+    fecha_atencion: Optional[date] = None
+
+    # Para sesión normal se usa la hora actual.
+    # Para sesión retroactiva deben venir hora_ingreso y hora_salida.
+    hora_ingreso: Optional[time] = None
+    hora_salida: Optional[time] = None
+
+    # Solo obligatorio si se registra retroactiva finalizada.
+    escaladolorsalida: Optional[int] = Field(default=None, ge=0, le=10)
+
+    # Tratamiento asociado.
     tratamientopacienteid: Optional[int] = None
+
+    # Si true, la sesión se guarda ya finalizada.
+    retroactiva: bool = False
 
     model_config = ConfigDict(populate_by_name=True)
 

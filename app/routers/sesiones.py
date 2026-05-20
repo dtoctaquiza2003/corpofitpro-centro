@@ -1,4 +1,4 @@
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date, time
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -7,7 +7,11 @@ from sqlalchemy.orm import Session, joinedload
 
 from ..services.notificacion_service import crear_notificacion_usuario
 from ..auth.dependencies import get_current_terapeuta, get_current_user
-from ..auth.permissions import validar_consultorio_secretario
+from ..auth.permissions import (
+    validar_consultorio_secretario,
+    permiso_temporal_activo,
+    TIPO_REGISTRO_RETROACTIVO,
+)
 from ..dependencies.db import get_db
 from ..models.alerta import Alerta
 from ..models.asistencia import Asistencia
@@ -215,15 +219,23 @@ def obtener_tratamiento_activo(
 
     return tratamientos[0]
 
-def _ya_tiene_sesion_hoy_para_patologia(
+def _ya_tiene_sesion_en_fecha_para_patologia(
     db: Session,
     paciente_id: int,
     tratamiento: TratamientoPaciente,
+    fecha_sesion: date,
 ) -> bool:
-    hoy = now_ecuador().date()
+    """
+    Valida la regla:
+    1 sesión diaria por patología.
 
-    # Si el tratamiento pertenece a un diagnóstico/patología,
-    # se bloquea cualquier otro tratamiento del mismo diagnóstico en el mismo día.
+    Si el tratamiento tiene diagnosticoid:
+        bloquea cualquier sesión del mismo diagnóstico en esa fecha.
+
+    Si no tiene diagnosticoid:
+        bloquea por el mismo tratamiento en esa fecha.
+    """
+
     if tratamiento.diagnosticoid is not None:
         return (
             db.query(SesionTerapia.id)
@@ -233,24 +245,103 @@ def _ya_tiene_sesion_hoy_para_patologia(
             )
             .filter(
                 SesionTerapia.pacienteid == paciente_id,
-                SesionTerapia.fecha == hoy,
+                SesionTerapia.fecha == fecha_sesion,
                 TratamientoPaciente.diagnosticoid == tratamiento.diagnosticoid,
             )
             .first()
             is not None
         )
 
-    # Si no tiene diagnóstico, se bloquea por tratamiento específico.
     return (
         db.query(SesionTerapia.id)
         .filter(
             SesionTerapia.pacienteid == paciente_id,
-            SesionTerapia.fecha == hoy,
+            SesionTerapia.fecha == fecha_sesion,
             SesionTerapia.tratamientopacienteid == tratamiento.id,
         )
         .first()
         is not None
     )
+
+def _validar_permiso_registro_retroactivo(
+    db: Session,
+    current_user: Usuario,
+    fecha_sesion: date,
+) -> None:
+    hoy = now_ecuador().date()
+
+    # Sesión de hoy: no necesita permiso retroactivo.
+    if fecha_sesion == hoy:
+        return
+
+    if fecha_sesion > hoy:
+        raise HTTPException(
+            status_code=400,
+            detail="No se puede registrar una atención con fecha futura.",
+        )
+
+    dias_atras = (hoy - fecha_sesion).days
+
+    permiso = permiso_temporal_activo(
+        db=db,
+        usuario=current_user,
+        tipo_permiso=TIPO_REGISTRO_RETROACTIVO,
+    )
+
+    if not permiso:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "No tienes permiso activo para registrar atenciones retroactivas. "
+                "Solicita autorización al jefe o secretario."
+            ),
+        )
+
+    if dias_atras > permiso.dias_atras_permitidos:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Tu permiso solo permite registrar hasta "
+                f"{permiso.dias_atras_permitidos} día(s) atrás."
+            ),
+        )
+    
+def _validar_datos_sesion_retroactiva(
+    data: InicioSesionCreate,
+    fecha_sesion: date,
+) -> None:
+    hoy = now_ecuador().date()
+
+    es_retroactiva = data.retroactiva or fecha_sesion != hoy
+
+    if not es_retroactiva:
+        return
+
+    if data.hora_ingreso is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Debe ingresar la hora de ingreso para la sesión retroactiva.",
+        )
+
+    if data.hora_salida is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Debe ingresar la hora de salida para la sesión retroactiva.",
+        )
+
+    if data.escaladolorsalida is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Debe ingresar el dolor de salida para la sesión retroactiva.",
+        )
+
+    if data.hora_salida <= data.hora_ingreso:
+        raise HTTPException(
+            status_code=400,
+            detail="La hora de salida debe ser mayor a la hora de ingreso.",
+        )
+    
+
 
 def validar_sesiones_disponibles_para_tratamiento(
     db: Session,
@@ -463,33 +554,46 @@ def iniciar_sesion(
         tratamiento_id=data.tratamientopacienteid,
     )
 
-    if _ya_tiene_sesion_hoy_para_patologia(
+    ahora = now_ecuador()
+    fecha_actual = ahora.date()
+    fecha_sesion = data.fecha_atencion or fecha_actual
+    es_retroactiva = data.retroactiva or fecha_sesion != fecha_actual
+
+    _validar_permiso_registro_retroactivo(
+        db=db,
+        current_user=current_user,
+        fecha_sesion=fecha_sesion,
+    )
+
+    _validar_datos_sesion_retroactiva(
+        data=data,
+        fecha_sesion=fecha_sesion,
+    )
+
+    if _ya_tiene_sesion_en_fecha_para_patologia(
         db=db,
         paciente_id=paciente.id,
         tratamiento=tratamiento_activo,
+        fecha_sesion=fecha_sesion,
     ):
         raise HTTPException(
             status_code=400,
             detail=(
-                "Este paciente ya tiene una sesión registrada hoy para esta patología. "
-                "Solo se permite una sesión diaria por patología."
+                "Este paciente ya tiene una sesión registrada en esa fecha "
+                "para esta patología. Solo se permite una sesión diaria por patología."
             ),
         )
-
 
     validar_sesiones_disponibles_para_tratamiento(
         db=db,
         tratamiento=tratamiento_activo,
     )
 
-    ahora = now_ecuador()
-    fecha_actual = ahora.date()
-
     asistencia_existente = (
         db.query(Asistencia)
         .filter(
             Asistencia.pacienteid == data.pacienteid,
-            Asistencia.fecha == fecha_actual,
+            Asistencia.fecha == fecha_sesion,
         )
         .first()
     )
@@ -497,19 +601,37 @@ def iniciar_sesion(
     if not asistencia_existente:
         asistencia = Asistencia(
             pacienteid=data.pacienteid,
-            fecha=fecha_actual,
+            fecha=fecha_sesion,
             horaregistro=ahora,
         )
         db.add(asistencia)
 
+    hora_ingreso = (
+        data.hora_ingreso
+        if es_retroactiva and data.hora_ingreso is not None
+        else ahora.time().replace(microsecond=0)
+    )
+
+    hora_salida = (
+        data.hora_salida
+        if es_retroactiva
+        else None
+    )
+
+    dolor_salida = (
+        data.escaladolorsalida
+        if es_retroactiva and data.escaladolorsalida is not None
+        else 0
+    )
+
     nueva_sesion = SesionTerapia(
         pacienteid=data.pacienteid,
         terapeutaid=current_user.id,
-        fecha=fecha_actual,
-        horaingreso=ahora.time().replace(microsecond=0),
-        horasalida=None,
+        fecha=fecha_sesion,
+        horaingreso=hora_ingreso,
+        horasalida=hora_salida,
         escaladolorentrada=data.escaladolorentrada,
-        escaladolorsalida=0,
+        escaladolorsalida=dolor_salida,
         pacientepaqueteid=None,
         tratamientopacienteid=tratamiento_activo.id,
     )
@@ -779,6 +901,7 @@ def listar_sesiones(
 @router.get("/tratamiento-resumen/{tratamiento_paciente_id}")
 def obtener_resumen_tratamiento_sesion(
     tratamiento_paciente_id: int,
+    fecha_atencion: Optional[date] = None,
     db: Session = Depends(get_db),
     current_user: Usuario = Depends(get_current_terapeuta),
 ):
@@ -835,10 +958,13 @@ def obtener_resumen_tratamiento_sesion(
     if sesiones_estimadas is not None:
         sesiones_restantes = max(sesiones_estimadas - sesiones_realizadas, 0)
 
-    tiene_sesion_hoy = _ya_tiene_sesion_hoy_para_patologia(
+    fecha_validacion = fecha_atencion or now_ecuador().date()
+
+    tiene_sesion_fecha = _ya_tiene_sesion_en_fecha_para_patologia(
         db=db,
         paciente_id=tratamiento.pacienteid,
         tratamiento=tratamiento,
+        fecha_sesion=fecha_validacion,
     )
 
     return {
@@ -847,11 +973,13 @@ def obtener_resumen_tratamiento_sesion(
         "sesiones_estimadas": sesiones_estimadas,
         "sesiones_realizadas": sesiones_realizadas,
         "sesiones_restantes": sesiones_restantes,
-        "tiene_sesion_hoy": tiene_sesion_hoy,
-        "bloqueado_hoy": tiene_sesion_hoy,
+        "fecha_validacion": fecha_validacion.isoformat(),
+        "tiene_sesion_fecha": tiene_sesion_fecha,
+        "bloqueado_hoy": tiene_sesion_fecha,
+        "bloqueado_fecha": tiene_sesion_fecha,
         "mensaje_bloqueo": (
-            "Ya se registró una sesión hoy para esta patología."
-            if tiene_sesion_hoy
+            "Ya se registró una sesión en esa fecha para esta patología."
+            if tiene_sesion_fecha
             else None
         ),
     }
