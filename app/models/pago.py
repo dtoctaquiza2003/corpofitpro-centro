@@ -1,4 +1,5 @@
 from sqlalchemy import (
+    Boolean,
     Column,
     DateTime,
     Float,
@@ -48,8 +49,14 @@ class Pago(Base):
     # 3 = Rechazado
     estadopago = Column(SmallInteger, default=2, nullable=False)
 
-    # Nuevos campos para auditoría y notificaciones
+    # Auditoría de creación / verificación
     creado_por_id = Column(Integer, ForeignKey("usuarios.id"), nullable=True)
     verificado_por_id = Column(Integer, ForeignKey("usuarios.id"), nullable=True)
     fecha_verificacion = Column(DateTime(timezone=True), nullable=True)
     motivo_rechazo = Column(Text, nullable=True)
+
+    # Anulación de pagos
+    anulado = Column(Boolean, default=False, nullable=False)
+    anulado_por_id = Column(Integer, ForeignKey("usuarios.id"), nullable=True)
+    fecha_anulacion = Column(DateTime(timezone=True), nullable=True)
+    motivo_anulacion = Column(Text, nullable=True)

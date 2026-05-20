@@ -42,6 +42,11 @@ class PagoOut(BaseModel):
     fecha_verificacion: Optional[datetime] = None
     motivo_rechazo: Optional[str] = None
 
+    anulado: bool = False
+    anulado_por_id: Optional[int] = None
+    fecha_anulacion: Optional[datetime] = None
+    motivo_anulacion: Optional[str] = None
+
     model_config = ConfigDict(from_attributes=True)
 
     
@@ -64,8 +69,12 @@ class PagoSimpleOut(BaseModel):
     fecha_verificacion: Optional[datetime] = None
     motivo_rechazo: Optional[str] = None
 
-    model_config = ConfigDict(from_attributes=True)
+    anulado: bool = False
+    anulado_por_id: Optional[int] = None
+    fecha_anulacion: Optional[datetime] = None
+    motivo_anulacion: Optional[str] = None
 
+    model_config = ConfigDict(from_attributes=True)
 
 class CuentaPaqueteOut(BaseModel):
     pacientepaqueteid: int
@@ -136,3 +145,6 @@ class CuentaMembresiaGimnasioOut(BaseModel):
     pagos: List[PagoSimpleOut] = Field(default_factory=list)
 
     model_config = ConfigDict(from_attributes=True)
+
+class PagoAnularRequest(BaseModel):
+    motivo_anulacion: str = Field(..., min_length=5, max_length=500)

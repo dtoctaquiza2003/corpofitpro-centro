@@ -12,6 +12,7 @@ from app.schemas.pago import (
     PagoCreate,
     PagoOut,
     PagoSimpleOut,
+    PagoAnularRequest
 )
 
 from ..auth.dependencies import get_current_secretary, get_current_user
@@ -1111,6 +1112,44 @@ async def registrar_pago_con_comprobante(
 # ============================================================
 # VERIFICAR / RECHAZAR PAGO
 # ============================================================
+
+@router.put("/{pago_id}/anular", response_model=PagoOut)
+def anular_pago(
+    pago_id: int,
+    data: PagoAnularRequest,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(get_current_user),
+):
+    # Solo jefe o secretario
+    if current_user.rol not in [1, 3]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="No tienes permisos para anular pagos.",
+        )
+
+    pago = db.query(Pago).filter(Pago.id == pago_id).first()
+
+    if not pago:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pago no encontrado.",
+        )
+
+    if pago.anulado:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Este pago ya fue anulado.",
+        )
+
+    pago.anulado = True
+    pago.anulado_por_id = current_user.id
+    pago.fecha_anulacion = datetime.now(timezone.utc)
+    pago.motivo_anulacion = data.motivo_anulacion.strip()
+
+    db.commit()
+    db.refresh(pago)
+
+    return pago
 
 @router.patch("/{pago_id}/verificar", response_model=PagoOut)
 def verificar_pago(
