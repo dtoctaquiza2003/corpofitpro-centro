@@ -382,29 +382,182 @@ def _nombre_paciente(paciente: Paciente | None) -> str:
     return f"{paciente.nombres} {paciente.apellidos}".strip()
 
 
-def _obtener_usuarios_para_alerta(
+def _nombre_usuario(usuario: Usuario | None) -> str:
+    if not usuario:
+        return "No asignado"
+
+    nombre = f"{usuario.nombres or ''} {usuario.apellidos or ''}".strip()
+
+    if nombre:
+        return nombre
+
+    if getattr(usuario, "email", None):
+        return usuario.email
+
+    return f"Usuario {usuario.id}"
+
+
+def _agregar_usuario_unico(
+    usuarios: list[Usuario],
+    usuarios_ids: set[int],
+    usuario: Usuario | None,
+) -> None:
+    if not usuario:
+        return
+
+    if usuario.activo is not True:
+        return
+
+    if usuario.id in usuarios_ids:
+        return
+
+    usuarios.append(usuario)
+    usuarios_ids.add(usuario.id)
+
+
+def _obtener_terapeutas_a_cargo_paciente(
     db: Session,
     paciente: Paciente,
+    sesion: SesionTerapia | None = None,
 ) -> list[Usuario]:
-    usuarios: list[Usuario] = []
-    usuarios_ids = set()
+    terapeutas: list[Usuario] = []
+    terapeutas_ids: set[int] = set()
+    hoy = now_ecuador().date()
 
-    # 1. Terapeuta asignado del paciente
+    # 1. Terapeuta principal asignado al paciente.
     if paciente.terapeutaasignadoid:
-        terapeuta = (
+        terapeuta_principal = (
             db.query(Usuario)
             .filter(
                 Usuario.id == paciente.terapeutaasignadoid,
+                Usuario.rol == 2,
                 Usuario.activo == True,
             )
             .first()
         )
 
-        if terapeuta and terapeuta.id not in usuarios_ids:
-            usuarios.append(terapeuta)
-            usuarios_ids.add(terapeuta.id)
+        _agregar_usuario_unico(
+            terapeutas,
+            terapeutas_ids,
+            terapeuta_principal,
+        )
 
-    # 2. Secretarios del consultorio del paciente
+    # 2. Terapeutas compartidos/autorizados activos.
+    terapeutas_compartidos = (
+        db.query(Usuario)
+        .join(
+            PacienteTerapeutaCompartido,
+            PacienteTerapeutaCompartido.terapeutaid == Usuario.id,
+        )
+        .filter(
+            PacienteTerapeutaCompartido.pacienteid == paciente.id,
+            PacienteTerapeutaCompartido.activo == True,
+            Usuario.rol == 2,
+            Usuario.activo == True,
+            or_(
+                PacienteTerapeutaCompartido.fecha_inicio == None,
+                PacienteTerapeutaCompartido.fecha_inicio <= hoy,
+            ),
+            or_(
+                PacienteTerapeutaCompartido.fecha_fin == None,
+                PacienteTerapeutaCompartido.fecha_fin >= hoy,
+            ),
+        )
+        .all()
+    )
+
+    for terapeuta in terapeutas_compartidos:
+        _agregar_usuario_unico(
+            terapeutas,
+            terapeutas_ids,
+            terapeuta,
+        )
+
+    # 3. Terapeutas por cesión temporal activa.
+    transferencias = (
+        db.query(Transferencia)
+        .filter(
+            Transferencia.activo == True,
+        )
+        .options(joinedload(Transferencia.pacientes))
+        .all()
+    )
+
+    terapeutas_cedidos_ids: set[int] = set()
+
+    for transferencia in transferencias:
+        paciente_esta_en_transferencia = any(
+            paciente_transferido.id == paciente.id
+            for paciente_transferido in transferencia.pacientes
+        )
+
+        if paciente_esta_en_transferencia and transferencia.terapeuta_destino_id:
+            terapeutas_cedidos_ids.add(transferencia.terapeuta_destino_id)
+
+    if terapeutas_cedidos_ids:
+        terapeutas_cedidos = (
+            db.query(Usuario)
+            .filter(
+                Usuario.id.in_(list(terapeutas_cedidos_ids)),
+                Usuario.rol == 2,
+                Usuario.activo == True,
+            )
+            .all()
+        )
+
+        for terapeuta in terapeutas_cedidos:
+            _agregar_usuario_unico(
+                terapeutas,
+                terapeutas_ids,
+                terapeuta,
+            )
+
+    # 4. Terapeuta que atendió la sesión.
+    # Esto asegura que también se nombre al terapeuta compartido o cedido
+    # que registró la atención.
+    if sesion and sesion.terapeutaid:
+        terapeuta_sesion = (
+            db.query(Usuario)
+            .filter(
+                Usuario.id == sesion.terapeutaid,
+                Usuario.rol == 2,
+                Usuario.activo == True,
+            )
+            .first()
+        )
+
+        _agregar_usuario_unico(
+            terapeutas,
+            terapeutas_ids,
+            terapeuta_sesion,
+        )
+
+    return terapeutas
+
+
+def _obtener_usuarios_para_alerta(
+    db: Session,
+    paciente: Paciente,
+    sesion: SesionTerapia | None = None,
+) -> list[Usuario]:
+    usuarios: list[Usuario] = []
+    usuarios_ids: set[int] = set()
+
+    # 1. Terapeutas a cargo del paciente.
+    terapeutas = _obtener_terapeutas_a_cargo_paciente(
+        db=db,
+        paciente=paciente,
+        sesion=sesion,
+    )
+
+    for terapeuta in terapeutas:
+        _agregar_usuario_unico(
+            usuarios,
+            usuarios_ids,
+            terapeuta,
+        )
+
+    # 2. Secretarios del consultorio del paciente.
     secretarios = (
         db.query(Usuario)
         .filter(
@@ -416,11 +569,13 @@ def _obtener_usuarios_para_alerta(
     )
 
     for secretario in secretarios:
-        if secretario.id not in usuarios_ids:
-            usuarios.append(secretario)
-            usuarios_ids.add(secretario.id)
+        _agregar_usuario_unico(
+            usuarios,
+            usuarios_ids,
+            secretario,
+        )
 
-    # 3. Jefes
+    # 3. Jefes.
     jefes = (
         db.query(Usuario)
         .filter(
@@ -431,11 +586,14 @@ def _obtener_usuarios_para_alerta(
     )
 
     for jefe in jefes:
-        if jefe.id not in usuarios_ids:
-            usuarios.append(jefe)
-            usuarios_ids.add(jefe.id)
+        _agregar_usuario_unico(
+            usuarios,
+            usuarios_ids,
+            jefe,
+        )
 
     return usuarios
+
 
 def _notificar_alerta_clinica(
     db: Session,
@@ -445,29 +603,68 @@ def _notificar_alerta_clinica(
     current_user: Usuario,
 ) -> None:
     nombre_paciente = _nombre_paciente(paciente)
+    nombre_terapeuta_sesion = _nombre_usuario(current_user)
+
+    terapeutas_a_cargo = _obtener_terapeutas_a_cargo_paciente(
+        db=db,
+        paciente=paciente,
+        sesion=sesion,
+    )
+
+    nombres_terapeutas_a_cargo = [
+        _nombre_usuario(terapeuta)
+        for terapeuta in terapeutas_a_cargo
+    ]
+
+    terapeutas_texto = (
+        ", ".join(nombres_terapeutas_a_cargo)
+        if nombres_terapeutas_a_cargo
+        else "No asignado"
+    )
 
     if alerta.tipo == "high_pain":
         titulo = "Alerta clínica: dolor crítico"
-        mensaje = f"{nombre_paciente} registró dolor crítico."
+        mensaje = (
+            f"Paciente: {nombre_paciente}\n"
+            f"Dolor crítico: {sesion.escaladolorentrada}/10\n"
+            f"Atendió: {nombre_terapeuta_sesion}\n"
+            f"Terapeuta(s) a cargo: {terapeutas_texto}"
+        )
+
     elif alerta.tipo == "pain_increase":
         titulo = "Alerta clínica: aumento de dolor"
-        mensaje = f"{nombre_paciente} registró un aumento de dolor."
+        mensaje = (
+            f"Paciente: {nombre_paciente}\n"
+            f"{alerta.descripcion}\n"
+            f"Atendió: {nombre_terapeuta_sesion}\n"
+            f"Terapeuta(s) a cargo: {terapeutas_texto}"
+        )
+
     else:
         titulo = "Alerta clínica"
-        mensaje = f"{nombre_paciente} generó una alerta clínica."
+        mensaje = (
+            f"Paciente: {nombre_paciente}\n"
+            f"{alerta.descripcion}\n"
+            f"Atendió: {nombre_terapeuta_sesion}\n"
+            f"Terapeuta(s) a cargo: {terapeutas_texto}"
+        )
 
     usuarios_destino = _obtener_usuarios_para_alerta(
         db=db,
         paciente=paciente,
+        sesion=sesion,
     )
 
     if not usuarios_destino:
         print("⚠️ No se encontraron usuarios destino para la alerta clínica.")
         return
 
+    notificaciones_creadas = 0
+
     for usuario in usuarios_destino:
         if usuario.id == current_user.id:
             continue
+
         crear_notificacion_usuario(
             db=db,
             usuarioid=usuario.id,
@@ -479,11 +676,19 @@ def _notificar_alerta_clinica(
             data={
                 "alerta_id": alerta.id,
                 "paciente_id": paciente.id,
+                "paciente_nombre": nombre_paciente,
                 "sesion_id": sesion.id,
                 "consultorioid": paciente.consultorioid,
                 "tipo_alerta": alerta.tipo,
                 "descripcion": alerta.descripcion,
+                "dolor_entrada": sesion.escaladolorentrada,
+                "dolor_salida": sesion.escaladolorsalida,
                 "terapeuta_id": sesion.terapeutaid,
+                "terapeuta_nombre": nombre_terapeuta_sesion,
+                "terapeutas_a_cargo": nombres_terapeutas_a_cargo,
+                "terapeutas_a_cargo_ids": [
+                    terapeuta.id for terapeuta in terapeutas_a_cargo
+                ],
                 "creado_por_id": current_user.id,
                 "actualizar": [
                     "alertas",
@@ -494,11 +699,13 @@ def _notificar_alerta_clinica(
             hacer_flush=False,
         )
 
+        notificaciones_creadas += 1
+
     db.flush()
 
     print(
         f"✅ Notificaciones de alerta creadas: "
-        f"{len(usuarios_destino)} para alerta {alerta.id}"
+        f"{notificaciones_creadas} para alerta {alerta.id}"
     )
 
 @router.post(

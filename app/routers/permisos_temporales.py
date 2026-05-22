@@ -37,83 +37,136 @@ def now_ecuador() -> datetime:
 
 
 
-def _nombre_usuario(usuario: Usuario) -> str:
-    nombres = (usuario.nombres or "").strip()
-    apellidos = (usuario.apellidos or "").strip()
-    nombre = f"{nombres} {apellidos}".strip()
-    return nombre or f"Usuario {usuario.id}"
+def _nombre_usuario(usuario: Usuario | None) -> str:
+    if not usuario:
+        return "Usuario"
+
+    nombre = f"{usuario.nombres or ''} {usuario.apellidos or ''}".strip()
+
+    if nombre:
+        return nombre
+
+    if getattr(usuario, "email", None):
+        return usuario.email
+
+    return f"Usuario {usuario.id}"
 
 
-def _titulo_permiso(tipo_permiso: str) -> str:
+def _tipo_permiso_legible(tipo_permiso: str) -> str:
     if tipo_permiso == TIPO_REGISTRO_RETROACTIVO:
-        return "Permiso retroactivo activado"
+        return "registro retroactivo de sesiones"
 
     if tipo_permiso == TIPO_ADMIN_TEMPORAL:
-        return "Permiso administrativo activado"
+        return "administrador temporal de consultorio"
 
-    return "Permiso temporal activado"
+    return tipo_permiso.replace("_", " ")
+
+
+def _formatear_fecha_permiso(fecha: datetime) -> str:
+    try:
+        fecha_ecuador = fecha.astimezone(timezone(timedelta(hours=-5)))
+    except Exception:
+        fecha_ecuador = fecha
+
+    return fecha_ecuador.strftime("%d/%m/%Y %H:%M")
 
 
 def _mensaje_permiso_otorgado(
-    tipo_permiso: str,
-    fecha_fin: datetime,
-    dias_atras_permitidos: int,
-) -> str:
-    vence = fecha_fin.astimezone(timezone(timedelta(hours=-5))).strftime("%d/%m/%Y %H:%M")
+    permiso: UsuarioPermisoTemporal,
+    autorizador: Usuario,
+) -> tuple[str, str]:
+    tipo_legible = _tipo_permiso_legible(permiso.tipo_permiso)
+    autorizador_nombre = _nombre_usuario(autorizador)
+    fecha_fin = _formatear_fecha_permiso(permiso.fecha_fin)
 
-    if tipo_permiso == TIPO_REGISTRO_RETROACTIVO:
-        if dias_atras_permitidos <= 0:
-            rango = "de hoy"
-        else:
-            rango = "desde el lunes de esta semana"
-
-        return (
-            "Se te otorgó permiso para registrar atenciones retroactivas "
-            f"{rango}. Válido hasta {vence}."
+    if permiso.tipo_permiso == TIPO_REGISTRO_RETROACTIVO:
+        mensaje = (
+            "Se te otorgó permiso para registrar sesiones retroactivas.\n"
+            "Alcance: desde el lunes de esta semana hasta hoy.\n"
+            f"Válido hasta: {fecha_fin}.\n"
+            f"Autorizado por: {autorizador_nombre}."
+        )
+    else:
+        mensaje = (
+            f"Se te otorgó permiso de {tipo_legible}.\n"
+            f"Válido hasta: {fecha_fin}.\n"
+            f"Autorizado por: {autorizador_nombre}."
         )
 
-    if tipo_permiso == TIPO_ADMIN_TEMPORAL:
-        return (
-            "Se te otorgó permiso administrativo temporal para tu consultorio. "
-            f"Válido hasta {vence}."
+    return "Permiso temporal activado", mensaje
+
+
+def _mensaje_permiso_desactivado(
+    permiso: UsuarioPermisoTemporal,
+    autorizador: Usuario,
+) -> tuple[str, str]:
+    tipo_legible = _tipo_permiso_legible(permiso.tipo_permiso)
+    autorizador_nombre = _nombre_usuario(autorizador)
+
+    if permiso.tipo_permiso == TIPO_REGISTRO_RETROACTIVO:
+        mensaje = (
+            "Tu permiso para registrar sesiones retroactivas fue desactivado.\n"
+            "Desde este momento ya no podrás registrar atenciones retroactivas.\n"
+            f"Desactivado por: {autorizador_nombre}."
+        )
+    else:
+        mensaje = (
+            f"Tu permiso de {tipo_legible} fue desactivado.\n"
+            f"Desactivado por: {autorizador_nombre}."
         )
 
-    return f"Se te otorgó un permiso temporal. Válido hasta {vence}."
+    return "Permiso temporal desactivado", mensaje
 
 
-def _notificar_permiso_otorgado(
+def _notificar_permiso_temporal(
     db: Session,
     permiso: UsuarioPermisoTemporal,
     usuario_objetivo: Usuario,
     current_user: Usuario,
+    activado: bool,
 ) -> None:
-    titulo = _titulo_permiso(permiso.tipo_permiso)
-    mensaje = _mensaje_permiso_otorgado(
-        tipo_permiso=permiso.tipo_permiso,
-        fecha_fin=permiso.fecha_fin,
-        dias_atras_permitidos=permiso.dias_atras_permitidos,
-    )
+    if activado:
+        titulo, mensaje = _mensaje_permiso_otorgado(
+            permiso=permiso,
+            autorizador=current_user,
+        )
+        tipo_notificacion = "permiso_temporal_otorgado"
+    else:
+        titulo, mensaje = _mensaje_permiso_desactivado(
+            permiso=permiso,
+            autorizador=current_user,
+        )
+        tipo_notificacion = "permiso_temporal_desactivado"
 
     crear_notificacion_usuario(
         db=db,
         usuarioid=usuario_objetivo.id,
         titulo=titulo,
         mensaje=mensaje,
-        tipo="permiso_temporal_otorgado",
+        tipo=tipo_notificacion,
         referencia_tipo="permiso_temporal",
         referencia_id=permiso.id,
         data={
-            "tipo_permiso": permiso.tipo_permiso,
             "permiso_id": permiso.id,
+            "tipo_permiso": permiso.tipo_permiso,
+            "permiso_activo": activado,
             "usuario_id": usuario_objetivo.id,
             "autorizado_por_id": current_user.id,
-            "autorizado_por": _nombre_usuario(current_user),
-            "fecha_inicio": permiso.fecha_inicio.isoformat(),
-            "fecha_fin": permiso.fecha_fin.isoformat(),
+            "fecha_inicio": permiso.fecha_inicio.isoformat()
+            if permiso.fecha_inicio
+            else None,
+            "fecha_fin": permiso.fecha_fin.isoformat()
+            if permiso.fecha_fin
+            else None,
             "dias_atras_permitidos": permiso.dias_atras_permitidos,
+            "actualizar": [
+                "permisos_temporales",
+                "sesiones",
+                "dashboard",
+                "notificaciones",
+            ],
         },
-        hacer_flush=True,
-        enviar_push=True,
+        hacer_flush=False,
     )
 
 
@@ -351,10 +404,9 @@ def crear_permiso_temporal(
     if data.tipo_permiso == TIPO_REGISTRO_RETROACTIVO:
         hoy_ecuador = now_ecuador().date()
 
-        # Monday = 0, Tuesday = 1, ..., Sunday = 6
-        dias_desde_lunes = hoy_ecuador.weekday()
-
-        dias_atras_permitidos = dias_desde_lunes
+        # Monday = 0, Tuesday = 1, ..., Sunday = 6.
+        # El permiso retroactivo permite desde el lunes de la semana actual.
+        dias_atras_permitidos = hoy_ecuador.weekday()
 
     if data.tipo_permiso == TIPO_ADMIN_TEMPORAL:
         if current_user.rol != 3:
@@ -394,11 +446,12 @@ def crear_permiso_temporal(
     db.add(permiso)
     db.flush()
 
-    _notificar_permiso_otorgado(
+    _notificar_permiso_temporal(
         db=db,
         permiso=permiso,
         usuario_objetivo=usuario_objetivo,
         current_user=current_user,
+        activado=True,
     )
 
     db.commit()
@@ -434,6 +487,15 @@ def desactivar_permiso_temporal(
     )
 
     permiso.activo = False
+    db.flush()
+
+    _notificar_permiso_temporal(
+        db=db,
+        permiso=permiso,
+        usuario_objetivo=usuario_objetivo,
+        current_user=current_user,
+        activado=False,
+    )
 
     db.commit()
     db.refresh(permiso)
