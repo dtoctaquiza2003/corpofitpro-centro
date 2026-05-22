@@ -263,7 +263,10 @@ def _validar_saldo_membresia_gimnasio(
     if precio <= 0:
         return
 
-    query = db.query(Pago).filter(Pago.membresiagimnasioid == membresia.id)
+    query = db.query(Pago).filter(
+        Pago.membresiagimnasioid == membresia.id,
+        Pago.anulado == False,
+    )
 
     if excluir_pago_id is not None:
         query = query.filter(Pago.id != excluir_pago_id)

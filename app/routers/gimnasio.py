@@ -368,23 +368,10 @@ def registrar_pase_diario_gimnasio(
             detail="Ya existe una asistencia de gimnasio registrada para ese paciente en esa fecha.",
         )
 
-    metodo = (data.metodopago or "").strip()
-
-    if not metodo:
-        raise HTTPException(
-            status_code=400,
-            detail="Seleccione un método de pago.",
-        )
-
-    if _es_transferencia(metodo):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "El pase diario por transferencia debe registrarse desde el módulo "
-                "de pagos con comprobante. Por ahora use Efectivo o Tarjeta."
-            ),
-        )
-
+    # Importante: el pase diario NO crea pago automáticamente.
+    # Algunas personas usan el gimnasio primero y pagan después.
+    # El pago se registra luego desde /api/pagos/ o /api/pagos/registrar-con-comprobante
+    # usando membresiagimnasioid = pase_diario.id.
     pase_diario = MembresiaGimnasio(
         pacienteid=paciente.id,
         fechainicio=fecha_pase,
@@ -409,35 +396,16 @@ def registrar_pase_diario_gimnasio(
     )
 
     db.add(movimiento)
-    db.flush()
-
-    pago = Pago(
-        pacienteid=paciente.id,
-        pacientepaqueteid=None,
-        tratamientopacienteid=None,
-        membresiagimnasioid=pase_diario.id,
-        monto=float(data.precio),
-        metodopago=metodo,
-        numerocomprobante=None,
-        comprobanteurl=None,
-        estadopago=2,
-        creado_por_id=current_user.id,
-        verificado_por_id=current_user.id,
-        fecha_verificacion=now_ecuador(),
-        motivo_rechazo=None,
-    )
-
-    db.add(pago)
     db.commit()
 
     db.refresh(pase_diario)
     db.refresh(movimiento)
-    db.refresh(pago)
 
     return PaseDiarioGimnasioOut(
+        paciente=f"{paciente.nombres} {paciente.apellidos}",
         membresia=pase_diario,
         movimiento=movimiento,
-        pago=pago,
+        pago=None,
     )
 
 @router.get(
@@ -487,7 +455,7 @@ def listar_pases_diarios_paciente(
         pago = (
             db.query(Pago)
             .filter(Pago.membresiagimnasioid == pase.id)
-            .order_by(Pago.fechapago.desc())
+            .order_by(Pago.id.desc())
             .first()
         )
 
@@ -519,7 +487,6 @@ def listar_pases_diarios_gimnasio(
         db.query(
             MembresiaGimnasio,
             MovimientoGimnasio,
-            Pago,
             Paciente,
         )
         .join(
@@ -529,10 +496,6 @@ def listar_pases_diarios_gimnasio(
         .join(
             Paciente,
             Paciente.id == MembresiaGimnasio.pacienteid,
-        )
-        .outerjoin(
-            Pago,
-            Pago.membresiagimnasioid == MembresiaGimnasio.id,
         )
         .filter(
             MembresiaGimnasio.modalidad == MODALIDAD_DIARIA,
@@ -546,6 +509,7 @@ def listar_pases_diarios_gimnasio(
                 status_code=403,
                 detail="El secretario no tiene consultorio asignado.",
             )
+
         query = query.filter(Paciente.consultorioid == current_user.consultorioid)
 
     elif current_user.rol == 2:
@@ -555,7 +519,10 @@ def listar_pases_diarios_gimnasio(
         pass
 
     else:
-        raise HTTPException(status_code=403, detail="No autorizado.")
+        raise HTTPException(
+            status_code=403,
+            detail="No autorizado.",
+        )
 
     if paciente_id is not None:
         query = query.filter(Paciente.id == paciente_id)
@@ -568,6 +535,7 @@ def listar_pases_diarios_gimnasio(
 
     if buscar and buscar.strip():
         texto = f"%{buscar.strip()}%"
+
         query = query.filter(
             or_(
                 Paciente.nombres.ilike(texto),
@@ -586,15 +554,33 @@ def listar_pases_diarios_gimnasio(
         .all()
     )
 
+    if not filas:
+        return []
+
+    membresia_ids = [membresia.id for membresia, _, _ in filas]
+
+    pagos = (
+        db.query(Pago)
+        .filter(Pago.membresiagimnasioid.in_(membresia_ids))
+        .order_by(Pago.id.desc())
+        .all()
+    )
+
+    ultimo_pago_por_membresia = {}
+
+    for pago in pagos:
+        if pago.membresiagimnasioid not in ultimo_pago_por_membresia:
+            ultimo_pago_por_membresia[pago.membresiagimnasioid] = pago
+
     resultado = []
 
-    for membresia, movimiento, pago, paciente in filas:
+    for membresia, movimiento, paciente in filas:
         resultado.append(
             PaseDiarioGimnasioOut(
                 paciente=f"{paciente.nombres} {paciente.apellidos}",
                 membresia=membresia,
                 movimiento=movimiento,
-                pago=pago,
+                pago=ultimo_pago_por_membresia.get(membresia.id),
             )
         )
 

@@ -82,7 +82,6 @@ class PaseDiarioGimnasioCreate(BaseModel):
     pacienteid: int
     fecha: Optional[date] = None
     precio: float = Field(..., gt=0)
-    metodopago: str = Field(default="Efectivo", min_length=1, max_length=50)
     observacion: Optional[str] = None
 
     model_config = ConfigDict(populate_by_name=True)
