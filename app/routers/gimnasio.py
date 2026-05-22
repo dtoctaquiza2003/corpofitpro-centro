@@ -11,8 +11,10 @@ from ..auth.dependencies import get_current_user
 from ..dependencies.db import get_db
 from ..models.gimnasio import MembresiaGimnasio, MovimientoGimnasio
 from ..models.paciente import Paciente
+from ..models.paciente_terapeuta_compartido import PacienteTerapeutaCompartido
 from ..models.sesion_terapia import SesionTerapia
 from ..models.usuario import Usuario
+from ..services.notificacion_service import crear_notificacion_usuario
 from ..schemas.gimnasio import (
     MembresiaGimnasioCreate,
     MembresiaGimnasioOut,
@@ -100,6 +102,207 @@ def _validar_acceso_paciente(
 
     return paciente
 
+
+
+def _nombre_paciente(paciente: Paciente | None) -> str:
+    if not paciente:
+        return "Paciente"
+
+    return f"{paciente.nombres or ''} {paciente.apellidos or ''}".strip() or "Paciente"
+
+
+def _nombre_usuario(usuario: Usuario | None) -> str:
+    if not usuario:
+        return "Usuario"
+
+    nombre = f"{usuario.nombres or ''} {usuario.apellidos or ''}".strip()
+
+    if nombre:
+        return nombre
+
+    return usuario.email or f"Usuario {usuario.id}"
+
+
+def _agregar_usuario_unico(
+    usuarios: list[Usuario],
+    usuarios_ids: set[int],
+    usuario: Usuario | None,
+) -> None:
+    if not usuario:
+        return
+
+    if usuario.activo is not True:
+        return
+
+    if usuario.id in usuarios_ids:
+        return
+
+    usuarios.append(usuario)
+    usuarios_ids.add(usuario.id)
+
+
+def _obtener_usuarios_actualizacion_gimnasio(
+    db: Session,
+    paciente: Paciente,
+) -> list[Usuario]:
+    usuarios: list[Usuario] = []
+    usuarios_ids: set[int] = set()
+    hoy = fecha_ecuador()
+
+    if paciente.terapeutaasignadoid:
+        terapeuta_principal = (
+            db.query(Usuario)
+            .filter(
+                Usuario.id == paciente.terapeutaasignadoid,
+                Usuario.rol == 2,
+                Usuario.activo == True,
+            )
+            .first()
+        )
+
+        _agregar_usuario_unico(
+            usuarios,
+            usuarios_ids,
+            terapeuta_principal,
+        )
+
+    terapeutas_compartidos = (
+        db.query(Usuario)
+        .join(
+            PacienteTerapeutaCompartido,
+            PacienteTerapeutaCompartido.terapeutaid == Usuario.id,
+        )
+        .filter(
+            PacienteTerapeutaCompartido.pacienteid == paciente.id,
+            PacienteTerapeutaCompartido.activo == True,
+            Usuario.rol == 2,
+            Usuario.activo == True,
+            or_(
+                PacienteTerapeutaCompartido.fecha_inicio == None,
+                PacienteTerapeutaCompartido.fecha_inicio <= hoy,
+            ),
+            or_(
+                PacienteTerapeutaCompartido.fecha_fin == None,
+                PacienteTerapeutaCompartido.fecha_fin >= hoy,
+            ),
+        )
+        .all()
+    )
+
+    for terapeuta in terapeutas_compartidos:
+        _agregar_usuario_unico(
+            usuarios,
+            usuarios_ids,
+            terapeuta,
+        )
+
+    secretarios = (
+        db.query(Usuario)
+        .filter(
+            Usuario.rol == 1,
+            Usuario.activo == True,
+            Usuario.consultorioid == paciente.consultorioid,
+        )
+        .all()
+    )
+
+    for secretario in secretarios:
+        _agregar_usuario_unico(
+            usuarios,
+            usuarios_ids,
+            secretario,
+        )
+
+    jefes = (
+        db.query(Usuario)
+        .filter(
+            Usuario.rol == 3,
+            Usuario.activo == True,
+        )
+        .all()
+    )
+
+    for jefe in jefes:
+        _agregar_usuario_unico(
+            usuarios,
+            usuarios_ids,
+            jefe,
+        )
+
+    return usuarios
+
+
+def _notificar_actualizacion_gimnasio(
+    db: Session,
+    paciente: Paciente,
+    current_user: Usuario,
+    tipo: str,
+    titulo: str,
+    mensaje: str,
+    membresia: MembresiaGimnasio | None = None,
+    movimiento: MovimientoGimnasio | None = None,
+) -> None:
+    usuarios_destino = _obtener_usuarios_actualizacion_gimnasio(
+        db=db,
+        paciente=paciente,
+    )
+
+    if not usuarios_destino:
+        print("ℹ️ No hay usuarios destino para actualización de gimnasio.")
+        return
+
+    nombre_paciente = _nombre_paciente(paciente)
+    creador = _nombre_usuario(current_user)
+
+    referencia_id = None
+
+    if membresia is not None:
+        referencia_id = membresia.id
+    elif movimiento is not None:
+        referencia_id = movimiento.id
+
+    notificaciones_creadas = 0
+
+    for usuario in usuarios_destino:
+        if usuario.id == current_user.id:
+            continue
+
+        crear_notificacion_usuario(
+            db=db,
+            usuarioid=usuario.id,
+            titulo=titulo,
+            mensaje=mensaje,
+            tipo=tipo,
+            referencia_tipo="gimnasio",
+            referencia_id=referencia_id,
+            data={
+                "paciente_id": paciente.id,
+                "paciente_nombre": nombre_paciente,
+                "consultorioid": paciente.consultorioid,
+                "membresia_id": membresia.id if membresia else None,
+                "modalidad": membresia.modalidad if membresia else None,
+                "movimiento_id": movimiento.id if movimiento else None,
+                "tipo_movimiento": movimiento.tipo if movimiento else None,
+                "creado_por_id": current_user.id,
+                "creado_por_nombre": creador,
+                "actualizar": [
+                    "gimnasio",
+                    "pagos_gimnasio",
+                    "dashboard",
+                    "notificaciones",
+                ],
+            },
+            hacer_flush=False,
+        )
+
+        notificaciones_creadas += 1
+
+    db.flush()
+
+    print(
+        f"✅ Notificaciones de gimnasio creadas: "
+        f"{notificaciones_creadas} para paciente {paciente.id}"
+    )
 
 def _obtener_membresia_activa(
     db: Session,
@@ -268,6 +471,23 @@ def crear_membresia_gimnasio(
     )
 
     db.add(nueva)
+    db.flush()
+
+    nombre_paciente = _nombre_paciente(paciente)
+
+    _notificar_actualizacion_gimnasio(
+        db=db,
+        paciente=paciente,
+        current_user=current_user,
+        tipo="gimnasio_membresia_creada",
+        titulo="Membresía de gimnasio creada",
+        mensaje=(
+            f"Se creó una membresía mensual de gimnasio para {nombre_paciente}. "
+            "La información de gimnasio fue actualizada."
+        ),
+        membresia=nueva,
+    )
+
     db.commit()
     db.refresh(nueva)
 
@@ -373,6 +593,24 @@ def registrar_pase_diario_gimnasio(
     )
 
     db.add(movimiento)
+    db.flush()
+
+    nombre_paciente = _nombre_paciente(paciente)
+
+    _notificar_actualizacion_gimnasio(
+        db=db,
+        paciente=paciente,
+        current_user=current_user,
+        tipo="gimnasio_pase_diario_creado",
+        titulo="Pase diario de gimnasio registrado",
+        mensaje=(
+            f"Se registró un pase diario de gimnasio para {nombre_paciente}. "
+            "La información de gimnasio fue actualizada."
+        ),
+        membresia=pase_diario,
+        movimiento=movimiento,
+    )
+
     db.commit()
 
     db.refresh(pase_diario)
@@ -760,6 +998,40 @@ def registrar_movimiento_gimnasio(
     )
 
     db.add(movimiento)
+    db.flush()
+
+    nombre_paciente = _nombre_paciente(paciente)
+
+    if movimiento.tipo == TIPO_ASISTENCIA_GIMNASIO:
+        titulo = "Asistencia de gimnasio registrada"
+        mensaje = (
+            f"Se registró una asistencia de gimnasio para {nombre_paciente}. "
+            "La membresía fue actualizada."
+        )
+    elif movimiento.tipo == TIPO_TERAPIA_REEMPLAZA_GIMNASIO:
+        titulo = "Día de gimnasio aplazado por terapia"
+        mensaje = (
+            f"Se aplazó un día de gimnasio de {nombre_paciente} por terapia. "
+            "La membresía fue actualizada."
+        )
+    else:
+        titulo = "Gimnasio actualizado"
+        mensaje = (
+            f"Se registró un movimiento de gimnasio para {nombre_paciente}. "
+            "La membresía fue actualizada."
+        )
+
+    _notificar_actualizacion_gimnasio(
+        db=db,
+        paciente=paciente,
+        current_user=current_user,
+        tipo="gimnasio_movimiento_registrado",
+        titulo=titulo,
+        mensaje=mensaje,
+        membresia=membresia,
+        movimiento=movimiento,
+    )
+
     db.commit()
     db.refresh(movimiento)
 
@@ -798,7 +1070,25 @@ def desactivar_membresia_gimnasio(
 
     membresia.activo = False
 
+    paciente = db.query(Paciente).filter(Paciente.id == membresia.pacienteid).first()
+
+    if paciente:
+        nombre_paciente = _nombre_paciente(paciente)
+
+        _notificar_actualizacion_gimnasio(
+            db=db,
+            paciente=paciente,
+            current_user=current_user,
+            tipo="gimnasio_membresia_desactivada",
+            titulo="Membresía de gimnasio desactivada",
+            mensaje=(
+                f"Se desactivó la membresía de gimnasio de {nombre_paciente}. "
+                "La información de gimnasio fue actualizada."
+            ),
+            membresia=membresia,
+        )
+
     db.commit()
     db.refresh(membresia)
 
-    return membresia    
+    return membresia
