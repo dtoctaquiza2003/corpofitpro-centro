@@ -3,6 +3,8 @@ from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .pago import PagoOut
+
 
 class MembresiaGimnasioCreate(BaseModel):
     pacienteid: int
@@ -35,6 +37,7 @@ class MembresiaGimnasioOut(BaseModel):
     fechainicio: date
     diascontratados: int
     precio: Optional[float] = None
+    modalidad: str = "MENSUAL"
     activo: bool
     observaciones: Optional[str] = None
     fechacreacion: Optional[datetime] = None
@@ -72,5 +75,23 @@ class ResumenMembresiaGimnasioOut(BaseModel):
 
     puede_registrar_hoy: bool
     mensaje: str
+
+    model_config = ConfigDict(from_attributes=True)
+
+class PaseDiarioGimnasioCreate(BaseModel):
+    pacienteid: int
+    fecha: Optional[date] = None
+    precio: float = Field(..., gt=0)
+    metodopago: str = Field(default="Efectivo", min_length=1, max_length=50)
+    observacion: Optional[str] = None
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class PaseDiarioGimnasioOut(BaseModel):
+    paciente: Optional[str] = None
+    membresia: MembresiaGimnasioOut
+    movimiento: MovimientoGimnasioOut
+    pago: Optional[PagoOut] = None
 
     model_config = ConfigDict(from_attributes=True)

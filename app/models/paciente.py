@@ -11,7 +11,7 @@ class Paciente(Base):
     terapeutaasignadoid = Column(Integer, ForeignKey("usuarios.id"))
     nombres = Column(String(100))
     apellidos = Column(String(100))
-    cedula = Column(String(10), unique=True)
+    cedula = Column(String(30), nullable=True)
     fechanacimiento = Column(Date)
     telefono = Column(String(20))
     direccion = Column(String(255))

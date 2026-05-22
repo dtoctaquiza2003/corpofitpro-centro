@@ -784,6 +784,7 @@ def listar_cuentas_gimnasio(
     query = (
         db.query(MembresiaGimnasio, Paciente)
         .join(Paciente, Paciente.id == MembresiaGimnasio.pacienteid)
+        .filter(MembresiaGimnasio.modalidad == "MENSUAL")
     )
 
     if current_user.rol == 2:

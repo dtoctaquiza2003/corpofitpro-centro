@@ -37,7 +37,11 @@ def _validar_paciente(
             detail="Paciente no encontrado",
         )
 
-    validar_acceso_paciente_por_rol(paciente, current_user)
+    validar_acceso_paciente_por_rol(
+        paciente=paciente,
+        current_user=current_user,
+        db=db,
+    )
 
     return paciente
 
@@ -134,7 +138,11 @@ def listar_tratamientos_paciente(
             joinedload(TratamientoPaciente.tipo_terapia),
         )
         .filter(TratamientoPaciente.pacienteid == paciente_id)
-        .order_by(TratamientoPaciente.fechainicio.desc())
+        .order_by(
+            TratamientoPaciente.activo.desc(),
+            TratamientoPaciente.fechainicio.desc(),
+            TratamientoPaciente.id.desc(),
+        )
         .all()
     )
 

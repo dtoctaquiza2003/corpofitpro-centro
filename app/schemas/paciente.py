@@ -6,7 +6,7 @@ from typing import List, Optional
 class PacienteBase(BaseModel):
     nombres: str
     apellidos: str
-    cedula: str = Field(..., min_length=10, max_length=10)
+    cedula: Optional[str] = Field(default=None, max_length=30)
     fechanacimiento: date
     telefono: Optional[str] = None
     direccion: Optional[str] = None
@@ -26,12 +26,18 @@ class PacienteBase(BaseModel):
     # por el consultorio real del terapeuta.
     consultorioid: Optional[int] = None
 
-    @field_validator('cedula')
+    @field_validator("cedula", mode="before")
     @classmethod
-    def validar_cedula(cls, v: str) -> str:
-        if len(v) != 10 or not v.isdigit():
-            raise ValueError('La cédula debe tener 10 dígitos numéricos')
-        return v
+    def normalizar_cedula(cls, v):
+        if v is None:
+            return None
+
+        text = str(v).strip()
+
+        if text == "" or text.lower() == "null":
+            return None
+
+        return text
 
 
 class PacienteCreate(PacienteBase):

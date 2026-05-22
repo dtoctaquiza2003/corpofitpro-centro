@@ -1,5 +1,4 @@
-from sqlalchemy import Boolean, Column, Date, DateTime, ForeignKey, Integer, Numeric, SmallInteger, Text, func
-
+from sqlalchemy import Boolean, Column, Date, DateTime, ForeignKey, Integer, Numeric, SmallInteger, String, Text, func
 from ..database import Base
 
 
@@ -12,6 +11,8 @@ class MembresiaGimnasio(Base):
     fechainicio = Column(Date, nullable=False)
     diascontratados = Column(SmallInteger, nullable=False, default=20)
     precio = Column(Numeric(10, 2), nullable=True)
+
+    modalidad = Column(String(20), nullable=False, default="MENSUAL")
 
     activo = Column(Boolean, nullable=False, default=True)
     observaciones = Column(Text, nullable=True)

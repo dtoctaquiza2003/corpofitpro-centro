@@ -85,6 +85,8 @@ def terapeuta_tiene_paciente_compartido_activo(
     if not es_terapeuta(current_user):
         return False
 
+    hoy = date.today()
+
     existe = (
         db.query(PacienteTerapeutaCompartido.id)
         .filter(
@@ -92,8 +94,12 @@ def terapeuta_tiene_paciente_compartido_activo(
             PacienteTerapeutaCompartido.terapeutaid == current_user.id,
             PacienteTerapeutaCompartido.activo == True,
             or_(
+                PacienteTerapeutaCompartido.fecha_inicio == None,
+                PacienteTerapeutaCompartido.fecha_inicio <= hoy,
+            ),
+            or_(
                 PacienteTerapeutaCompartido.fecha_fin == None,
-                PacienteTerapeutaCompartido.fecha_fin >= date.today(),
+                PacienteTerapeutaCompartido.fecha_fin >= hoy,
             ),
         )
         .first()

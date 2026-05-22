@@ -853,16 +853,23 @@ def crear_paciente(
     db: Session = Depends(get_db),
     current_user: Usuario = Depends(get_current_secretary),
 ):
-    existing = db.query(Paciente).filter(Paciente.cedula == paciente.cedula).first()
+    cedula_limpia = paciente.cedula.strip() if paciente.cedula else None
 
-    if existing:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "message": "Ya existe un paciente con esa cédula.",
-                "paciente_id": existing.id,
-            },
+    if cedula_limpia:
+        existing = (
+            db.query(Paciente)
+            .filter(Paciente.cedula == cedula_limpia)
+            .first()
         )
+
+        if existing:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": "Ya existe un paciente con ese documento.",
+                    "paciente_id": existing.id,
+                },
+            )
 
     terapeuta, consultorio_id = obtener_terapeuta_y_consultorio(
         db,
@@ -1004,23 +1011,26 @@ def actualizar_paciente(
     # SECRETARIO: solo puede actualizar pacientes de su consultorio
     validar_acceso_paciente_por_rol(db_paciente, current_user)
 
-    paciente_con_misma_cedula = (
-        db.query(Paciente)
-        .filter(
-            Paciente.cedula == paciente.cedula,
-            Paciente.id != paciente_id,
-        )
-        .first()
-    )
+    cedula_limpia = paciente.cedula.strip() if paciente.cedula else None
 
-    if paciente_con_misma_cedula:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "message": "Ya existe otro paciente registrado con esa cédula.",
-                "paciente_id": paciente_con_misma_cedula.id,
-            },
+    if cedula_limpia:
+        paciente_con_misma_cedula = (
+            db.query(Paciente)
+            .filter(
+                Paciente.cedula == cedula_limpia,
+                Paciente.id != paciente_id,
+            )
+            .first()
         )
+
+        if paciente_con_misma_cedula:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": "Ya existe otro paciente registrado con ese documento.",
+                    "paciente_id": paciente_con_misma_cedula.id,
+                },
+            )
 
     terapeuta, consultorio_id = obtener_terapeuta_y_consultorio(
         db,

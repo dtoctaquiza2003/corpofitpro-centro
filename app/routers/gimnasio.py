@@ -1,7 +1,8 @@
 from datetime import date, timedelta, datetime, timezone
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from ..models.pago import Pago
 from sqlalchemy.orm import Session
 
 from ..auth.dependencies import get_current_user
@@ -16,6 +17,8 @@ from ..schemas.gimnasio import (
     MovimientoGimnasioCreate,
     MovimientoGimnasioOut,
     ResumenMembresiaGimnasioOut,
+    PaseDiarioGimnasioOut,
+    PaseDiarioGimnasioCreate,
 )
 
 router = APIRouter(prefix="/api/gimnasio", tags=["gimnasio"])
@@ -24,9 +27,19 @@ router = APIRouter(prefix="/api/gimnasio", tags=["gimnasio"])
 TIPO_ASISTENCIA_GIMNASIO = 1
 TIPO_TERAPIA_REEMPLAZA_GIMNASIO = 2
 
+MODALIDAD_MENSUAL = "MENSUAL"
+MODALIDAD_DIARIA = "DIARIA"
+
 def fecha_ecuador() -> date:
     return datetime.now(timezone(timedelta(hours=-5))).date()
 
+
+def now_ecuador() -> datetime:
+    return datetime.now(timezone(timedelta(hours=-5)))
+
+
+def _es_transferencia(metodo: str) -> bool:
+    return "transfer" in (metodo or "").strip().lower()
 
 def _es_dia_habil(fecha: date) -> bool:
     return fecha.weekday() < 5
@@ -119,6 +132,7 @@ def _obtener_membresia_activa(
         .filter(
             MembresiaGimnasio.pacienteid == paciente_id,
             MembresiaGimnasio.activo == True,
+            MembresiaGimnasio.modalidad == MODALIDAD_MENSUAL,
         )
         .order_by(MembresiaGimnasio.fechainicio.desc())
         .first()
@@ -270,6 +284,7 @@ def crear_membresia_gimnasio(
         fechainicio=data.fechainicio,
         diascontratados=data.diascontratados,
         precio=data.precio,
+        modalidad=MODALIDAD_MENSUAL,
         activo=True,
         observaciones=data.observaciones,
     )
@@ -280,6 +295,298 @@ def crear_membresia_gimnasio(
 
     return nueva
 
+@router.post("/pases-diarios",response_model=PaseDiarioGimnasioOut,status_code=status.HTTP_201_CREATED,)
+def registrar_pase_diario_gimnasio(
+    data: PaseDiarioGimnasioCreate,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(get_current_user),
+):
+    paciente = _validar_acceso_paciente(
+        db=db,
+        paciente_id=data.pacienteid,
+        current_user=current_user,
+    )
+
+    if current_user.rol not in (1, 3):
+        raise HTTPException(
+            status_code=403,
+            detail="Solo jefe o secretario pueden registrar pases diarios de gimnasio.",
+        )
+
+    fecha_pase = data.fecha or fecha_ecuador()
+
+    if not _es_dia_habil(fecha_pase):
+        raise HTTPException(
+            status_code=400,
+            detail="Solo se puede registrar gimnasio de lunes a viernes.",
+        )
+
+    membresia_mensual_activa = _obtener_membresia_activa(
+        db=db,
+        paciente_id=paciente.id,
+    )
+
+    if membresia_mensual_activa:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Este paciente ya tiene una membresía mensual activa. "
+                "Registra la asistencia desde la membresía, no como pase diario."
+            ),
+        )
+
+    pase_existente = (
+        db.query(MembresiaGimnasio)
+        .filter(
+            MembresiaGimnasio.pacienteid == paciente.id,
+            MembresiaGimnasio.fechainicio == fecha_pase,
+            MembresiaGimnasio.modalidad == MODALIDAD_DIARIA,
+        )
+        .first()
+    )
+
+    if pase_existente:
+        raise HTTPException(
+            status_code=400,
+            detail="Este paciente ya tiene un pase diario registrado para esa fecha.",
+        )
+
+    movimiento_existente = (
+        db.query(MovimientoGimnasio)
+        .filter(
+            MovimientoGimnasio.pacienteid == paciente.id,
+            MovimientoGimnasio.fecha == fecha_pase,
+            MovimientoGimnasio.tipo == TIPO_ASISTENCIA_GIMNASIO,
+        )
+        .first()
+    )
+
+    if movimiento_existente:
+        raise HTTPException(
+            status_code=400,
+            detail="Ya existe una asistencia de gimnasio registrada para ese paciente en esa fecha.",
+        )
+
+    metodo = (data.metodopago or "").strip()
+
+    if not metodo:
+        raise HTTPException(
+            status_code=400,
+            detail="Seleccione un método de pago.",
+        )
+
+    if _es_transferencia(metodo):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "El pase diario por transferencia debe registrarse desde el módulo "
+                "de pagos con comprobante. Por ahora use Efectivo o Tarjeta."
+            ),
+        )
+
+    pase_diario = MembresiaGimnasio(
+        pacienteid=paciente.id,
+        fechainicio=fecha_pase,
+        diascontratados=1,
+        precio=data.precio,
+        modalidad=MODALIDAD_DIARIA,
+        activo=False,
+        observaciones=data.observacion,
+    )
+
+    db.add(pase_diario)
+    db.flush()
+
+    movimiento = MovimientoGimnasio(
+        membresiaid=pase_diario.id,
+        pacienteid=paciente.id,
+        fecha=fecha_pase,
+        tipo=TIPO_ASISTENCIA_GIMNASIO,
+        sesionid=None,
+        tratamientopacienteid=None,
+        observacion=data.observacion or "Pase diario de gimnasio",
+    )
+
+    db.add(movimiento)
+    db.flush()
+
+    pago = Pago(
+        pacienteid=paciente.id,
+        pacientepaqueteid=None,
+        tratamientopacienteid=None,
+        membresiagimnasioid=pase_diario.id,
+        monto=float(data.precio),
+        metodopago=metodo,
+        numerocomprobante=None,
+        comprobanteurl=None,
+        estadopago=2,
+        creado_por_id=current_user.id,
+        verificado_por_id=current_user.id,
+        fecha_verificacion=now_ecuador(),
+        motivo_rechazo=None,
+    )
+
+    db.add(pago)
+    db.commit()
+
+    db.refresh(pase_diario)
+    db.refresh(movimiento)
+    db.refresh(pago)
+
+    return PaseDiarioGimnasioOut(
+        membresia=pase_diario,
+        movimiento=movimiento,
+        pago=pago,
+    )
+
+@router.get(
+    "/paciente/{paciente_id}/pases-diarios",
+    response_model=List[PaseDiarioGimnasioOut],
+)
+def listar_pases_diarios_paciente(
+    paciente_id: int,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(get_current_user),
+):
+    paciente = _validar_acceso_paciente(
+        db=db,
+        paciente_id=paciente_id,
+        current_user=current_user,
+    )
+
+    pases = (
+        db.query(MembresiaGimnasio)
+        .filter(
+            MembresiaGimnasio.pacienteid == paciente_id,
+            MembresiaGimnasio.modalidad == MODALIDAD_DIARIA,
+        )
+        .order_by(
+            MembresiaGimnasio.fechainicio.desc(),
+            MembresiaGimnasio.id.desc(),
+        )
+        .all()
+    )
+
+    resultado = []
+
+    for pase in pases:
+        movimiento = (
+            db.query(MovimientoGimnasio)
+            .filter(
+                MovimientoGimnasio.membresiaid == pase.id,
+                MovimientoGimnasio.tipo == TIPO_ASISTENCIA_GIMNASIO,
+            )
+            .order_by(MovimientoGimnasio.id.desc())
+            .first()
+        )
+
+        if not movimiento:
+            continue
+
+        pago = (
+            db.query(Pago)
+            .filter(Pago.membresiagimnasioid == pase.id)
+            .order_by(Pago.fechapago.desc())
+            .first()
+        )
+
+        resultado.append(
+            PaseDiarioGimnasioOut(
+                paciente=f"{paciente.nombres} {paciente.apellidos}",
+                membresia=pase,
+                movimiento=movimiento,
+                pago=pago,
+            )
+        )
+    return resultado
+
+@router.get(
+    "/pases-diarios",
+    response_model=List[PaseDiarioGimnasioOut],
+)
+def listar_pases_diarios_gimnasio(
+    fecha_desde: Optional[date] = Query(default=None),
+    fecha_hasta: Optional[date] = Query(default=None),
+    paciente_id: Optional[int] = Query(default=None),
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(get_current_user),
+):
+    query = (
+        db.query(
+            MembresiaGimnasio,
+            MovimientoGimnasio,
+            Pago,
+            Paciente,
+        )
+        .join(
+            MovimientoGimnasio,
+            MovimientoGimnasio.membresiaid == MembresiaGimnasio.id,
+        )
+        .join(
+            Paciente,
+            Paciente.id == MembresiaGimnasio.pacienteid,
+        )
+        .outerjoin(
+            Pago,
+            Pago.membresiagimnasioid == MembresiaGimnasio.id,
+        )
+        .filter(
+            MembresiaGimnasio.modalidad == MODALIDAD_DIARIA,
+            MovimientoGimnasio.tipo == TIPO_ASISTENCIA_GIMNASIO,
+        )
+    )
+
+    if current_user.rol == 1:
+        if current_user.consultorioid is None:
+            raise HTTPException(
+                status_code=403,
+                detail="El secretario no tiene consultorio asignado.",
+            )
+
+        query = query.filter(Paciente.consultorioid == current_user.consultorioid)
+
+    elif current_user.rol == 2:
+        query = query.filter(Paciente.terapeutaasignadoid == current_user.id)
+
+    elif current_user.rol == 3:
+        pass
+
+    else:
+        raise HTTPException(
+            status_code=403,
+            detail="No autorizado.",
+        )
+
+    if paciente_id is not None:
+        query = query.filter(Paciente.id == paciente_id)
+
+    if fecha_desde is not None:
+        query = query.filter(MovimientoGimnasio.fecha >= fecha_desde)
+
+    if fecha_hasta is not None:
+        query = query.filter(MovimientoGimnasio.fecha <= fecha_hasta)
+
+    filas = (
+        query.order_by(
+            MovimientoGimnasio.fecha.desc(),
+            MembresiaGimnasio.id.desc(),
+        )
+        .all()
+    )
+
+    resultado = []
+
+    for membresia, movimiento, pago, paciente in filas:
+        resultado.append(
+            PaseDiarioGimnasioOut(
+                paciente=f"{paciente.nombres} {paciente.apellidos}",
+                membresia=membresia,
+                movimiento=movimiento,
+                pago=pago,
+            )
+        )
+
+    return resultado
 
 @router.get(
     "/paciente/{paciente_id}/activa",
