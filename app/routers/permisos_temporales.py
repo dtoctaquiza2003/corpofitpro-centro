@@ -9,6 +9,7 @@ from ..auth.permissions import validar_consultorio_secretario
 from ..dependencies.db import get_db
 from ..models.usuario import Usuario
 from ..models.usuario_permiso_temporal import UsuarioPermisoTemporal
+from ..services.notificacion_service import crear_notificacion_usuario
 from ..schemas.permiso_temporal import (
     PermisoTemporalCreate,
     PermisoTemporalEstadoOut,
@@ -33,6 +34,88 @@ def now_utc() -> datetime:
 
 def now_ecuador() -> datetime:
     return datetime.now(timezone(timedelta(hours=-5)))
+
+
+
+def _nombre_usuario(usuario: Usuario) -> str:
+    nombres = (usuario.nombres or "").strip()
+    apellidos = (usuario.apellidos or "").strip()
+    nombre = f"{nombres} {apellidos}".strip()
+    return nombre or f"Usuario {usuario.id}"
+
+
+def _titulo_permiso(tipo_permiso: str) -> str:
+    if tipo_permiso == TIPO_REGISTRO_RETROACTIVO:
+        return "Permiso retroactivo activado"
+
+    if tipo_permiso == TIPO_ADMIN_TEMPORAL:
+        return "Permiso administrativo activado"
+
+    return "Permiso temporal activado"
+
+
+def _mensaje_permiso_otorgado(
+    tipo_permiso: str,
+    fecha_fin: datetime,
+    dias_atras_permitidos: int,
+) -> str:
+    vence = fecha_fin.astimezone(timezone(timedelta(hours=-5))).strftime("%d/%m/%Y %H:%M")
+
+    if tipo_permiso == TIPO_REGISTRO_RETROACTIVO:
+        if dias_atras_permitidos <= 0:
+            rango = "de hoy"
+        else:
+            rango = "desde el lunes de esta semana"
+
+        return (
+            "Se te otorgó permiso para registrar atenciones retroactivas "
+            f"{rango}. Válido hasta {vence}."
+        )
+
+    if tipo_permiso == TIPO_ADMIN_TEMPORAL:
+        return (
+            "Se te otorgó permiso administrativo temporal para tu consultorio. "
+            f"Válido hasta {vence}."
+        )
+
+    return f"Se te otorgó un permiso temporal. Válido hasta {vence}."
+
+
+def _notificar_permiso_otorgado(
+    db: Session,
+    permiso: UsuarioPermisoTemporal,
+    usuario_objetivo: Usuario,
+    current_user: Usuario,
+) -> None:
+    titulo = _titulo_permiso(permiso.tipo_permiso)
+    mensaje = _mensaje_permiso_otorgado(
+        tipo_permiso=permiso.tipo_permiso,
+        fecha_fin=permiso.fecha_fin,
+        dias_atras_permitidos=permiso.dias_atras_permitidos,
+    )
+
+    crear_notificacion_usuario(
+        db=db,
+        usuarioid=usuario_objetivo.id,
+        titulo=titulo,
+        mensaje=mensaje,
+        tipo="permiso_temporal_otorgado",
+        referencia_tipo="permiso_temporal",
+        referencia_id=permiso.id,
+        data={
+            "tipo_permiso": permiso.tipo_permiso,
+            "permiso_id": permiso.id,
+            "usuario_id": usuario_objetivo.id,
+            "autorizado_por_id": current_user.id,
+            "autorizado_por": _nombre_usuario(current_user),
+            "fecha_inicio": permiso.fecha_inicio.isoformat(),
+            "fecha_fin": permiso.fecha_fin.isoformat(),
+            "dias_atras_permitidos": permiso.dias_atras_permitidos,
+        },
+        hacer_flush=True,
+        enviar_push=True,
+    )
+
 
 def _obtener_usuario_activo(
     db: Session,
@@ -309,6 +392,15 @@ def crear_permiso_temporal(
     )
 
     db.add(permiso)
+    db.flush()
+
+    _notificar_permiso_otorgado(
+        db=db,
+        permiso=permiso,
+        usuario_objetivo=usuario_objetivo,
+        current_user=current_user,
+    )
+
     db.commit()
     db.refresh(permiso)
 
