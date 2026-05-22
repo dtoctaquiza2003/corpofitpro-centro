@@ -280,7 +280,16 @@ def _validar_permiso_registro_retroactivo(
             detail="No se puede registrar una atención con fecha futura.",
         )
 
-    dias_atras = (hoy - fecha_sesion).days
+    lunes_semana_actual = hoy - timedelta(days=hoy.weekday())
+
+    if fecha_sesion < lunes_semana_actual:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "El permiso retroactivo solo permite registrar atenciones "
+                "desde el lunes de la semana actual."
+            ),
+        )
 
     permiso = permiso_temporal_activo(
         db=db,
@@ -294,15 +303,6 @@ def _validar_permiso_registro_retroactivo(
             detail=(
                 "No tienes permiso activo para registrar atenciones retroactivas. "
                 "Solicita autorización al jefe o secretario."
-            ),
-        )
-
-    if dias_atras > permiso.dias_atras_permitidos:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Tu permiso solo permite registrar hasta "
-                f"{permiso.dias_atras_permitidos} día(s) atrás."
             ),
         )
     

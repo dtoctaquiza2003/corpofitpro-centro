@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -31,6 +31,8 @@ TIPOS_PERMITIDOS = {
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
+def now_ecuador() -> datetime:
+    return datetime.now(timezone(timedelta(hours=-5)))
 
 def _obtener_usuario_activo(
     db: Session,
@@ -261,18 +263,15 @@ def crear_permiso_temporal(
             detail="La fecha fin debe ser mayor a la fecha inicio.",
         )
 
-    if data.tipo_permiso == TIPO_REGISTRO_RETROACTIVO:
-        if data.dias_atras_permitidos < 1:
-            raise HTTPException(
-                status_code=400,
-                detail="El permiso retroactivo debe permitir al menos 1 día atrás.",
-            )
+    dias_atras_permitidos = data.dias_atras_permitidos
 
-        if data.dias_atras_permitidos > 1:
-            raise HTTPException(
-                status_code=400,
-                detail="Por seguridad, el registro retroactivo solo permite máximo 1 día atrás.",
-            )
+    if data.tipo_permiso == TIPO_REGISTRO_RETROACTIVO:
+        hoy_ecuador = now_ecuador().date()
+
+        # Monday = 0, Tuesday = 1, ..., Sunday = 6
+        dias_desde_lunes = hoy_ecuador.weekday()
+
+        dias_atras_permitidos = dias_desde_lunes
 
     if data.tipo_permiso == TIPO_ADMIN_TEMPORAL:
         if current_user.rol != 3:
@@ -304,7 +303,7 @@ def crear_permiso_temporal(
         tipo_permiso=data.tipo_permiso,
         fecha_inicio=fecha_inicio,
         fecha_fin=data.fecha_fin,
-        dias_atras_permitidos=data.dias_atras_permitidos,
+        dias_atras_permitidos=dias_atras_permitidos,
         motivo=data.motivo,
         activo=True,
     )
