@@ -2,8 +2,8 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
-from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, UploadFile, status
-from sqlalchemy import func
+from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, UploadFile, status, Query
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, joinedload
 
 from app.schemas.pago import (
@@ -596,6 +596,9 @@ def listar_cuentas_paquetes(
 
 @router.get("/cuentas-tratamientos", response_model=List[CuentaTratamientoOut])
 def listar_cuentas_tratamientos(
+    limit: int = Query(default=20, ge=1, le=50),
+    offset: int = Query(default=0, ge=0),
+    buscar: Optional[str] = Query(default=None),
     db: Session = Depends(get_db),
     current_user: Usuario = Depends(get_current_user),
 ):
@@ -613,18 +616,22 @@ def listar_cuentas_tratamientos(
             current_user,
             current_user.consultorioid,
         )
-
-        query = query.filter(
-            Paciente.consultorioid == current_user.consultorioid
-        )
+        query = query.filter(Paciente.consultorioid == current_user.consultorioid)
 
     elif current_user.rol == 3:
         pass
 
     else:
-        raise HTTPException(
-            status_code=403,
-            detail="No autorizado",
+        raise HTTPException(status_code=403, detail="No autorizado")
+
+    if buscar and buscar.strip():
+        texto = f"%{buscar.strip()}%"
+        query = query.filter(
+            or_(
+                Paciente.nombres.ilike(texto),
+                Paciente.apellidos.ilike(texto),
+                TratamientoPaciente.tipotratamiento.ilike(texto),
+            )
         )
 
     tratamientos = (
@@ -633,6 +640,8 @@ def listar_cuentas_tratamientos(
             TratamientoPaciente.fechainicio.desc(),
             TratamientoPaciente.id.desc(),
         )
+        .offset(offset)
+        .limit(limit)
         .all()
     )
 
@@ -683,12 +692,8 @@ def listar_cuentas_tratamientos(
         )
 
         total_generado = float(sesiones_realizadas) * precio_aplicado
-
         pagos = pagos_por_tratamiento.get(tratamiento.id, [])
-
-        pagos_no_anulados = [
-            pago for pago in pagos if not bool(pago.anulado)
-        ]
+        pagos_no_anulados = [pago for pago in pagos if not bool(pago.anulado)]
 
         pagado_verificado = sum(
             float(pago.monto or 0)
@@ -702,12 +707,10 @@ def listar_cuentas_tratamientos(
             if pago.estadopago == 1
         )
 
-        saldo_real = total_generado - pagado_verificado
-        saldo = max(saldo_real, 0)
+        saldo = max(total_generado - pagado_verificado, 0)
         saldo_favor = max(pagado_verificado - total_generado, 0)
 
         nombre_tipo_terapia = None
-
         if tratamiento.tipo_terapia:
             nombre_tipo_terapia = tratamiento.tipo_terapia.nombre
 
@@ -758,8 +761,6 @@ def listar_cuentas_tratamientos(
                         verificado_por_id=pago.verificado_por_id,
                         fecha_verificacion=pago.fecha_verificacion,
                         motivo_rechazo=pago.motivo_rechazo,
-
-                        # IMPORTANTE PARA QUE FLUTTER LO MUESTRE BIEN
                         anulado=bool(pago.anulado),
                         anulado_por_id=pago.anulado_por_id,
                         fecha_anulacion=pago.fecha_anulacion,
@@ -776,8 +777,12 @@ def listar_cuentas_tratamientos(
 # CUENTAS POR GIMNASIO
 # ============================================================
 
+
 @router.get("/cuentas-gimnasio", response_model=List[CuentaMembresiaGimnasioOut])
 def listar_cuentas_gimnasio(
+    limit: int = Query(default=20, ge=1, le=50),
+    offset: int = Query(default=0, ge=0),
+    buscar: Optional[str] = Query(default=None),
     db: Session = Depends(get_db),
     current_user: Usuario = Depends(get_current_user),
 ):
@@ -795,18 +800,22 @@ def listar_cuentas_gimnasio(
             current_user,
             current_user.consultorioid,
         )
-
-        query = query.filter(
-            Paciente.consultorioid == current_user.consultorioid
-        )
+        query = query.filter(Paciente.consultorioid == current_user.consultorioid)
 
     elif current_user.rol == 3:
         pass
 
     else:
-        raise HTTPException(
-            status_code=403,
-            detail="No autorizado",
+        raise HTTPException(status_code=403, detail="No autorizado")
+
+    if buscar and buscar.strip():
+        texto = f"%{buscar.strip()}%"
+        query = query.filter(
+            or_(
+                Paciente.nombres.ilike(texto),
+                Paciente.apellidos.ilike(texto),
+                MembresiaGimnasio.observaciones.ilike(texto),
+            )
         )
 
     membresias = (
@@ -815,6 +824,8 @@ def listar_cuentas_gimnasio(
             MembresiaGimnasio.fechainicio.desc(),
             MembresiaGimnasio.id.desc(),
         )
+        .offset(offset)
+        .limit(limit)
         .all()
     )
 
@@ -839,12 +850,8 @@ def listar_cuentas_gimnasio(
 
     for membresia, paciente in membresias:
         precio = float(membresia.precio or 0)
-
         pagos = pagos_por_membresia.get(membresia.id, [])
-
-        pagos_no_anulados = [
-            pago for pago in pagos if not bool(pago.anulado)
-        ]
+        pagos_no_anulados = [pago for pago in pagos if not bool(pago.anulado)]
 
         pagado_verificado = sum(
             float(pago.monto or 0)
@@ -858,8 +865,7 @@ def listar_cuentas_gimnasio(
             if pago.estadopago == 1
         )
 
-        saldo_real = precio - pagado_verificado
-        saldo = max(saldo_real, 0)
+        saldo = max(precio - pagado_verificado, 0)
         saldo_favor = max(pagado_verificado - precio, 0)
 
         resultado.append(
@@ -906,6 +912,7 @@ def listar_cuentas_gimnasio(
         )
 
     return resultado
+
 
 
 # ============================================================

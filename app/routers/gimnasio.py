@@ -3,6 +3,7 @@ from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from ..models.pago import Pago
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from ..auth.dependencies import get_current_user
@@ -508,6 +509,9 @@ def listar_pases_diarios_gimnasio(
     fecha_desde: Optional[date] = Query(default=None),
     fecha_hasta: Optional[date] = Query(default=None),
     paciente_id: Optional[int] = Query(default=None),
+    buscar: Optional[str] = Query(default=None),
+    limit: int = Query(default=20, ge=1, le=50),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
     current_user: Usuario = Depends(get_current_user),
 ):
@@ -542,7 +546,6 @@ def listar_pases_diarios_gimnasio(
                 status_code=403,
                 detail="El secretario no tiene consultorio asignado.",
             )
-
         query = query.filter(Paciente.consultorioid == current_user.consultorioid)
 
     elif current_user.rol == 2:
@@ -552,10 +555,7 @@ def listar_pases_diarios_gimnasio(
         pass
 
     else:
-        raise HTTPException(
-            status_code=403,
-            detail="No autorizado.",
-        )
+        raise HTTPException(status_code=403, detail="No autorizado.")
 
     if paciente_id is not None:
         query = query.filter(Paciente.id == paciente_id)
@@ -566,11 +566,23 @@ def listar_pases_diarios_gimnasio(
     if fecha_hasta is not None:
         query = query.filter(MovimientoGimnasio.fecha <= fecha_hasta)
 
+    if buscar and buscar.strip():
+        texto = f"%{buscar.strip()}%"
+        query = query.filter(
+            or_(
+                Paciente.nombres.ilike(texto),
+                Paciente.apellidos.ilike(texto),
+                MovimientoGimnasio.observacion.ilike(texto),
+            )
+        )
+
     filas = (
         query.order_by(
             MovimientoGimnasio.fecha.desc(),
             MembresiaGimnasio.id.desc(),
         )
+        .offset(offset)
+        .limit(limit)
         .all()
     )
 
