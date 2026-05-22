@@ -6,6 +6,7 @@ from ..models.pago import Pago
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
+from ..auth.permissions import validar_acceso_paciente_por_rol
 from ..auth.dependencies import get_current_user
 from ..dependencies.db import get_db
 from ..models.gimnasio import MembresiaGimnasio, MovimientoGimnasio
@@ -91,37 +92,13 @@ def _validar_acceso_paciente(
             detail="Paciente no encontrado.",
         )
 
-    if current_user.rol == 3:
-        return paciente
-
-    if current_user.rol == 1:
-        if current_user.consultorioid is None:
-            raise HTTPException(
-                status_code=403,
-                detail="El secretario no tiene consultorio asignado.",
-            )
-
-        if paciente.consultorioid != current_user.consultorioid:
-            raise HTTPException(
-                status_code=403,
-                detail="No puedes acceder a pacientes de otro consultorio.",
-            )
-
-        return paciente
-
-    if current_user.rol == 2:
-        if paciente.terapeutaasignadoid != current_user.id:
-            raise HTTPException(
-                status_code=403,
-                detail="No puedes acceder a pacientes que no están asignados a ti.",
-            )
-
-        return paciente
-
-    raise HTTPException(
-        status_code=403,
-        detail="No autorizado.",
+    validar_acceso_paciente_por_rol(
+        paciente=paciente,
+        current_user=current_user,
+        db=db,
     )
+
+    return paciente
 
 
 def _obtener_membresia_activa(
