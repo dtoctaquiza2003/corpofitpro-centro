@@ -423,6 +423,47 @@ def _calcular_resumen(
     )
 
 
+def _desactivar_membresia_mensual_si_terminada(
+    db: Session,
+    membresia: MembresiaGimnasio | None,
+    fecha_referencia: Optional[date] = None,
+) -> bool:
+    """
+    Devuelve True si la membresía mensual ya terminó y fue marcada como inactiva.
+
+    Esto evita que una membresía con 0 días restantes, pero todavía con activo=True
+    en base de datos, bloquee la renovación o el pase diario.
+    """
+    if not membresia:
+        return False
+
+    if membresia.modalidad != MODALIDAD_MENSUAL:
+        return False
+
+    if membresia.activo is not True:
+        return False
+
+    fecha_control = fecha_referencia or fecha_ecuador()
+
+    resumen = _calcular_resumen(
+        db=db,
+        membresia=membresia,
+        fecha_referencia=fecha_control,
+    )
+
+    membresia_terminada = (
+        resumen.dias_restantes <= 0
+        or fecha_control > resumen.fecha_fin_estimada
+    )
+
+    if not membresia_terminada:
+        return False
+
+    membresia.activo = False
+    db.flush()
+    return True
+
+
 
 
 @router.post("/membresias", response_model=MembresiaGimnasioOut)
@@ -455,10 +496,27 @@ def crear_membresia_gimnasio(
     )
 
     if membresia_activa:
-        raise HTTPException(
-            status_code=400,
-            detail="El paciente ya tiene una membresía de gimnasio activa. Desactiva o finaliza la membresía actual antes de crear otra.",
+        membresia_anterior_terminada = _desactivar_membresia_mensual_si_terminada(
+            db=db,
+            membresia=membresia_activa,
+            fecha_referencia=data.fechainicio,
         )
+
+        if not membresia_anterior_terminada:
+            resumen_actual = _calcular_resumen(
+                db=db,
+                membresia=membresia_activa,
+                fecha_referencia=data.fechainicio,
+            )
+
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "El paciente ya tiene una membresía de gimnasio activa. "
+                    f"Le quedan {resumen_actual.dias_restantes} día(s). "
+                    "Desactiva la membresía actual antes de crear otra."
+                ),
+            )
 
     nueva = MembresiaGimnasio(
         pacienteid=paciente.id,
@@ -525,13 +583,27 @@ def registrar_pase_diario_gimnasio(
     )
 
     if membresia_mensual_activa:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Este paciente ya tiene una membresía mensual activa. "
-                "Registra la asistencia desde la membresía, no como pase diario."
-            ),
+        membresia_anterior_terminada = _desactivar_membresia_mensual_si_terminada(
+            db=db,
+            membresia=membresia_mensual_activa,
+            fecha_referencia=fecha_pase,
         )
+
+        if not membresia_anterior_terminada:
+            resumen_actual = _calcular_resumen(
+                db=db,
+                membresia=membresia_mensual_activa,
+                fecha_referencia=fecha_pase,
+            )
+
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Este paciente ya tiene una membresía mensual activa. "
+                    f"Le quedan {resumen_actual.dias_restantes} día(s). "
+                    "Registra la asistencia desde la membresía, no como pase diario."
+                ),
+            )
 
     pase_existente = (
         db.query(MembresiaGimnasio)
@@ -927,6 +999,20 @@ def registrar_movimiento_gimnasio(
         raise HTTPException(
             status_code=400,
             detail="El paciente no tiene una membresía de gimnasio activa.",
+        )
+
+    if _desactivar_membresia_mensual_si_terminada(
+        db=db,
+        membresia=membresia,
+        fecha_referencia=fecha_movimiento,
+    ):
+        db.commit()
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "La membresía ya no tiene días disponibles. "
+                "Crea una nueva membresía para registrar más asistencias."
+            ),
         )
     
     if fecha_movimiento < membresia.fechainicio:
