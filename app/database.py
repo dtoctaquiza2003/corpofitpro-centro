@@ -33,7 +33,7 @@ def _env_int(name: str, default: int) -> int:
 # (4 + 2) * 1 * 2 = 12 conexiones, demasiado cerca del límite 15
 # del pooler session mode de Supabase. En deploy/restart se puede duplicar
 # temporalmente y provocar EMAXCONNSESSION.
-DB_POOL_SIZE = _env_int("DB_POOL_SIZE", 4)
+DB_POOL_SIZE = _env_int("DB_POOL_SIZE", 5)
 DB_MAX_OVERFLOW = _env_int("DB_MAX_OVERFLOW", 0)
 DB_POOL_TIMEOUT = _env_int("DB_POOL_TIMEOUT", 40)
 DB_POOL_RECYCLE = _env_int("DB_POOL_RECYCLE", 180)
