@@ -629,10 +629,17 @@ def listar_cuentas_tratamientos(
 
     if buscar and buscar.strip():
         texto = f"%{buscar.strip()}%"
+        nombre_completo = func.concat(
+            Paciente.nombres,
+            " ",
+            Paciente.apellidos,
+        )
+
         query = query.filter(
             or_(
                 Paciente.nombres.ilike(texto),
                 Paciente.apellidos.ilike(texto),
+                nombre_completo.ilike(texto),
                 TratamientoPaciente.tipotratamiento.ilike(texto),
             )
         )
