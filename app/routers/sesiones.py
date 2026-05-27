@@ -1,7 +1,7 @@
 from datetime import datetime, timezone, timedelta, date, time
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import or_
 from sqlalchemy.orm import Session, joinedload
 
@@ -123,6 +123,7 @@ def _terapeuta_puede_atender_paciente(
 def build_sesion_out(
     sesion: SesionTerapia,
     db: Session,
+    tratamientos_aplicados_override: Optional[list[str]] = None,
 ) -> SesionAtencionOut:
     paciente_nombre = None
     tratamiento_nombre = None
@@ -140,7 +141,9 @@ def build_sesion_out(
                 sesion.tratamiento_paciente.precio_sesion_aplicado
             )
 
-    if sesion.id:
+    if tratamientos_aplicados_override is not None:
+        tratamientos_aplicados = tratamientos_aplicados_override
+    elif sesion.id:
         tratamientos_db = (
             db.query(TipoTratamiento.nombre)
             .join(
@@ -174,6 +177,55 @@ def build_sesion_out(
         estado="FINALIZADA" if sesion.horasalida else "EN_CURSO",
         tratamientos=tratamientos_aplicados,
     )
+
+
+def _tratamientos_aplicados_por_sesion(
+    db: Session,
+    sesiones: list[SesionTerapia],
+) -> dict[int, list[str]]:
+    sesiones_ids = [sesion.id for sesion in sesiones if sesion.id]
+
+    if not sesiones_ids:
+        return {}
+
+    rows = (
+        db.query(
+            SesionTratamiento.sesionid,
+            TipoTratamiento.nombre,
+        )
+        .join(
+            TipoTratamiento,
+            TipoTratamiento.id == SesionTratamiento.tratamientoid,
+        )
+        .filter(SesionTratamiento.sesionid.in_(sesiones_ids))
+        .order_by(SesionTratamiento.sesionid.asc(), TipoTratamiento.nombre.asc())
+        .all()
+    )
+
+    resultado: dict[int, list[str]] = {}
+
+    for sesion_id, nombre in rows:
+        if not nombre:
+            continue
+        resultado.setdefault(sesion_id, []).append(nombre)
+
+    return resultado
+
+
+def _build_sesiones_out(
+    sesiones: list[SesionTerapia],
+    db: Session,
+) -> list[SesionAtencionOut]:
+    tratamientos_por_sesion = _tratamientos_aplicados_por_sesion(db, sesiones)
+
+    return [
+        build_sesion_out(
+            sesion,
+            db,
+            tratamientos_aplicados_override=tratamientos_por_sesion.get(sesion.id, []),
+        )
+        for sesion in sesiones
+    ]
 
 
 def obtener_tratamiento_activo(
@@ -879,7 +931,7 @@ def listar_sesiones_en_curso(
         .all()
     )
 
-    return [build_sesion_out(sesion, db) for sesion in sesiones]
+    return _build_sesiones_out(sesiones, db)
 
 @router.get("/tipos-tratamiento", response_model=List[TipoTratamientoOut])
 def listar_tipos_tratamiento(
@@ -1062,6 +1114,9 @@ def finalizar_sesion(
 
 @router.get("/", response_model=List[SesionAtencionOut])
 def listar_sesiones(
+    paciente_id: Optional[int] = Query(default=None, ge=1),
+    limit: int = Query(default=80, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
     current_user: Usuario = Depends(get_current_user),
 ):
@@ -1095,15 +1150,20 @@ def listar_sesiones(
             detail="No autorizado",
         )
 
+    if paciente_id is not None:
+        query = query.filter(SesionTerapia.pacienteid == paciente_id)
+
     sesiones = (
         query.order_by(
             SesionTerapia.fecha.desc(),
             SesionTerapia.horaingreso.desc(),
         )
+        .offset(offset)
+        .limit(limit)
         .all()
     )
 
-    return [build_sesion_out(sesion, db) for sesion in sesiones]
+    return _build_sesiones_out(sesiones, db)
 
 @router.get("/tratamiento-resumen/{tratamiento_paciente_id}")
 def obtener_resumen_tratamiento_sesion(
