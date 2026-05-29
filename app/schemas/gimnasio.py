@@ -94,3 +94,33 @@ class PaseDiarioGimnasioOut(BaseModel):
     pago: Optional[PagoOut] = None
 
     model_config = ConfigDict(from_attributes=True)
+
+class GimnasioAsistenciaRapidaCreate(BaseModel):
+    fecha: Optional[date] = None
+    observacion: Optional[str] = None
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class GimnasioAsistenciaRapidaOut(BaseModel):
+    pacienteid: int
+    paciente: str
+    cedula: Optional[str] = None
+    consultorioid: Optional[int] = None
+
+    membresiaid: int
+    fechainicio: date
+    fecha_fin_estimada: date
+
+    dias_contratados: int
+    dias_asistidos: int
+    dias_aplazados_por_terapia: int
+    dias_consumidos: int
+    dias_restantes: int
+
+    ultima_asistencia: Optional[date] = None
+    asistencia_hoy_registrada: bool
+    puede_registrar_hoy: bool
+    mensaje: str
+
+    model_config = ConfigDict(from_attributes=True)

@@ -3,7 +3,7 @@ from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from ..models.pago import Pago
-from sqlalchemy import or_
+from sqlalchemy import case, func, or_
 from sqlalchemy.orm import Session
 
 from ..auth.permissions import validar_acceso_paciente_por_rol
@@ -23,6 +23,8 @@ from ..schemas.gimnasio import (
     ResumenMembresiaGimnasioOut,
     PaseDiarioGimnasioOut,
     PaseDiarioGimnasioCreate,
+    GimnasioAsistenciaRapidaCreate,
+    GimnasioAsistenciaRapidaOut,
 )
 
 router = APIRouter(prefix="/api/gimnasio", tags=["gimnasio"])
@@ -276,6 +278,7 @@ def _notificar_actualizacion_gimnasio(
             referencia_tipo="gimnasio",
             referencia_id=referencia_id,
             data={
+                "pacienteid": paciente.id,
                 "paciente_id": paciente.id,
                 "paciente_nombre": nombre_paciente,
                 "consultorioid": paciente.consultorioid,
@@ -872,6 +875,347 @@ def listar_pases_diarios_gimnasio(
         )
 
     return resultado
+
+
+
+def _aplicar_filtro_acceso_gimnasio(query, current_user: Usuario):
+    """Aplica el alcance del usuario sin cargar objetos completos.
+
+    Se usa en la pantalla rápida para que la consulta sea liviana:
+    secretario = solo su consultorio, terapeuta = pacientes asignados,
+    jefe = todos.
+    """
+    if current_user.rol == 1:
+        if current_user.consultorioid is None:
+            raise HTTPException(
+                status_code=403,
+                detail="El secretario no tiene consultorio asignado.",
+            )
+
+        return query.filter(Paciente.consultorioid == current_user.consultorioid)
+
+    if current_user.rol == 2:
+        return query.filter(Paciente.terapeutaasignadoid == current_user.id)
+
+    if current_user.rol == 3:
+        return query
+
+    raise HTTPException(status_code=403, detail="No autorizado.")
+
+
+def _mensaje_asistencia_rapida(
+    *,
+    hoy: date,
+    fechainicio: date,
+    fecha_fin_estimada: date,
+    dias_restantes: int,
+    asistencia_hoy_registrada: bool,
+) -> tuple[bool, str]:
+    if not _es_dia_habil(hoy):
+        return False, "Hoy no cuenta como día de gimnasio porque es fin de semana."
+
+    if hoy < fechainicio:
+        return False, "La membresía todavía no inicia."
+
+    if asistencia_hoy_registrada:
+        return False, "Ya se registró la asistencia de gimnasio de hoy."
+
+    if dias_restantes <= 0:
+        return False, "La membresía ya no tiene días disponibles."
+
+    if hoy > fecha_fin_estimada:
+        return False, "La membresía ya finalizó."
+
+    return True, "Lista para registrar asistencia de hoy."
+
+
+def _armar_asistencia_rapida_out(
+    *,
+    membresia: MembresiaGimnasio,
+    paciente: Paciente,
+    hoy: date,
+    dias_asistidos: int,
+    dias_aplazados: int,
+    asistencia_hoy_registrada: bool,
+    ultima_asistencia: date | None,
+) -> GimnasioAsistenciaRapidaOut:
+    dias_contratados = int(membresia.diascontratados or 0)
+    total_dias_programados = dias_contratados + dias_aplazados
+
+    fecha_fin_estimada = _sumar_dias_habiles_incluyendo_inicio(
+        membresia.fechainicio,
+        total_dias_programados,
+    )
+
+    if hoy < membresia.fechainicio:
+        dias_habiles_transcurridos = 0
+    else:
+        dias_habiles_transcurridos = _contar_dias_habiles(
+            membresia.fechainicio,
+            min(hoy, fecha_fin_estimada),
+        )
+
+    # Los días aplazados por terapia no consumen cupo de gimnasio.
+    dias_consumidos = max(dias_habiles_transcurridos - dias_aplazados, 0)
+    dias_consumidos = min(dias_consumidos, dias_contratados)
+    dias_restantes = max(dias_contratados - dias_consumidos, 0)
+
+    puede_registrar, mensaje = _mensaje_asistencia_rapida(
+        hoy=hoy,
+        fechainicio=membresia.fechainicio,
+        fecha_fin_estimada=fecha_fin_estimada,
+        dias_restantes=dias_restantes,
+        asistencia_hoy_registrada=asistencia_hoy_registrada,
+    )
+
+    nombre_paciente = f"{paciente.nombres or ''} {paciente.apellidos or ''}".strip()
+
+    return GimnasioAsistenciaRapidaOut(
+        pacienteid=paciente.id,
+        paciente=nombre_paciente or "Paciente",
+        cedula=paciente.cedula,
+        consultorioid=paciente.consultorioid,
+        membresiaid=membresia.id,
+        fechainicio=membresia.fechainicio,
+        fecha_fin_estimada=fecha_fin_estimada,
+        dias_contratados=dias_contratados,
+        dias_asistidos=dias_asistidos,
+        dias_aplazados_por_terapia=dias_aplazados,
+        dias_consumidos=dias_consumidos,
+        dias_restantes=dias_restantes,
+        ultima_asistencia=ultima_asistencia,
+        asistencia_hoy_registrada=asistencia_hoy_registrada,
+        puede_registrar_hoy=puede_registrar,
+        mensaje=mensaje,
+    )
+
+
+@router.get(
+    "/asistencias-rapidas",
+    response_model=List[GimnasioAsistenciaRapidaOut],
+)
+def listar_asistencias_rapidas_gimnasio(
+    buscar: Optional[str] = Query(default=None),
+    limit: int = Query(default=30, ge=1, le=50),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(get_current_user),
+):
+    """Lista pacientes con membresía mensual activa para registrar asistencia.
+
+    Optimización: trae máximo 50 filas y calcula los movimientos con una sola
+    agregación SQL, sin abrir reportes ni pagos.
+    """
+    hoy = fecha_ecuador()
+
+    query = (
+        db.query(MembresiaGimnasio, Paciente)
+        .join(Paciente, Paciente.id == MembresiaGimnasio.pacienteid)
+        .filter(
+            MembresiaGimnasio.activo == True,
+            MembresiaGimnasio.modalidad == MODALIDAD_MENSUAL,
+        )
+    )
+
+    query = _aplicar_filtro_acceso_gimnasio(query, current_user)
+
+    if buscar and buscar.strip():
+        texto = f"%{buscar.strip()}%"
+        query = query.filter(
+            or_(
+                Paciente.nombres.ilike(texto),
+                Paciente.apellidos.ilike(texto),
+                Paciente.cedula.ilike(texto),
+                func.concat(Paciente.nombres, " ", Paciente.apellidos).ilike(texto),
+                func.concat(Paciente.apellidos, " ", Paciente.nombres).ilike(texto),
+            )
+        )
+
+    filas = (
+        query.order_by(Paciente.apellidos.asc(), Paciente.nombres.asc(), MembresiaGimnasio.id.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+
+    if not filas:
+        return []
+
+    membresia_ids = [membresia.id for membresia, _ in filas]
+
+    agregados = (
+        db.query(
+            MovimientoGimnasio.membresiaid.label("membresiaid"),
+            func.coalesce(
+                func.sum(
+                    case(
+                        (MovimientoGimnasio.tipo == TIPO_ASISTENCIA_GIMNASIO, 1),
+                        else_=0,
+                    )
+                ),
+                0,
+            ).label("dias_asistidos"),
+            func.coalesce(
+                func.sum(
+                    case(
+                        (MovimientoGimnasio.tipo == TIPO_TERAPIA_REEMPLAZA_GIMNASIO, 1),
+                        else_=0,
+                    )
+                ),
+                0,
+            ).label("dias_aplazados"),
+            func.coalesce(
+                func.max(
+                    case(
+                        (MovimientoGimnasio.fecha == hoy, 1),
+                        else_=0,
+                    )
+                ),
+                0,
+            ).label("tiene_hoy"),
+            func.max(
+                case(
+                    (MovimientoGimnasio.tipo == TIPO_ASISTENCIA_GIMNASIO, MovimientoGimnasio.fecha),
+                    else_=None,
+                )
+            ).label("ultima_asistencia"),
+        )
+        .filter(MovimientoGimnasio.membresiaid.in_(membresia_ids))
+        .group_by(MovimientoGimnasio.membresiaid)
+        .all()
+    )
+
+    agregados_por_membresia = {
+        row.membresiaid: {
+            "dias_asistidos": int(row.dias_asistidos or 0),
+            "dias_aplazados": int(row.dias_aplazados or 0),
+            "tiene_hoy": int(row.tiene_hoy or 0) > 0,
+            "ultima_asistencia": row.ultima_asistencia,
+        }
+        for row in agregados
+    }
+
+    resultado: list[GimnasioAsistenciaRapidaOut] = []
+
+    for membresia, paciente in filas:
+        datos = agregados_por_membresia.get(membresia.id, {})
+
+        resultado.append(
+            _armar_asistencia_rapida_out(
+                membresia=membresia,
+                paciente=paciente,
+                hoy=hoy,
+                dias_asistidos=int(datos.get("dias_asistidos", 0) or 0),
+                dias_aplazados=int(datos.get("dias_aplazados", 0) or 0),
+                asistencia_hoy_registrada=bool(datos.get("tiene_hoy", False)),
+                ultima_asistencia=datos.get("ultima_asistencia"),
+            )
+        )
+
+    return resultado
+
+
+@router.post(
+    "/asistencias-rapidas/{membresia_id}/registrar",
+    response_model=MovimientoGimnasioOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def registrar_asistencia_rapida_gimnasio(
+    membresia_id: int,
+    data: GimnasioAsistenciaRapidaCreate,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(get_current_user),
+):
+    """Registra asistencia de gimnasio desde el dashboard con datos mínimos."""
+    fila = (
+        db.query(MembresiaGimnasio, Paciente)
+        .join(Paciente, Paciente.id == MembresiaGimnasio.pacienteid)
+        .filter(MembresiaGimnasio.id == membresia_id)
+        .first()
+    )
+
+    if not fila:
+        raise HTTPException(status_code=404, detail="Membresía no encontrada.")
+
+    membresia, paciente = fila
+
+    validar_acceso_paciente_por_rol(
+        paciente=paciente,
+        current_user=current_user,
+        db=db,
+    )
+
+    if membresia.modalidad != MODALIDAD_MENSUAL or membresia.activo is not True:
+        raise HTTPException(
+            status_code=400,
+            detail="La membresía no está activa para registro rápido.",
+        )
+
+    fecha_movimiento = data.fecha or fecha_ecuador()
+
+    if not _es_dia_habil(fecha_movimiento):
+        raise HTTPException(
+            status_code=400,
+            detail="Solo se puede registrar gimnasio de lunes a viernes.",
+        )
+
+    if _desactivar_membresia_mensual_si_terminada(
+        db=db,
+        membresia=membresia,
+        fecha_referencia=fecha_movimiento,
+    ):
+        db.commit()
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "La membresía ya no tiene días disponibles. "
+                "Crea una nueva membresía para registrar más asistencias."
+            ),
+        )
+
+    resumen = _calcular_resumen(
+        db=db,
+        membresia=membresia,
+        fecha_referencia=fecha_movimiento,
+    )
+
+    if not resumen.puede_registrar_hoy:
+        raise HTTPException(status_code=400, detail=resumen.mensaje)
+
+    movimiento = MovimientoGimnasio(
+        membresiaid=membresia.id,
+        pacienteid=paciente.id,
+        fecha=fecha_movimiento,
+        tipo=TIPO_ASISTENCIA_GIMNASIO,
+        sesionid=None,
+        tratamientopacienteid=None,
+        observacion=(data.observacion or "Asistencia registrada desde dashboard"),
+    )
+
+    db.add(movimiento)
+    db.flush()
+
+    nombre_paciente = _nombre_paciente(paciente)
+
+    _notificar_actualizacion_gimnasio(
+        db=db,
+        paciente=paciente,
+        current_user=current_user,
+        tipo="gimnasio_asistencia_rapida_registrada",
+        titulo="Asistencia de gimnasio registrada",
+        mensaje=(
+            f"Se registró una asistencia de gimnasio para {nombre_paciente}. "
+            "La membresía fue actualizada."
+        ),
+        membresia=membresia,
+        movimiento=movimiento,
+    )
+
+    db.commit()
+    db.refresh(movimiento)
+
+    return movimiento
+
 
 @router.get(
     "/paciente/{paciente_id}/activa",
