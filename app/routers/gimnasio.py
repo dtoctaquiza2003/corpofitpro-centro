@@ -879,28 +879,18 @@ def listar_pases_diarios_gimnasio(
 
 
 def _aplicar_filtro_acceso_gimnasio(query, current_user: Usuario):
-    """Aplica el alcance del usuario sin cargar objetos completos.
+    """Aplica el alcance de la pantalla rápida sin cargar objetos completos.
 
-    Se usa en la pantalla rápida para que la consulta sea liviana:
-    secretario = solo su consultorio, terapeuta = pacientes asignados,
-    jefe = todos.
+    Regla de negocio: la asistencia rápida de gimnasio solo la registran
+    los terapeutas. El listado se limita a sus pacientes asignados.
     """
-    if current_user.rol == 1:
-        if current_user.consultorioid is None:
-            raise HTTPException(
-                status_code=403,
-                detail="El secretario no tiene consultorio asignado.",
-            )
+    if current_user.rol != 2:
+        raise HTTPException(
+            status_code=403,
+            detail="Solo los terapeutas pueden registrar asistencia de gimnasio.",
+        )
 
-        return query.filter(Paciente.consultorioid == current_user.consultorioid)
-
-    if current_user.rol == 2:
-        return query.filter(Paciente.terapeutaasignadoid == current_user.id)
-
-    if current_user.rol == 3:
-        return query
-
-    raise HTTPException(status_code=403, detail="No autorizado.")
+    return query.filter(Paciente.terapeutaasignadoid == current_user.id)
 
 
 def _mensaje_asistencia_rapida(
@@ -1138,6 +1128,12 @@ def registrar_asistencia_rapida_gimnasio(
         raise HTTPException(status_code=404, detail="Membresía no encontrada.")
 
     membresia, paciente = fila
+
+    if current_user.rol != 2:
+        raise HTTPException(
+            status_code=403,
+            detail="Solo los terapeutas pueden registrar asistencia de gimnasio.",
+        )
 
     validar_acceso_paciente_por_rol(
         paciente=paciente,
