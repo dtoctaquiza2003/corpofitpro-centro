@@ -1,9 +1,8 @@
-import os
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Dict, List, Optional, Set, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import Date, case, cast, func
+from sqlalchemy import Date, cast, exists, func
 from sqlalchemy.orm import Session, joinedload
 
 from ..models.alerta import Alerta
@@ -19,6 +18,7 @@ from ..models.tratamiento_paciente import TratamientoPaciente
 from ..models.usuario import Usuario
 from ..schemas.reporte import (
     ClinicaSemanalOut,
+    DashboardAccionesOut,
     DashboardLiteOut,
     DashboardResumenOut,
     FisioDetalleOut,
@@ -55,7 +55,6 @@ DIAS_SEMANA = [
 
 PORCENTAJE_FISIO = 0.35
 PORCENTAJE_CLINICA = 0.65
-MAX_REPORT_DAYS = int(os.getenv("MAX_REPORT_DAYS", "31"))
 
 
 def _nombre_usuario(usuario: Optional[Usuario]) -> str:
@@ -82,6 +81,24 @@ def _precio_aplicado(tratamiento: Optional[TratamientoPaciente]) -> float:
     return float(tratamiento.precio_sesion_aplicado)
 
 
+def _columna_paciente_alerta():
+    """Devuelve la columna FK del paciente en Alerta.
+
+    En algunas versiones del modelo el atributo se llama `pacienteid`,
+    y en otras `paciente_id` mapeado a la columna real `pacienteid`.
+    Esto evita que el reporte falle por diferencia de nombres en el ORM.
+    """
+    columna = getattr(Alerta, "pacienteid", None)
+    if columna is not None:
+        return columna
+
+    columna = getattr(Alerta, "paciente_id", None)
+    if columna is not None:
+        return columna
+
+    raise RuntimeError("El modelo Alerta no tiene pacienteid ni paciente_id.")
+
+
 def _default_range(desde: Optional[date], hasta: Optional[date]) -> tuple[date, date]:
     today = date.today()
 
@@ -95,16 +112,6 @@ def _default_range(desde: Optional[date], hasta: Optional[date]) -> tuple[date, 
         raise HTTPException(
             status_code=400,
             detail="La fecha hasta no puede ser menor que desde.",
-        )
-
-    dias = (hasta - desde).days + 1
-    if dias > MAX_REPORT_DAYS:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"El rango máximo permitido para reportes es de "
-                f"{MAX_REPORT_DAYS} días. Selecciona un rango menor."
-            ),
         )
 
     return desde, hasta
@@ -276,8 +283,7 @@ def _aplicar_filtros_pagos(
     )
 
     query = (
-        query.filter(func.coalesce(Pago.anulado, False) == False)
-        .join(
+        query.join(
             TratamientoPaciente,
             TratamientoPaciente.id == Pago.tratamientopacienteid,
         )
@@ -332,20 +338,9 @@ def _calcular_cuentas_tratamientos(
     consultorioid: Optional[int] = None,
 ) -> Dict[int, Dict[str, float]]:
     """
-    Calcula cuentas de tratamientos usando agregaciones SQL.
-
-    Antes se cargaban tratamientos ORM + sesiones + pagos y luego se hacía el
-    cálculo en Python. Con muchos pacientes esto se vuelve lento y ocupa más
-    memoria. Esta versión deja que PostgreSQL agrupe los datos y devuelve solo
-    totales por tratamiento.
+    Calcula cuentas de tratamientos usando toda la vida del tratamiento.
     """
-    if tratamiento_ids is not None and not tratamiento_ids:
-        return {}
-
-    tratamientos_query = db.query(
-        TratamientoPaciente.id.label("id"),
-        func.coalesce(TratamientoPaciente.precio_sesion_aplicado, 0).label("precio"),
-    )
+    tratamientos_query = db.query(TratamientoPaciente)
 
     tratamientos_query = _aplicar_filtros_tratamientos(
         tratamientos_query,
@@ -355,72 +350,63 @@ def _calcular_cuentas_tratamientos(
     )
 
     if tratamiento_ids is not None:
+        if not tratamiento_ids:
+            return {}
+
         tratamientos_query = tratamientos_query.filter(
             TratamientoPaciente.id.in_(tratamiento_ids)
         )
 
-    tratamientos_sq = tratamientos_query.subquery()
+    tratamientos = tratamientos_query.all()
+    ids = {t.id for t in tratamientos}
 
-    sesiones_sq = (
+    if not ids:
+        return {}
+
+    sesiones_por_tratamiento = dict(
         db.query(
-            SesionTerapia.tratamientopacienteid.label("id"),
-            func.count(SesionTerapia.id).label("sesiones"),
+            SesionTerapia.tratamientopacienteid,
+            func.count(SesionTerapia.id),
         )
-        .join(
-            tratamientos_sq,
-            tratamientos_sq.c.id == SesionTerapia.tratamientopacienteid,
+        .filter(
+            SesionTerapia.tratamientopacienteid.in_(ids),
+            SesionTerapia.horasalida != None,
         )
-        .filter(SesionTerapia.horasalida != None)
         .group_by(SesionTerapia.tratamientopacienteid)
-        .subquery()
-    )
-
-    pagos_sq = (
-        db.query(
-            Pago.tratamientopacienteid.label("id"),
-            func.coalesce(
-                func.sum(case((Pago.estadopago == 2, Pago.monto), else_=0)),
-                0,
-            ).label("pagado_verificado"),
-            func.coalesce(
-                func.sum(case((Pago.estadopago == 1, Pago.monto), else_=0)),
-                0,
-            ).label("pendiente_verificacion"),
-        )
-        .join(
-            tratamientos_sq,
-            tratamientos_sq.c.id == Pago.tratamientopacienteid,
-        )
-        .filter(func.coalesce(Pago.anulado, False) == False)
-        .group_by(Pago.tratamientopacienteid)
-        .subquery()
-    )
-
-    rows = (
-        db.query(
-            tratamientos_sq.c.id,
-            tratamientos_sq.c.precio,
-            func.coalesce(sesiones_sq.c.sesiones, 0).label("sesiones"),
-            func.coalesce(pagos_sq.c.pagado_verificado, 0).label("pagado_verificado"),
-            func.coalesce(pagos_sq.c.pendiente_verificacion, 0).label("pendiente_verificacion"),
-        )
-        .outerjoin(sesiones_sq, sesiones_sq.c.id == tratamientos_sq.c.id)
-        .outerjoin(pagos_sq, pagos_sq.c.id == tratamientos_sq.c.id)
         .all()
     )
 
+    pagos_rows = (
+        db.query(
+            Pago.tratamientopacienteid,
+            Pago.estadopago,
+            func.coalesce(func.sum(Pago.monto), 0),
+        )
+        .filter(Pago.tratamientopacienteid.in_(ids))
+        .group_by(Pago.tratamientopacienteid, Pago.estadopago)
+        .all()
+    )
+
+    pagos_map: Dict[int, Dict[int, float]] = {}
+
+    for tratamiento_id, estado, total in pagos_rows:
+        if tratamiento_id is None:
+            continue
+
+        pagos_map.setdefault(tratamiento_id, {})[estado] = float(total or 0)
+
     result: Dict[int, Dict[str, float]] = {}
 
-    for row in rows:
-        precio = float(row.precio or 0)
-        sesiones = int(row.sesiones or 0)
+    for tratamiento in tratamientos:
+        sesiones = int(sesiones_por_tratamiento.get(tratamiento.id, 0) or 0)
+        precio = _precio_aplicado(tratamiento)
         total_generado = sesiones * precio
-        pagado_verificado = float(row.pagado_verificado or 0)
-        pendiente_verificacion = float(row.pendiente_verificacion or 0)
+        pagado_verificado = pagos_map.get(tratamiento.id, {}).get(2, 0.0)
+        pendiente_verificacion = pagos_map.get(tratamiento.id, {}).get(1, 0.0)
         saldo = max(total_generado - pagado_verificado, 0.0)
         saldo_favor = max(pagado_verificado - total_generado, 0.0)
 
-        result[int(row.id)] = {
+        result[tratamiento.id] = {
             "precio": precio,
             "sesiones": float(sesiones),
             "total_generado": total_generado,
@@ -475,7 +461,6 @@ def _pagos_aplicados_a_rango_por_tratamiento(
         .filter(
             Pago.tratamientopacienteid.in_(tratamiento_ids),
             Pago.estadopago == 2,
-            func.coalesce(Pago.anulado, False) == False,
             cast(Pago.fechapago, Date) <= hasta,
         )
         .group_by(Pago.tratamientopacienteid)
@@ -563,6 +548,206 @@ def obtener_filtros_reportes(
 # Dashboard
 # -----------------------------------------------------------------------------
 
+@router.get("/dashboard-acciones", response_model=DashboardAccionesOut)
+def dashboard_acciones(
+    consultorioid: Optional[int] = Query(None),
+    terapeutaid: Optional[int] = Query(None),
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(get_current_user),
+):
+    """
+    Endpoint liviano para el panel principal.
+
+    Solo usa COUNT/SUM simples y consultas limitadas por rol.
+    No calcula cuentas, saldos ni reportes financieros pesados.
+    """
+    _validar_filtros_para_rol(current_user, terapeutaid)
+
+    hoy = date.today()
+    inicio_semana = hoy - timedelta(days=hoy.weekday())
+    inicio_semana_dt = datetime.combine(inicio_semana, time.min)
+    hace_7_dias = hoy - timedelta(days=7)
+
+    # Sesiones de hoy
+    sesiones_hoy_query = db.query(SesionTerapia).filter(
+        SesionTerapia.fecha == hoy,
+    )
+    sesiones_hoy_query = _aplicar_filtros_sesiones(
+        sesiones_hoy_query,
+        current_user,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+    )
+    sesiones_hoy = sesiones_hoy_query.count()
+
+    # Sesiones actualmente en curso. No se restringe por fecha para detectar
+    # sesiones que hayan quedado abiertas por error.
+    sesiones_en_curso_query = db.query(SesionTerapia).filter(
+        SesionTerapia.horasalida == None,
+    )
+    sesiones_en_curso_query = _aplicar_filtros_sesiones(
+        sesiones_en_curso_query,
+        current_user,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+    )
+    sesiones_en_curso = sesiones_en_curso_query.count()
+
+    sesiones_finalizadas_hoy_query = db.query(SesionTerapia).filter(
+        SesionTerapia.fecha == hoy,
+        SesionTerapia.horasalida != None,
+    )
+    sesiones_finalizadas_hoy_query = _aplicar_filtros_sesiones(
+        sesiones_finalizadas_hoy_query,
+        current_user,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+    )
+    sesiones_finalizadas_hoy = sesiones_finalizadas_hoy_query.count()
+
+    # Pacientes activos según rol.
+    pacientes_query = db.query(Paciente).filter(Paciente.estadopaciente == 1)
+
+    if current_user.rol == 2:
+        pacientes_query = pacientes_query.filter(
+            Paciente.terapeutaasignadoid == current_user.id,
+        )
+    elif current_user.rol == 1:
+        consultorio_resuelto = _resolver_consultorioid_para_rol(current_user)
+        pacientes_query = pacientes_query.filter(
+            Paciente.consultorioid == consultorio_resuelto,
+        )
+    elif current_user.rol == 3:
+        if consultorioid is not None:
+            pacientes_query = pacientes_query.filter(
+                Paciente.consultorioid == consultorioid,
+            )
+        if terapeutaid is not None:
+            pacientes_query = pacientes_query.filter(
+                Paciente.terapeutaasignadoid == terapeutaid,
+            )
+    else:
+        raise HTTPException(status_code=403, detail="No autorizado")
+
+    pacientes_activos = pacientes_query.count()
+    pacientes_nuevos_semana = pacientes_query.filter(
+        Paciente.fechainicio >= inicio_semana_dt,
+    ).count()
+
+    # Tratamientos activos y tratamientos que requieren revisión por no tener
+    # sesión finalizada en los últimos 7 días.
+    tratamientos_query = db.query(TratamientoPaciente).filter(
+        TratamientoPaciente.activo == True,
+    )
+    tratamientos_query = _aplicar_filtros_tratamientos(
+        tratamientos_query,
+        current_user,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+    )
+
+    tratamientos_activos = tratamientos_query.count()
+
+    sesion_reciente_exists = exists().where(
+        SesionTerapia.tratamientopacienteid == TratamientoPaciente.id,
+        SesionTerapia.horasalida != None,
+        SesionTerapia.fecha >= hace_7_dias,
+    )
+
+    tratamientos_sin_sesion_7_dias = tratamientos_query.filter(
+        ~sesion_reciente_exists,
+    ).count()
+
+    # Transferencias pendientes de verificación. Es solo COUNT, no suma cuentas.
+    transferencias_pendientes_query = db.query(Pago).filter(
+        Pago.estadopago == 1,
+        Pago.tratamientopacienteid != None,
+    )
+    transferencias_pendientes_query = _aplicar_filtros_pagos(
+        transferencias_pendientes_query,
+        current_user,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+    )
+    transferencias_pendientes = transferencias_pendientes_query.count()
+
+    # Alertas no leídas.
+    alertas_query = db.query(Alerta).join(
+        Paciente,
+        Paciente.id == _columna_paciente_alerta(),
+    ).filter(Alerta.leida == False)
+
+    if current_user.rol == 2:
+        alertas_query = alertas_query.filter(
+            Paciente.terapeutaasignadoid == current_user.id,
+        )
+    elif current_user.rol == 1:
+        consultorio_resuelto = _resolver_consultorioid_para_rol(current_user)
+        alertas_query = alertas_query.filter(
+            Paciente.consultorioid == consultorio_resuelto,
+        )
+    elif current_user.rol == 3 and consultorioid is not None:
+        alertas_query = alertas_query.filter(Paciente.consultorioid == consultorioid)
+
+    alertas_no_leidas = alertas_query.count()
+
+    notificaciones_no_leidas = (
+        db.query(Notificacion)
+        .filter(
+            Notificacion.usuarioid == current_user.id,
+            Notificacion.leida == False,
+        )
+        .count()
+    )
+
+    # Cesiones activas. Mantiene la misma lógica del dashboard anterior.
+    cesiones_query = db.query(Transferencia).filter(Transferencia.activo == True)
+
+    if current_user.rol == 1:
+        consultorio_resuelto = _resolver_consultorioid_para_rol(current_user)
+        terapeutas_ids = [
+            row.id
+            for row in db.query(Usuario.id)
+            .filter(
+                Usuario.rol == 2,
+                Usuario.activo == True,
+                Usuario.consultorioid == consultorio_resuelto,
+            )
+            .all()
+        ]
+
+        if terapeutas_ids:
+            cesiones_query = cesiones_query.filter(
+                Transferencia.terapeuta_origen_id.in_(terapeutas_ids),
+                Transferencia.terapeuta_destino_id.in_(terapeutas_ids),
+            )
+        else:
+            cesiones_query = cesiones_query.filter(Transferencia.id == -1)
+
+    elif current_user.rol == 2:
+        cesiones_query = cesiones_query.filter(
+            Transferencia.terapeuta_destino_id == current_user.id,
+        )
+    elif current_user.rol == 3:
+        pass
+
+    cesiones_activas = cesiones_query.count()
+
+    return DashboardAccionesOut(
+        sesiones_hoy=sesiones_hoy,
+        sesiones_en_curso=sesiones_en_curso,
+        sesiones_finalizadas_hoy=sesiones_finalizadas_hoy,
+        pacientes_activos=pacientes_activos,
+        pacientes_nuevos_semana=pacientes_nuevos_semana,
+        tratamientos_activos=tratamientos_activos,
+        tratamientos_sin_sesion_7_dias=tratamientos_sin_sesion_7_dias,
+        transferencias_pendientes=transferencias_pendientes,
+        alertas_no_leidas=alertas_no_leidas,
+        notificaciones_no_leidas=notificaciones_no_leidas,
+        cesiones_activas=cesiones_activas,
+    )
+
+
 @router.get("/dashboard-resumen", response_model=DashboardResumenOut)
 def dashboard_resumen(
     consultorioid: Optional[int] = Query(None),
@@ -609,7 +794,6 @@ def dashboard_resumen(
         cast(Pago.fechapago, Date) == hoy,
         Pago.estadopago == 2,
         Pago.tratamientopacienteid != None,
-        func.coalesce(Pago.anulado, False) == False,
     )
 
     pagos_hoy_query = _aplicar_filtros_pagos(
@@ -648,7 +832,6 @@ def dashboard_resumen(
     transferencias_pendientes_query = db.query(Pago).filter(
         Pago.estadopago == 1,
         Pago.tratamientopacienteid != None,
-        func.coalesce(Pago.anulado, False) == False,
     )
 
     transferencias_pendientes_query = _aplicar_filtros_pagos(
@@ -688,7 +871,7 @@ def dashboard_lite(
     # Alertas no leídas
     alertas_query = db.query(Alerta).join(
         Paciente,
-        Paciente.id == Alerta.paciente_id,
+        Paciente.id == _columna_paciente_alerta(),
     ).filter(
         Alerta.leida == False,
     )
@@ -892,20 +1075,8 @@ def reporte_terapias(
     desde, hasta = _default_range(desde, hasta)
 
     sesiones_query = (
-        db.query(
-            SesionTerapia.fecha.label("fecha"),
-            SesionTerapia.tratamientopacienteid.label("tratamiento_id"),
-            TratamientoPaciente.tipotratamiento.label("tratamiento"),
-            func.coalesce(
-                TratamientoPaciente.precio_sesion_aplicado,
-                0,
-            ).label("precio"),
-            func.count(SesionTerapia.id).label("sesiones"),
-        )
-        .join(
-            TratamientoPaciente,
-            TratamientoPaciente.id == SesionTerapia.tratamientopacienteid,
-        )
+        db.query(SesionTerapia)
+        .options(joinedload(SesionTerapia.tratamiento_paciente))
         .filter(
             SesionTerapia.fecha.between(desde, hasta),
             SesionTerapia.horasalida != None,
@@ -920,21 +1091,12 @@ def reporte_terapias(
         consultorioid=consultorioid,
     )
 
-    sesiones_rows = (
-        sesiones_query
-        .group_by(
-            SesionTerapia.fecha,
-            SesionTerapia.tratamientopacienteid,
-            TratamientoPaciente.tipotratamiento,
-            TratamientoPaciente.precio_sesion_aplicado,
-        )
-        .all()
-    )
+    sesiones = sesiones_query.all()
 
     tratamiento_ids = {
-        int(row.tratamiento_id)
-        for row in sesiones_rows
-        if row.tratamiento_id
+        s.tratamientopacienteid
+        for s in sesiones
+        if s.tratamientopacienteid
     }
 
     cuentas = _calcular_cuentas_tratamientos(
@@ -945,10 +1107,9 @@ def reporte_terapias(
         consultorioid=consultorioid,
     )
 
-    total_sesiones = sum(int(row.sesiones or 0) for row in sesiones_rows)
     total_generado = sum(
-        int(row.sesiones or 0) * float(row.precio or 0)
-        for row in sesiones_rows
+        _precio_aplicado(s.tratamiento_paciente)
+        for s in sesiones
     )
 
     total_pagado_verificado = sum(
@@ -981,7 +1142,6 @@ def reporte_terapias(
         cast(Pago.fechapago, Date).between(desde, hasta),
         Pago.estadopago == 2,
         Pago.tratamientopacienteid != None,
-        func.coalesce(Pago.anulado, False) == False,
     )
 
     pagos_query = _aplicar_filtros_pagos(
@@ -1016,11 +1176,10 @@ def reporte_terapias(
         for item in _generar_dias_reporte(desde, hasta)
     }
 
-    for row in sesiones_rows:
-        nombre = row.tratamiento or "Sin tratamiento"
-        sesiones_cantidad = int(row.sesiones or 0)
-        precio = float(row.precio or 0)
-        total_row = sesiones_cantidad * precio
+    for sesion in sesiones:
+        tratamiento = sesion.tratamiento_paciente
+        nombre = tratamiento.tipotratamiento if tratamiento else "Sin tratamiento"
+        precio = _precio_aplicado(tratamiento)
 
         item = tratamiento_map.setdefault(
             nombre,
@@ -1030,13 +1189,13 @@ def reporte_terapias(
             },
         )
 
-        item["sesiones"] += sesiones_cantidad
-        item["total"] += total_row
+        item["sesiones"] += 1
+        item["total"] += precio
 
-        if row.fecha in dias_map:
-            dias_map[row.fecha].sesiones += sesiones_cantidad
-            dias_map[row.fecha].total_generado = round(
-                dias_map[row.fecha].total_generado + total_row,
+        if sesion.fecha in dias_map:
+            dias_map[sesion.fecha].sesiones += 1
+            dias_map[sesion.fecha].total_generado = round(
+                dias_map[sesion.fecha].total_generado + precio,
                 2,
             )
 
@@ -1073,7 +1232,7 @@ def reporte_terapias(
     return TerapiasReporteOut(
         desde=desde,
         hasta=hasta,
-        total_sesiones=total_sesiones,
+        total_sesiones=len(sesiones),
         total_generado=round(total_generado, 2),
         total_pagado_verificado=round(total_pagado_verificado, 2),
         total_pendiente=round(total_pendiente, 2),
@@ -1108,25 +1267,11 @@ def reporte_fisioterapeutas_semanal(
     desde, hasta = _default_range(desde, hasta)
 
     sesiones_query = (
-        db.query(
-            SesionTerapia.terapeutaid.label("terapeuta_id"),
-            SesionTerapia.tratamientopacienteid.label("tratamiento_id"),
-            Usuario.nombres.label("terapeuta_nombres"),
-            Usuario.apellidos.label("terapeuta_apellidos"),
-            Paciente.consultorioid.label("consultorio_id"),
-            Consultorio.nombre.label("consultorio_nombre"),
-            func.coalesce(
-                TratamientoPaciente.precio_sesion_aplicado,
-                0,
-            ).label("precio"),
-            func.count(SesionTerapia.id).label("sesiones"),
-        )
-        .join(Usuario, Usuario.id == SesionTerapia.terapeutaid)
-        .join(Paciente, Paciente.id == SesionTerapia.pacienteid)
-        .outerjoin(Consultorio, Consultorio.id == Paciente.consultorioid)
-        .join(
-            TratamientoPaciente,
-            TratamientoPaciente.id == SesionTerapia.tratamientopacienteid,
+        db.query(SesionTerapia)
+        .options(
+            joinedload(SesionTerapia.terapeuta),
+            joinedload(SesionTerapia.paciente),
+            joinedload(SesionTerapia.tratamiento_paciente),
         )
         .filter(
             SesionTerapia.fecha.between(desde, hasta),
@@ -1135,44 +1280,21 @@ def reporte_fisioterapeutas_semanal(
         )
     )
 
-    _validar_filtros_para_rol(current_user, terapeutaid)
-    consultorioid_resuelto = _resolver_consultorioid_para_rol(
+    sesiones_query = _aplicar_filtros_sesiones(
+        sesiones_query,
         current_user,
-        consultorioid,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
     )
 
-    if current_user.rol == 2:
-        sesiones_query = sesiones_query.filter(
-            SesionTerapia.terapeutaid == current_user.id
-        )
-    elif terapeutaid is not None:
-        sesiones_query = sesiones_query.filter(
-            SesionTerapia.terapeutaid == terapeutaid
-        )
+    sesiones = sesiones_query.all()
 
-    if consultorioid_resuelto is not None:
-        sesiones_query = sesiones_query.filter(
-            Paciente.consultorioid == consultorioid_resuelto
-        )
-
-    sesiones_rows = (
-        sesiones_query
-        .group_by(
-            SesionTerapia.terapeutaid,
-            SesionTerapia.tratamientopacienteid,
-            Usuario.nombres,
-            Usuario.apellidos,
-            Paciente.consultorioid,
-            Consultorio.nombre,
-            TratamientoPaciente.precio_sesion_aplicado,
-        )
-        .all()
-    )
+    consultorios_map = _obtener_consultorios_map(db)
 
     tratamiento_ids = {
-        int(row.tratamiento_id)
-        for row in sesiones_rows
-        if row.tratamiento_id
+        s.tratamientopacienteid
+        for s in sesiones
+        if s.tratamientopacienteid
     }
 
     disponible_pagado = _pagos_aplicados_a_rango_por_tratamiento(
@@ -1185,32 +1307,32 @@ def reporte_fisioterapeutas_semanal(
     data: Dict[int, Dict[str, float | int | str | None]] = {}
     generado_por_tratamiento_en_rango: Dict[Tuple[int, int], float] = {}
 
-    for row in sesiones_rows:
-        terapeuta_id = int(row.terapeuta_id)
-        tratamiento_id = int(row.tratamiento_id)
-        sesiones_cantidad = int(row.sesiones or 0)
-        precio = float(row.precio or 0)
-        generado = sesiones_cantidad * precio
-        consultorio_id = row.consultorio_id
-        terapeuta_nombre = f"{row.terapeuta_nombres} {row.terapeuta_apellidos}".strip()
+    for sesion in sesiones:
+        terapeuta_id = sesion.terapeutaid
+        tratamiento_id = sesion.tratamientopacienteid
+        precio = _precio_aplicado(sesion.tratamiento_paciente)
+        consultorio_id = sesion.paciente.consultorioid if sesion.paciente else None
 
         item = data.setdefault(
             terapeuta_id,
             {
-                "terapeuta": terapeuta_nombre or "Sin terapeuta",
+                "terapeuta": _nombre_usuario(sesion.terapeuta),
                 "consultorioid": consultorio_id,
-                "consultorio": row.consultorio_nombre or "Sin consultorio",
+                "consultorio": consultorios_map.get(
+                    consultorio_id,
+                    "Sin consultorio",
+                ),
                 "sesiones": 0,
                 "total_generado": 0.0,
             },
         )
 
-        item["sesiones"] = int(item["sesiones"]) + sesiones_cantidad
-        item["total_generado"] = float(item["total_generado"]) + generado
+        item["sesiones"] = int(item["sesiones"]) + 1
+        item["total_generado"] = float(item["total_generado"]) + precio
 
         key = (terapeuta_id, tratamiento_id)
         generado_por_tratamiento_en_rango[key] = (
-            generado_por_tratamiento_en_rango.get(key, 0.0) + generado
+            generado_por_tratamiento_en_rango.get(key, 0.0) + precio
         )
 
     pagado_por_terapeuta: Dict[int, float] = {
@@ -1405,21 +1527,10 @@ def reporte_clinicas_semanal(
     desde, hasta = _default_range(desde, hasta)
 
     sesiones_query = (
-        db.query(
-            Paciente.consultorioid.label("consultorio_id"),
-            Consultorio.nombre.label("consultorio_nombre"),
-            SesionTerapia.tratamientopacienteid.label("tratamiento_id"),
-            func.coalesce(
-                TratamientoPaciente.precio_sesion_aplicado,
-                0,
-            ).label("precio"),
-            func.count(SesionTerapia.id).label("sesiones"),
-        )
-        .join(Paciente, Paciente.id == SesionTerapia.pacienteid)
-        .outerjoin(Consultorio, Consultorio.id == Paciente.consultorioid)
-        .join(
-            TratamientoPaciente,
-            TratamientoPaciente.id == SesionTerapia.tratamientopacienteid,
+        db.query(SesionTerapia)
+        .options(
+            joinedload(SesionTerapia.paciente),
+            joinedload(SesionTerapia.tratamiento_paciente),
         )
         .filter(
             SesionTerapia.fecha.between(desde, hasta),
@@ -1428,41 +1539,21 @@ def reporte_clinicas_semanal(
         )
     )
 
-    _validar_filtros_para_rol(current_user, terapeutaid)
-    consultorioid_resuelto = _resolver_consultorioid_para_rol(
+    sesiones_query = _aplicar_filtros_sesiones(
+        sesiones_query,
         current_user,
-        consultorioid,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
     )
 
-    if current_user.rol == 2:
-        sesiones_query = sesiones_query.filter(
-            SesionTerapia.terapeutaid == current_user.id
-        )
-    elif terapeutaid is not None:
-        sesiones_query = sesiones_query.filter(
-            SesionTerapia.terapeutaid == terapeutaid
-        )
+    sesiones = sesiones_query.all()
 
-    if consultorioid_resuelto is not None:
-        sesiones_query = sesiones_query.filter(
-            Paciente.consultorioid == consultorioid_resuelto
-        )
-
-    sesiones_rows = (
-        sesiones_query
-        .group_by(
-            Paciente.consultorioid,
-            Consultorio.nombre,
-            SesionTerapia.tratamientopacienteid,
-            TratamientoPaciente.precio_sesion_aplicado,
-        )
-        .all()
-    )
+    consultorios_map = _obtener_consultorios_map(db)
 
     tratamiento_ids = {
-        int(row.tratamiento_id)
-        for row in sesiones_rows
-        if row.tratamiento_id
+        s.tratamientopacienteid
+        for s in sesiones
+        if s.tratamientopacienteid
     }
 
     disponible_pagado = _pagos_aplicados_a_rango_por_tratamiento(
@@ -1475,29 +1566,30 @@ def reporte_clinicas_semanal(
     data: Dict[Optional[int], Dict[str, float | int | str | None]] = {}
     generado_por_clinica_tratamiento: Dict[Tuple[Optional[int], int], float] = {}
 
-    for row in sesiones_rows:
-        consultorio_id = row.consultorio_id
-        tratamiento_id = int(row.tratamiento_id)
-        sesiones_cantidad = int(row.sesiones or 0)
-        precio = float(row.precio or 0)
-        generado = sesiones_cantidad * precio
+    for sesion in sesiones:
+        consultorio_id = sesion.paciente.consultorioid if sesion.paciente else None
+        tratamiento_id = sesion.tratamientopacienteid
+        precio = _precio_aplicado(sesion.tratamiento_paciente)
 
         item = data.setdefault(
             consultorio_id,
             {
                 "consultorioid": consultorio_id,
-                "consultorio": row.consultorio_nombre or "Sin consultorio",
+                "consultorio": consultorios_map.get(
+                    consultorio_id,
+                    "Sin consultorio",
+                ),
                 "sesiones": 0,
                 "total_generado": 0.0,
             },
         )
 
-        item["sesiones"] = int(item["sesiones"]) + sesiones_cantidad
-        item["total_generado"] = float(item["total_generado"]) + generado
+        item["sesiones"] = int(item["sesiones"]) + 1
+        item["total_generado"] = float(item["total_generado"]) + precio
 
         key = (consultorio_id, tratamiento_id)
         generado_por_clinica_tratamiento[key] = (
-            generado_por_clinica_tratamiento.get(key, 0.0) + generado
+            generado_por_clinica_tratamiento.get(key, 0.0) + precio
         )
 
     pagado_por_clinica: Dict[Optional[int], float] = {

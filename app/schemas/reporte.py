@@ -69,6 +69,31 @@ class DashboardLiteOut(DashboardResumenOut):
     cesiones_activas: int = 0
 
 
+class DashboardAccionesOut(BaseModel):
+    """
+    Resumen liviano para las tarjetas accionables del dashboard.
+
+    Importante: este esquema NO incluye cálculos de cuentas/saldos, porque esos
+    reportes son más pesados y deben cargarse solo cuando el usuario entra a
+    Pagos o Reportes.
+    """
+
+    sesiones_hoy: int = 0
+    sesiones_en_curso: int = 0
+    sesiones_finalizadas_hoy: int = 0
+
+    pacientes_activos: int = 0
+    pacientes_nuevos_semana: int = 0
+
+    tratamientos_activos: int = 0
+    tratamientos_sin_sesion_7_dias: int = 0
+
+    transferencias_pendientes: int = 0
+    alertas_no_leidas: int = 0
+    notificaciones_no_leidas: int = 0
+    cesiones_activas: int = 0
+
+
 # -----------------------------------------------------------------------------
 # Reporte general de terapias
 # -----------------------------------------------------------------------------
