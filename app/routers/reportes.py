@@ -11,6 +11,7 @@ from ..models.transferencia import Transferencia
 from ..auth.dependencies import get_current_secretary, get_current_user
 from ..dependencies.db import get_db
 from ..models.consultorio import Consultorio
+from ..models.gimnasio import MembresiaGimnasio
 from ..models.paciente import Paciente
 from ..models.pago import Pago
 from ..models.sesion_terapia import SesionTerapia
@@ -53,8 +54,14 @@ DIAS_SEMANA = [
     "Domingo",
 ]
 
-PORCENTAJE_FISIO = 0.35
-PORCENTAJE_CLINICA = 0.65
+PORCENTAJE_FISIO_TERAPIA = 0.35
+PORCENTAJE_CLINICA_TERAPIA = 0.65
+PORCENTAJE_FISIO_GIMNASIO = 0.50
+PORCENTAJE_CLINICA_GIMNASIO = 0.50
+
+# Compatibilidad con cálculos antiguos de terapias.
+PORCENTAJE_FISIO = PORCENTAJE_FISIO_TERAPIA
+PORCENTAJE_CLINICA = PORCENTAJE_CLINICA_TERAPIA
 
 
 def _nombre_usuario(usuario: Optional[Usuario]) -> str:
@@ -302,6 +309,128 @@ def _aplicar_filtros_pagos(
     return query
 
 
+def _resolver_consultorioid_gimnasio_para_rol(
+    current_user: Usuario,
+    consultorioid: Optional[int] = None,
+) -> Optional[int]:
+    """Aplica la misma seguridad por rol a los pagos de gimnasio."""
+    return _resolver_consultorioid_para_rol(current_user, consultorioid)
+
+
+def _pagos_gimnasio_por_terapeuta(
+    db: Session,
+    current_user: Usuario,
+    desde: date,
+    hasta: date,
+    terapeutaid: Optional[int] = None,
+    consultorioid: Optional[int] = None,
+):
+    """
+    Pagos verificados de gimnasio mensual y pase diario agrupados por terapeuta.
+
+    Regla de negocio:
+    - Terapia: 35% para fisioterapeuta.
+    - Gimnasio mensual y diario: 50% para fisioterapeuta.
+
+    La asignación se hace por el terapeuta principal del paciente
+    (pacientes.terapeutaasignadoid), no por quien registró el pago.
+    """
+    _validar_filtros_para_rol(current_user, terapeutaid)
+    consultorioid = _resolver_consultorioid_gimnasio_para_rol(
+        current_user,
+        consultorioid,
+    )
+
+    query = (
+        db.query(
+            Paciente.terapeutaasignadoid.label("terapeutaid"),
+            Usuario.nombres.label("nombres"),
+            Usuario.apellidos.label("apellidos"),
+            Usuario.consultorioid.label("consultorioid"),
+            func.coalesce(func.sum(Pago.monto), 0).label("total_pagado"),
+        )
+        .select_from(Pago)
+        .join(
+            MembresiaGimnasio,
+            MembresiaGimnasio.id == Pago.membresiagimnasioid,
+        )
+        .join(Paciente, Paciente.id == MembresiaGimnasio.pacienteid)
+        .join(Usuario, Usuario.id == Paciente.terapeutaasignadoid)
+        .filter(
+            Pago.membresiagimnasioid != None,
+            Pago.estadopago == 2,
+            Pago.anulado == False,
+            cast(Pago.fechapago, Date).between(desde, hasta),
+            Paciente.terapeutaasignadoid != None,
+            Usuario.rol == 2,
+            Usuario.activo == True,
+        )
+    )
+
+    if current_user.rol == 2:
+        query = query.filter(Paciente.terapeutaasignadoid == current_user.id)
+    elif terapeutaid is not None:
+        query = query.filter(Paciente.terapeutaasignadoid == terapeutaid)
+
+    if consultorioid is not None:
+        query = query.filter(Paciente.consultorioid == consultorioid)
+
+    return (
+        query.group_by(
+            Paciente.terapeutaasignadoid,
+            Usuario.nombres,
+            Usuario.apellidos,
+            Usuario.consultorioid,
+        )
+        .all()
+    )
+
+
+def _pagos_gimnasio_por_consultorio(
+    db: Session,
+    current_user: Usuario,
+    desde: date,
+    hasta: date,
+    terapeutaid: Optional[int] = None,
+    consultorioid: Optional[int] = None,
+):
+    """Pagos verificados de gimnasio mensual/diario agrupados por consultorio."""
+    _validar_filtros_para_rol(current_user, terapeutaid)
+    consultorioid = _resolver_consultorioid_gimnasio_para_rol(
+        current_user,
+        consultorioid,
+    )
+
+    query = (
+        db.query(
+            Paciente.consultorioid.label("consultorioid"),
+            func.coalesce(func.sum(Pago.monto), 0).label("total_pagado"),
+        )
+        .select_from(Pago)
+        .join(
+            MembresiaGimnasio,
+            MembresiaGimnasio.id == Pago.membresiagimnasioid,
+        )
+        .join(Paciente, Paciente.id == MembresiaGimnasio.pacienteid)
+        .filter(
+            Pago.membresiagimnasioid != None,
+            Pago.estadopago == 2,
+            Pago.anulado == False,
+            cast(Pago.fechapago, Date).between(desde, hasta),
+        )
+    )
+
+    if current_user.rol == 2:
+        query = query.filter(Paciente.terapeutaasignadoid == current_user.id)
+    elif terapeutaid is not None:
+        query = query.filter(Paciente.terapeutaasignadoid == terapeutaid)
+
+    if consultorioid is not None:
+        query = query.filter(Paciente.consultorioid == consultorioid)
+
+    return query.group_by(Paciente.consultorioid).all()
+
+
 def _obtener_consultorios_map(db: Session) -> Dict[Optional[int], str]:
     rows = db.query(Consultorio).all()
     return {c.id: _nombre_consultorio(c) for c in rows}
@@ -382,7 +511,10 @@ def _calcular_cuentas_tratamientos(
             Pago.estadopago,
             func.coalesce(func.sum(Pago.monto), 0),
         )
-        .filter(Pago.tratamientopacienteid.in_(ids))
+        .filter(
+            Pago.tratamientopacienteid.in_(ids),
+            Pago.anulado == False,
+        )
         .group_by(Pago.tratamientopacienteid, Pago.estadopago)
         .all()
     )
@@ -461,6 +593,7 @@ def _pagos_aplicados_a_rango_por_tratamiento(
         .filter(
             Pago.tratamientopacienteid.in_(tratamiento_ids),
             Pago.estadopago == 2,
+            Pago.anulado == False,
             cast(Pago.fechapago, Date) <= hasta,
         )
         .group_by(Pago.tratamientopacienteid)
@@ -661,6 +794,7 @@ def dashboard_acciones(
     # Transferencias pendientes de verificación. Es solo COUNT, no suma cuentas.
     transferencias_pendientes_query = db.query(Pago).filter(
         Pago.estadopago == 1,
+        Pago.anulado == False,
         Pago.tratamientopacienteid != None,
     )
     transferencias_pendientes_query = _aplicar_filtros_pagos(
@@ -793,6 +927,7 @@ def dashboard_resumen(
     pagos_hoy_query = db.query(Pago).filter(
         cast(Pago.fechapago, Date) == hoy,
         Pago.estadopago == 2,
+        Pago.anulado == False,
         Pago.tratamientopacienteid != None,
     )
 
@@ -831,6 +966,7 @@ def dashboard_resumen(
 
     transferencias_pendientes_query = db.query(Pago).filter(
         Pago.estadopago == 1,
+        Pago.anulado == False,
         Pago.tratamientopacienteid != None,
     )
 
@@ -1141,6 +1277,7 @@ def reporte_terapias(
     pagos_query = db.query(Pago).filter(
         cast(Pago.fechapago, Date).between(desde, hasta),
         Pago.estadopago == 2,
+        Pago.anulado == False,
         Pago.tratamientopacienteid != None,
     )
 
@@ -1291,6 +1428,15 @@ def reporte_fisioterapeutas_semanal(
 
     consultorios_map = _obtener_consultorios_map(db)
 
+    pagos_gimnasio_rows = _pagos_gimnasio_por_terapeuta(
+        db=db,
+        current_user=current_user,
+        desde=desde,
+        hasta=hasta,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+    )
+
     tratamiento_ids = {
         s.tratamientopacienteid
         for s in sesiones
@@ -1324,6 +1470,7 @@ def reporte_fisioterapeutas_semanal(
                 ),
                 "sesiones": 0,
                 "total_generado": 0.0,
+                "total_gimnasio_pagado": 0.0,
             },
         )
 
@@ -1333,6 +1480,30 @@ def reporte_fisioterapeutas_semanal(
         key = (terapeuta_id, tratamiento_id)
         generado_por_tratamiento_en_rango[key] = (
             generado_por_tratamiento_en_rango.get(key, 0.0) + precio
+        )
+
+    for row in pagos_gimnasio_rows:
+        terapeuta_id = int(row.terapeutaid)
+        consultorio_id = row.consultorioid
+        total_gimnasio_pagado = float(row.total_pagado or 0)
+
+        item = data.setdefault(
+            terapeuta_id,
+            {
+                "terapeuta": f"{row.nombres or ''} {row.apellidos or ''}".strip() or "Sin terapeuta",
+                "consultorioid": consultorio_id,
+                "consultorio": consultorios_map.get(
+                    consultorio_id,
+                    "Sin consultorio",
+                ),
+                "sesiones": 0,
+                "total_generado": 0.0,
+                "total_gimnasio_pagado": 0.0,
+            },
+        )
+
+        item["total_gimnasio_pagado"] = (
+            float(item.get("total_gimnasio_pagado", 0.0)) + total_gimnasio_pagado
         )
 
     pagado_por_terapeuta: Dict[int, float] = {
@@ -1353,9 +1524,15 @@ def reporte_fisioterapeutas_semanal(
     resultado: List[FisioSemanalOut] = []
 
     for tid, item in data.items():
-        total_generado = float(item["total_generado"])
-        total_pagado = float(pagado_por_terapeuta.get(tid, 0.0))
-        pendiente = max(total_generado - total_pagado, 0.0)
+        total_terapia_generado = float(item["total_generado"])
+        total_terapia_pagado = float(pagado_por_terapeuta.get(tid, 0.0))
+        pendiente_terapia = max(total_terapia_generado - total_terapia_pagado, 0.0)
+        total_gimnasio_pagado = float(item.get("total_gimnasio_pagado", 0.0))
+
+        ganancia_terapia_total = total_terapia_generado * PORCENTAJE_FISIO_TERAPIA
+        ganancia_terapia_cobrada = total_terapia_pagado * PORCENTAJE_FISIO_TERAPIA
+        ganancia_terapia_pendiente = pendiente_terapia * PORCENTAJE_FISIO_TERAPIA
+        ganancia_gimnasio_cobrada = total_gimnasio_pagado * PORCENTAJE_FISIO_GIMNASIO
 
         resultado.append(
             FisioSemanalOut(
@@ -1364,12 +1541,17 @@ def reporte_fisioterapeutas_semanal(
                 consultorioid=item.get("consultorioid"),
                 consultorio=str(item.get("consultorio") or "Sin consultorio"),
                 sesiones_realizadas=int(item["sesiones"]),
-                total_generado=round(total_generado, 2),
-                total_pagado_pacientes=round(total_pagado, 2),
-                total_pendiente_pacientes=round(pendiente, 2),
-                ganancia_fisio_total=round(total_generado * PORCENTAJE_FISIO, 2),
-                ganancia_fisio_cobrada=round(total_pagado * PORCENTAJE_FISIO, 2),
-                ganancia_fisio_pendiente=round(pendiente * PORCENTAJE_FISIO, 2),
+                total_generado=round(total_terapia_generado, 2),
+                total_pagado_pacientes=round(total_terapia_pagado, 2),
+                total_pendiente_pacientes=round(pendiente_terapia, 2),
+                total_gimnasio_pagado=round(total_gimnasio_pagado, 2),
+                ganancia_terapia_total=round(ganancia_terapia_total, 2),
+                ganancia_terapia_cobrada=round(ganancia_terapia_cobrada, 2),
+                ganancia_terapia_pendiente=round(ganancia_terapia_pendiente, 2),
+                ganancia_gimnasio_cobrada=round(ganancia_gimnasio_cobrada, 2),
+                ganancia_fisio_total=round(ganancia_terapia_total + ganancia_gimnasio_cobrada, 2),
+                ganancia_fisio_cobrada=round(ganancia_terapia_cobrada + ganancia_gimnasio_cobrada, 2),
+                ganancia_fisio_pendiente=round(ganancia_terapia_pendiente, 2),
             )
         )
 
@@ -1550,6 +1732,15 @@ def reporte_clinicas_semanal(
 
     consultorios_map = _obtener_consultorios_map(db)
 
+    pagos_gimnasio_rows = _pagos_gimnasio_por_consultorio(
+        db=db,
+        current_user=current_user,
+        desde=desde,
+        hasta=hasta,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+    )
+
     tratamiento_ids = {
         s.tratamientopacienteid
         for s in sesiones
@@ -1581,6 +1772,7 @@ def reporte_clinicas_semanal(
                 ),
                 "sesiones": 0,
                 "total_generado": 0.0,
+                "total_gimnasio_pagado": 0.0,
             },
         )
 
@@ -1590,6 +1782,28 @@ def reporte_clinicas_semanal(
         key = (consultorio_id, tratamiento_id)
         generado_por_clinica_tratamiento[key] = (
             generado_por_clinica_tratamiento.get(key, 0.0) + precio
+        )
+
+    for row in pagos_gimnasio_rows:
+        consultorio_id = row.consultorioid
+        total_gimnasio_pagado = float(row.total_pagado or 0)
+
+        item = data.setdefault(
+            consultorio_id,
+            {
+                "consultorioid": consultorio_id,
+                "consultorio": consultorios_map.get(
+                    consultorio_id,
+                    "Sin consultorio",
+                ),
+                "sesiones": 0,
+                "total_generado": 0.0,
+                "total_gimnasio_pagado": 0.0,
+            },
+        )
+
+        item["total_gimnasio_pagado"] = (
+            float(item.get("total_gimnasio_pagado", 0.0)) + total_gimnasio_pagado
         )
 
     pagado_por_clinica: Dict[Optional[int], float] = {
@@ -1610,24 +1824,43 @@ def reporte_clinicas_semanal(
     resultado: List[ClinicaSemanalOut] = []
 
     for consultorio_id, item in data.items():
-        total_generado = float(item["total_generado"])
-        total_pagado = float(pagado_por_clinica.get(consultorio_id, 0.0))
-        pendiente = max(total_generado - total_pagado, 0.0)
+        total_terapia_generado = float(item["total_generado"])
+        total_terapia_pagado = float(pagado_por_clinica.get(consultorio_id, 0.0))
+        pendiente_terapia = max(total_terapia_generado - total_terapia_pagado, 0.0)
+        total_gimnasio_pagado = float(item.get("total_gimnasio_pagado", 0.0))
+
+        ganancia_fisios_terapia_total = total_terapia_generado * PORCENTAJE_FISIO_TERAPIA
+        ganancia_fisios_terapia_cobrada = total_terapia_pagado * PORCENTAJE_FISIO_TERAPIA
+        ganancia_fisios_terapia_pendiente = pendiente_terapia * PORCENTAJE_FISIO_TERAPIA
+        ganancia_clinica_terapia_total = total_terapia_generado * PORCENTAJE_CLINICA_TERAPIA
+        ganancia_clinica_terapia_cobrada = total_terapia_pagado * PORCENTAJE_CLINICA_TERAPIA
+        ganancia_clinica_terapia_pendiente = pendiente_terapia * PORCENTAJE_CLINICA_TERAPIA
+        ganancia_fisios_gimnasio_cobrada = total_gimnasio_pagado * PORCENTAJE_FISIO_GIMNASIO
+        ganancia_clinica_gimnasio_cobrada = total_gimnasio_pagado * PORCENTAJE_CLINICA_GIMNASIO
 
         resultado.append(
             ClinicaSemanalOut(
                 consultorioid=consultorio_id,
                 consultorio=str(item.get("consultorio") or "Sin consultorio"),
                 sesiones_realizadas=int(item["sesiones"]),
-                total_generado=round(total_generado, 2),
-                total_pagado_pacientes=round(total_pagado, 2),
-                total_pendiente_pacientes=round(pendiente, 2),
-                ganancia_fisios_total=round(total_generado * PORCENTAJE_FISIO, 2),
-                ganancia_fisios_cobrada=round(total_pagado * PORCENTAJE_FISIO, 2),
-                ganancia_fisios_pendiente=round(pendiente * PORCENTAJE_FISIO, 2),
-                ganancia_clinica_total=round(total_generado * PORCENTAJE_CLINICA, 2),
-                ganancia_clinica_cobrada=round(total_pagado * PORCENTAJE_CLINICA, 2),
-                ganancia_clinica_pendiente=round(pendiente * PORCENTAJE_CLINICA, 2),
+                total_generado=round(total_terapia_generado, 2),
+                total_pagado_pacientes=round(total_terapia_pagado, 2),
+                total_pendiente_pacientes=round(pendiente_terapia, 2),
+                total_gimnasio_pagado=round(total_gimnasio_pagado, 2),
+                ganancia_fisios_terapia_total=round(ganancia_fisios_terapia_total, 2),
+                ganancia_fisios_terapia_cobrada=round(ganancia_fisios_terapia_cobrada, 2),
+                ganancia_fisios_terapia_pendiente=round(ganancia_fisios_terapia_pendiente, 2),
+                ganancia_fisios_gimnasio_cobrada=round(ganancia_fisios_gimnasio_cobrada, 2),
+                ganancia_clinica_terapia_total=round(ganancia_clinica_terapia_total, 2),
+                ganancia_clinica_terapia_cobrada=round(ganancia_clinica_terapia_cobrada, 2),
+                ganancia_clinica_terapia_pendiente=round(ganancia_clinica_terapia_pendiente, 2),
+                ganancia_clinica_gimnasio_cobrada=round(ganancia_clinica_gimnasio_cobrada, 2),
+                ganancia_fisios_total=round(ganancia_fisios_terapia_total + ganancia_fisios_gimnasio_cobrada, 2),
+                ganancia_fisios_cobrada=round(ganancia_fisios_terapia_cobrada + ganancia_fisios_gimnasio_cobrada, 2),
+                ganancia_fisios_pendiente=round(ganancia_fisios_terapia_pendiente, 2),
+                ganancia_clinica_total=round(ganancia_clinica_terapia_total + ganancia_clinica_gimnasio_cobrada, 2),
+                ganancia_clinica_cobrada=round(ganancia_clinica_terapia_cobrada + ganancia_clinica_gimnasio_cobrada, 2),
+                ganancia_clinica_pendiente=round(ganancia_clinica_terapia_pendiente, 2),
             )
         )
 

@@ -150,9 +150,21 @@ class FisioSemanalOut(BaseModel):
     consultorioid: Optional[int] = None
     consultorio: str = "Sin consultorio"
     sesiones_realizadas: int = 0
+    # Terapias: valores de sesiones finalizadas.
     total_generado: float = 0
     total_pagado_pacientes: float = 0
     total_pendiente_pacientes: float = 0
+
+    # Gimnasio: pagos verificados de membresía mensual y pase diario.
+    total_gimnasio_pagado: float = 0
+
+    # Desglose de ganancia del terapeuta.
+    ganancia_terapia_total: float = 0
+    ganancia_terapia_cobrada: float = 0
+    ganancia_terapia_pendiente: float = 0
+    ganancia_gimnasio_cobrada: float = 0
+
+    # Totales finales para compatibilidad con el frontend existente.
     ganancia_fisio_total: float = 0
     ganancia_fisio_cobrada: float = 0
     ganancia_fisio_pendiente: float = 0
@@ -191,9 +203,27 @@ class ClinicaSemanalOut(BaseModel):
     consultorioid: Optional[int] = None
     consultorio: str = "Sin consultorio"
     sesiones_realizadas: int = 0
+    # Terapias: valores de sesiones finalizadas.
     total_generado: float = 0
     total_pagado_pacientes: float = 0
     total_pendiente_pacientes: float = 0
+
+    # Gimnasio: pagos verificados de membresía mensual y pase diario.
+    total_gimnasio_pagado: float = 0
+
+    # Desglose de fisioterapeutas.
+    ganancia_fisios_terapia_total: float = 0
+    ganancia_fisios_terapia_cobrada: float = 0
+    ganancia_fisios_terapia_pendiente: float = 0
+    ganancia_fisios_gimnasio_cobrada: float = 0
+
+    # Desglose de clínica.
+    ganancia_clinica_terapia_total: float = 0
+    ganancia_clinica_terapia_cobrada: float = 0
+    ganancia_clinica_terapia_pendiente: float = 0
+    ganancia_clinica_gimnasio_cobrada: float = 0
+
+    # Totales finales para compatibilidad con el frontend existente.
     ganancia_fisios_total: float = 0
     ganancia_fisios_cobrada: float = 0
     ganancia_fisios_pendiente: float = 0
