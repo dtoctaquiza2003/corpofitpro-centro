@@ -111,6 +111,8 @@ class TratamientoRealizadoOut(BaseModel):
 
 class ResumenEstadoPagosOut(BaseModel):
     pagado_verificado: float = 0
+    # Dinero pagado antes de usar CORPOFIT Pro. Reduce saldos, pero no es caja actual.
+    pago_previo: float = 0
     pendiente_cobro: float = 0
     saldo_a_favor: float = 0
     pendiente_verificacion: float = 0
@@ -132,6 +134,8 @@ class TerapiasReporteOut(BaseModel):
     total_sesiones: int = 0
     total_generado: float = 0
     total_pagado_verificado: float = 0
+    # Pago previo / saldo inicial: no entra al cuadre de caja del rango.
+    total_pago_previo_verificado: float = 0
     total_ecuasanitas: float = 0
     sesiones_ecuasanitas: int = 0
     total_pendiente: float = 0

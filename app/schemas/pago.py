@@ -24,6 +24,42 @@ class PagoCreate(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
 
+class PagoPrevioTratamientoCreate(BaseModel):
+    """
+    Registro de terapias pagadas antes de la implementación del sistema.
+
+    Este registro reduce la deuda del tratamiento, pero no representa dinero
+    recibido en caja en la fecha de registro.
+    """
+
+    pacienteid: int
+    tratamientopacienteid: int
+    monto: float = Field(..., gt=0)
+    fechapagoreal: Optional[date] = None
+    observacionpagoprevio: Optional[str] = Field(default=None, max_length=500)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+
+
+class PagoPrevioGimnasioCreate(BaseModel):
+    """
+    Registro de membresías de gimnasio pagadas antes de usar el sistema.
+
+    Reduce la deuda de la membresía, pero no representa dinero recibido
+    en caja en la fecha de registro.
+    """
+
+    pacienteid: int
+    membresiagimnasioid: int
+    monto: float = Field(..., gt=0)
+    fechapagoreal: Optional[date] = None
+    observacionpagoprevio: Optional[str] = Field(default=None, max_length=500)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
 class PagoOut(BaseModel):
     id: int
     pacienteid: int
@@ -47,6 +83,11 @@ class PagoOut(BaseModel):
     verificado_por_id: Optional[int] = None
     fecha_verificacion: Optional[datetime] = None
     motivo_rechazo: Optional[str] = None
+
+    # Pago previo / saldo inicial
+    espagoprevio: bool = False
+    fechapagoreal: Optional[date] = None
+    observacionpagoprevio: Optional[str] = None
 
     # Anulación
     anulado: bool = False
@@ -77,6 +118,11 @@ class PagoSimpleOut(BaseModel):
     verificado_por_id: Optional[int] = None
     fecha_verificacion: Optional[datetime] = None
     motivo_rechazo: Optional[str] = None
+
+    # Pago previo / saldo inicial
+    espagoprevio: bool = False
+    fechapagoreal: Optional[date] = None
+    observacionpagoprevio: Optional[str] = None
 
     # Anulación
     anulado: bool = False
@@ -125,7 +171,12 @@ class CuentaTratamientoOut(BaseModel):
     sesiones_realizadas: int
 
     total_generado: float
+    # Total que reduce la deuda: pagos de caja + pagos previos/saldos iniciales.
     pagado_verificado: float
+    # Dinero cobrado antes del sistema. No entra a caja ni ingresos del día.
+    pago_previo_verificado: float = 0
+    # Dinero realmente cobrado dentro del sistema. Útil para cuadre de caja.
+    pagado_caja_verificado: float = 0
     pendiente_verificacion: float
     saldo: float
     saldo_favor: float = 0
@@ -150,7 +201,12 @@ class CuentaMembresiaGimnasioOut(BaseModel):
     activo: bool
     observaciones: Optional[str] = None
 
+    # Total que reduce la deuda: pagos de caja + pagos previos/saldos iniciales.
     pagado_verificado: float
+    # Dinero cobrado antes del sistema. No entra a caja ni ingresos del día.
+    pago_previo_verificado: float = 0
+    # Dinero realmente cobrado dentro del sistema. Útil para cuadre de caja.
+    pagado_caja_verificado: float = 0
     pendiente_verificacion: float
     saldo: float
     saldo_favor: float = 0

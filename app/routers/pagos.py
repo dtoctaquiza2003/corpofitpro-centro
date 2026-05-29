@@ -11,6 +11,8 @@ from app.schemas.pago import (
     CuentaPaqueteOut,
     CuentaTratamientoOut,
     PagoCreate,
+    PagoPrevioTratamientoCreate,
+    PagoPrevioGimnasioCreate,
     PagoOut,
     PagoSimpleOut,
     PagoAnularRequest
@@ -584,6 +586,13 @@ def listar_cuentas_paquetes(
                         verificado_por_id=pago.verificado_por_id,
                         fecha_verificacion=pago.fecha_verificacion,
                         motivo_rechazo=pago.motivo_rechazo,
+                        espagoprevio=bool(getattr(pago, "espagoprevio", False)),
+                        fechapagoreal=getattr(pago, "fechapagoreal", None),
+                        observacionpagoprevio=getattr(
+                            pago,
+                            "observacionpagoprevio",
+                            None,
+                        ),
                     )
                     for pago in pagos
                 ],
@@ -705,11 +714,19 @@ def listar_cuentas_tratamientos(
         pagos = pagos_por_tratamiento.get(tratamiento.id, [])
         pagos_no_anulados = [pago for pago in pagos if not bool(pago.anulado)]
 
-        pagado_verificado = sum(
+        pagado_caja_verificado = sum(
             float(pago.monto or 0)
             for pago in pagos_no_anulados
-            if pago.estadopago == 2
+            if pago.estadopago == 2 and not bool(getattr(pago, "espagoprevio", False))
         )
+
+        pago_previo_verificado = sum(
+            float(pago.monto or 0)
+            for pago in pagos_no_anulados
+            if pago.estadopago == 2 and bool(getattr(pago, "espagoprevio", False))
+        )
+
+        pagado_verificado = pagado_caja_verificado + pago_previo_verificado
 
         pendiente_verificacion = sum(
             float(pago.monto or 0)
@@ -746,6 +763,8 @@ def listar_cuentas_tratamientos(
                 sesiones_realizadas=sesiones_realizadas,
                 total_generado=total_generado,
                 pagado_verificado=pagado_verificado,
+                pago_previo_verificado=pago_previo_verificado,
+                pagado_caja_verificado=pagado_caja_verificado,
                 pendiente_verificacion=pendiente_verificacion,
                 saldo=saldo,
                 saldo_favor=saldo_favor,
@@ -771,6 +790,13 @@ def listar_cuentas_tratamientos(
                         verificado_por_id=pago.verificado_por_id,
                         fecha_verificacion=pago.fecha_verificacion,
                         motivo_rechazo=pago.motivo_rechazo,
+                        espagoprevio=bool(getattr(pago, "espagoprevio", False)),
+                        fechapagoreal=getattr(pago, "fechapagoreal", None),
+                        observacionpagoprevio=getattr(
+                            pago,
+                            "observacionpagoprevio",
+                            None,
+                        ),
                         anulado=bool(pago.anulado),
                         anulado_por_id=pago.anulado_por_id,
                         fecha_anulacion=pago.fecha_anulacion,
@@ -863,11 +889,19 @@ def listar_cuentas_gimnasio(
         pagos = pagos_por_membresia.get(membresia.id, [])
         pagos_no_anulados = [pago for pago in pagos if not bool(pago.anulado)]
 
-        pagado_verificado = sum(
+        pagado_caja_verificado = sum(
             float(pago.monto or 0)
             for pago in pagos_no_anulados
-            if pago.estadopago == 2
+            if pago.estadopago == 2 and not bool(getattr(pago, "espagoprevio", False))
         )
+
+        pago_previo_verificado = sum(
+            float(pago.monto or 0)
+            for pago in pagos_no_anulados
+            if pago.estadopago == 2 and bool(getattr(pago, "espagoprevio", False))
+        )
+
+        pagado_verificado = pagado_caja_verificado + pago_previo_verificado
 
         pendiente_verificacion = sum(
             float(pago.monto or 0)
@@ -889,6 +923,8 @@ def listar_cuentas_gimnasio(
                 activo=membresia.activo,
                 observaciones=membresia.observaciones,
                 pagado_verificado=pagado_verificado,
+                pago_previo_verificado=pago_previo_verificado,
+                pagado_caja_verificado=pagado_caja_verificado,
                 pendiente_verificacion=pendiente_verificacion,
                 saldo=saldo,
                 saldo_favor=saldo_favor,
@@ -911,6 +947,13 @@ def listar_cuentas_gimnasio(
                         verificado_por_id=pago.verificado_por_id,
                         fecha_verificacion=pago.fecha_verificacion,
                         motivo_rechazo=pago.motivo_rechazo,
+                        espagoprevio=bool(getattr(pago, "espagoprevio", False)),
+                        fechapagoreal=getattr(pago, "fechapagoreal", None),
+                        observacionpagoprevio=getattr(
+                            pago,
+                            "observacionpagoprevio",
+                            None,
+                        ),
                         anulado=bool(pago.anulado),
                         anulado_por_id=pago.anulado_por_id,
                         fecha_anulacion=pago.fecha_anulacion,
@@ -923,6 +966,148 @@ def listar_cuentas_gimnasio(
 
     return resultado
 
+
+
+# ============================================================
+# REGISTRAR PAGO PREVIO DE TERAPIAS
+# ============================================================
+
+@router.post(
+    "/pago-previo-tratamiento",
+    response_model=PagoOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def registrar_pago_previo_tratamiento(
+    data: PagoPrevioTratamientoCreate,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(get_current_secretary),
+):
+    """
+    Registra dinero que el paciente ya había pagado antes de usar el sistema.
+
+    Solo aplica para terapias/tratamientos. Para gimnasio existe
+    /api/pagos/pago-previo-gimnasio.
+    Este movimiento reduce el saldo del tratamiento, pero no debe contarse
+    como ingreso de caja del día ni como método de pago cobrado ahora.
+    """
+    paciente = _validar_paciente(
+        db=db,
+        pacienteid=data.pacienteid,
+        current_user=current_user,
+    )
+
+    _validar_tratamiento_paciente(
+        db=db,
+        pacienteid=data.pacienteid,
+        tratamientopacienteid=data.tratamientopacienteid,
+    )
+
+    observacion = (data.observacionpagoprevio or "").strip() or None
+
+    nuevo_pago = Pago(
+        pacienteid=data.pacienteid,
+        pacientepaqueteid=None,
+        tratamientopacienteid=data.tratamientopacienteid,
+        membresiagimnasioid=None,
+        monto=float(data.monto),
+        metodopago="Pago previo",
+        numerocomprobante=None,
+        comprobanteurl=None,
+        estadopago=2,
+        creado_por_id=current_user.id,
+        verificado_por_id=current_user.id,
+        fecha_verificacion=now_ecuador(),
+        motivo_rechazo=None,
+        espagoprevio=True,
+        fechapagoreal=data.fechapagoreal,
+        observacionpagoprevio=observacion,
+    )
+
+    db.add(nuevo_pago)
+    db.commit()
+    db.refresh(nuevo_pago)
+
+    print(
+        f"✅ Pago previo registrado para paciente {paciente.id} "
+        f"tratamiento {data.tratamientopacienteid}: ${float(data.monto):.2f}"
+    )
+
+    return nuevo_pago
+
+
+
+
+# ============================================================
+# REGISTRAR PAGO PREVIO DE GIMNASIO
+# ============================================================
+
+@router.post(
+    "/pago-previo-gimnasio",
+    response_model=PagoOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def registrar_pago_previo_gimnasio(
+    data: PagoPrevioGimnasioCreate,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(get_current_secretary),
+):
+    """
+    Registra dinero que el paciente ya había pagado por gimnasio antes
+    de usar el sistema.
+
+    Aplica para membresías mensuales de gimnasio que ya estaban en curso.
+    Reduce el saldo de la membresía, pero no debe contarse como ingreso
+    de caja del día ni como método de pago cobrado ahora.
+    """
+    paciente = _validar_paciente(
+        db=db,
+        pacienteid=data.pacienteid,
+        current_user=current_user,
+    )
+
+    membresia = _validar_membresia_gimnasio(
+        db=db,
+        pacienteid=data.pacienteid,
+        membresiagimnasioid=data.membresiagimnasioid,
+    )
+
+    _validar_saldo_membresia_gimnasio(
+        db=db,
+        membresia=membresia,
+        monto=float(data.monto),
+    )
+
+    observacion = (data.observacionpagoprevio or "").strip() or None
+
+    nuevo_pago = Pago(
+        pacienteid=data.pacienteid,
+        pacientepaqueteid=None,
+        tratamientopacienteid=None,
+        membresiagimnasioid=data.membresiagimnasioid,
+        monto=float(data.monto),
+        metodopago="Pago previo",
+        numerocomprobante=None,
+        comprobanteurl=None,
+        estadopago=2,
+        creado_por_id=current_user.id,
+        verificado_por_id=current_user.id,
+        fecha_verificacion=now_ecuador(),
+        motivo_rechazo=None,
+        espagoprevio=True,
+        fechapagoreal=data.fechapagoreal,
+        observacionpagoprevio=observacion,
+    )
+
+    db.add(nuevo_pago)
+    db.commit()
+    db.refresh(nuevo_pago)
+
+    print(
+        f"✅ Pago previo de gimnasio registrado para paciente {paciente.id} "
+        f"membresía {data.membresiagimnasioid}: ${float(data.monto):.2f}"
+    )
+
+    return nuevo_pago
 
 
 # ============================================================

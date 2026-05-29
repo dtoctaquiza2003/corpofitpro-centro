@@ -133,6 +133,19 @@ def _columna_paciente_alerta():
     raise RuntimeError("El modelo Alerta no tiene pacienteid ni paciente_id.")
 
 
+def _pago_no_anulado_filter():
+    return or_(Pago.anulado == False, Pago.anulado.is_(None))
+
+
+def _pago_de_caja_filter():
+    """Pagos que sí representan dinero cobrado dentro del sistema.
+
+    Los pagos previos reducen saldos, pero no deben entrar al cuadre
+    de caja, ingresos del día ni gráficos por método de pago.
+    """
+    return or_(Pago.espagoprevio == False, Pago.espagoprevio.is_(None))
+
+
 def _default_range(desde: Optional[date], hasta: Optional[date]) -> tuple[date, date]:
     today = date.today()
 
@@ -389,7 +402,8 @@ def _pagos_gimnasio_por_terapeuta(
         .filter(
             Pago.membresiagimnasioid != None,
             Pago.estadopago == 2,
-            Pago.anulado == False,
+            _pago_no_anulado_filter(),
+            _pago_de_caja_filter(),
             cast(Pago.fechapago, Date).between(desde, hasta),
             Paciente.terapeutaasignadoid != None,
             Usuario.rol == 2,
@@ -448,7 +462,8 @@ def _pagos_gimnasio_por_consultorio(
         .filter(
             Pago.membresiagimnasioid != None,
             Pago.estadopago == 2,
-            Pago.anulado == False,
+            _pago_no_anulado_filter(),
+            _pago_de_caja_filter(),
             cast(Pago.fechapago, Date).between(desde, hasta),
         )
     )
@@ -544,23 +559,45 @@ def _calcular_cuentas_tratamientos(
         db.query(
             Pago.tratamientopacienteid,
             Pago.estadopago,
+            Pago.espagoprevio,
             func.coalesce(func.sum(Pago.monto), 0),
         )
         .filter(
             Pago.tratamientopacienteid.in_(ids),
-            Pago.anulado == False,
+            _pago_no_anulado_filter(),
         )
-        .group_by(Pago.tratamientopacienteid, Pago.estadopago)
+        .group_by(
+            Pago.tratamientopacienteid,
+            Pago.estadopago,
+            Pago.espagoprevio,
+        )
         .all()
     )
 
-    pagos_map: Dict[int, Dict[int, float]] = {}
+    pagos_map: Dict[int, Dict[str, float]] = {}
 
-    for tratamiento_id, estado, total in pagos_rows:
+    for tratamiento_id, estado, es_previo, total in pagos_rows:
         if tratamiento_id is None:
             continue
 
-        pagos_map.setdefault(tratamiento_id, {})[estado] = float(total or 0)
+        item = pagos_map.setdefault(
+            tratamiento_id,
+            {
+                "pagado_caja": 0.0,
+                "pago_previo": 0.0,
+                "pendiente_verificacion": 0.0,
+            },
+        )
+
+        total_float = float(total or 0)
+
+        if estado == 2:
+            if bool(es_previo):
+                item["pago_previo"] += total_float
+            else:
+                item["pagado_caja"] += total_float
+        elif estado == 1:
+            item["pendiente_verificacion"] += total_float
 
     result: Dict[int, Dict[str, float]] = {}
 
@@ -568,8 +605,20 @@ def _calcular_cuentas_tratamientos(
         sesiones = int(sesiones_por_tratamiento.get(tratamiento.id, 0) or 0)
         precio = _precio_aplicado(tratamiento)
         total_generado = sesiones * precio
-        pagado_verificado = pagos_map.get(tratamiento.id, {}).get(2, 0.0)
-        pendiente_verificacion = pagos_map.get(tratamiento.id, {}).get(1, 0.0)
+        pagos_item = pagos_map.get(
+            tratamiento.id,
+            {
+                "pagado_caja": 0.0,
+                "pago_previo": 0.0,
+                "pendiente_verificacion": 0.0,
+            },
+        )
+        pagado_caja = float(pagos_item.get("pagado_caja", 0.0) or 0.0)
+        pago_previo = float(pagos_item.get("pago_previo", 0.0) or 0.0)
+        pagado_verificado = pagado_caja + pago_previo
+        pendiente_verificacion = float(
+            pagos_item.get("pendiente_verificacion", 0.0) or 0.0
+        )
         es_ecuasanitas = _es_paciente_ecuasanitas(tratamiento.paciente)
         cubierto_ecuasanitas = total_generado if es_ecuasanitas else 0.0
 
@@ -590,6 +639,8 @@ def _calcular_cuentas_tratamientos(
             "sesiones": float(sesiones),
             "total_generado": total_generado,
             "pagado_verificado": pagado_verificado,
+            "pagado_caja_verificado": pagado_caja,
+            "pago_previo_verificado": pago_previo,
             "pendiente_verificacion": pendiente_verificacion,
             "saldo": saldo,
             "saldo_favor": saldo_favor,
@@ -642,8 +693,11 @@ def _pagos_aplicados_a_rango_por_tratamiento(
         .filter(
             Pago.tratamientopacienteid.in_(tratamiento_ids),
             Pago.estadopago == 2,
-            Pago.anulado == False,
-            cast(Pago.fechapago, Date) <= hasta,
+            _pago_no_anulado_filter(),
+            or_(
+                Pago.espagoprevio == True,
+                cast(Pago.fechapago, Date) <= hasta,
+            ),
         )
         .group_by(Pago.tratamientopacienteid)
         .all()
@@ -976,7 +1030,8 @@ def dashboard_resumen(
     pagos_hoy_query = db.query(Pago).filter(
         cast(Pago.fechapago, Date) == hoy,
         Pago.estadopago == 2,
-        Pago.anulado == False,
+        _pago_no_anulado_filter(),
+        _pago_de_caja_filter(),
         Pago.tratamientopacienteid != None,
     )
 
@@ -1310,8 +1365,16 @@ def reporte_terapias(
         1 for s in sesiones if _es_paciente_ecuasanitas(s.paciente)
     )
 
+    # Para no dañar el cuadre de caja, el total pagado del reporte general
+    # solo suma dinero cobrado dentro del sistema. Los pagos previos se
+    # muestran separado y solo reducen saldos.
     total_pagado_verificado = sum(
-        item["pagado_verificado"]
+        item.get("pagado_caja_verificado", item["pagado_verificado"])
+        for item in cuentas.values()
+    )
+
+    total_pago_previo_verificado = sum(
+        item.get("pago_previo_verificado", 0.0)
         for item in cuentas.values()
     )
 
@@ -1339,7 +1402,8 @@ def reporte_terapias(
     pagos_query = db.query(Pago).filter(
         cast(Pago.fechapago, Date).between(desde, hasta),
         Pago.estadopago == 2,
-        Pago.anulado == False,
+        _pago_no_anulado_filter(),
+        _pago_de_caja_filter(),
         Pago.tratamientopacienteid != None,
     )
 
@@ -1439,6 +1503,7 @@ def reporte_terapias(
         total_sesiones=len(sesiones),
         total_generado=round(total_generado, 2),
         total_pagado_verificado=round(total_pagado_verificado, 2),
+        total_pago_previo_verificado=round(total_pago_previo_verificado, 2),
         total_ecuasanitas=round(total_ecuasanitas, 2),
         sesiones_ecuasanitas=sesiones_ecuasanitas,
         total_pendiente=round(total_pendiente, 2),
@@ -1450,6 +1515,7 @@ def reporte_terapias(
         sesiones_por_dia=list(dias_map.values()),
         estado_pagos=ResumenEstadoPagosOut(
             pagado_verificado=round(total_pagado_verificado, 2),
+            pago_previo=round(total_pago_previo_verificado, 2),
             pendiente_cobro=round(total_pendiente, 2),
             saldo_a_favor=round(saldo_a_favor, 2),
             pendiente_verificacion=round(pendiente_verificacion_total, 2),

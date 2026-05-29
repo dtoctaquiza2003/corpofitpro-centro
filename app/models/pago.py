@@ -1,6 +1,7 @@
 from sqlalchemy import (
     Boolean,
     Column,
+    Date,
     DateTime,
     Float,
     ForeignKey,
@@ -54,6 +55,14 @@ class Pago(Base):
     verificado_por_id = Column(Integer, ForeignKey("usuarios.id"), nullable=True)
     fecha_verificacion = Column(DateTime(timezone=True), nullable=True)
     motivo_rechazo = Column(Text, nullable=True)
+
+
+    # Pago previo / saldo inicial: dinero cobrado antes de usar el sistema.
+    # Cuenta para reducir la deuda del tratamiento, pero NO debe entrar a caja
+    # ni a ingresos cobrados del día porque no se cobró dentro del sistema.
+    espagoprevio = Column(Boolean, default=False, nullable=False)
+    fechapagoreal = Column(Date, nullable=True)
+    observacionpagoprevio = Column(Text, nullable=True)
 
     # Anulación de pagos
     anulado = Column(Boolean, default=False, nullable=False)
