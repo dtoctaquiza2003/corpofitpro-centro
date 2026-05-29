@@ -70,5 +70,6 @@ def root():
 
 # Endpoint de health check
 @app.get("/health")
-def health_check():
+async def health_check():
+    # Debe ser extremadamente liviano: no tocar DB ni servicios externos.
     return {"status": "ok"}
