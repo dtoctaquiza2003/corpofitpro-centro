@@ -14,6 +14,7 @@ class PacienteBase(BaseModel):
     ocupacion: Optional[str] = None
     correoelectronico: Optional[str] = None
     tiposeguro: Optional[str] = None
+    esecuasanitas: bool = False
     motivoconsulta: Optional[str] = None
     examenescomplementarios: Optional[str] = None
     consentimientofirmado: Optional[bool] = False

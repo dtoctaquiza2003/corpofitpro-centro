@@ -114,6 +114,7 @@ class ResumenEstadoPagosOut(BaseModel):
     pendiente_cobro: float = 0
     saldo_a_favor: float = 0
     pendiente_verificacion: float = 0
+    cubierto_ecuasanitas: float = 0
 
 
 class ReporteDiaOut(BaseModel):
@@ -122,6 +123,7 @@ class ReporteDiaOut(BaseModel):
     sesiones: int = 0
     total_generado: float = 0
     pagos_verificados: float = 0
+    cubierto_ecuasanitas: float = 0
 
 
 class TerapiasReporteOut(BaseModel):
@@ -130,6 +132,8 @@ class TerapiasReporteOut(BaseModel):
     total_sesiones: int = 0
     total_generado: float = 0
     total_pagado_verificado: float = 0
+    total_ecuasanitas: float = 0
+    sesiones_ecuasanitas: int = 0
     total_pendiente: float = 0
     saldo_a_favor: float = 0
     transferencias_pendientes: int = 0
@@ -154,6 +158,7 @@ class FisioSemanalOut(BaseModel):
     total_generado: float = 0
     total_pagado_pacientes: float = 0
     total_pendiente_pacientes: float = 0
+    total_ecuasanitas: float = 0
 
     # Gimnasio: pagos verificados de membresía mensual y pase diario.
     total_gimnasio_pagado: float = 0
@@ -162,6 +167,7 @@ class FisioSemanalOut(BaseModel):
     ganancia_terapia_total: float = 0
     ganancia_terapia_cobrada: float = 0
     ganancia_terapia_pendiente: float = 0
+    ganancia_terapia_ecuasanitas: float = 0
     ganancia_gimnasio_cobrada: float = 0
 
     # Totales finales para compatibilidad con el frontend existente.
@@ -182,6 +188,8 @@ class FisioDetallePacienteOut(BaseModel):
     total_generado: float = 0
     pagado_paciente: float = 0
     pendiente_paciente: float = 0
+    es_ecuasanitas: bool = False
+    cubierto_ecuasanitas: float = 0
     ganancia_fisio: float = 0
     ganancia_cobrada: float = 0
     ganancia_pendiente: float = 0
@@ -207,6 +215,7 @@ class ClinicaSemanalOut(BaseModel):
     total_generado: float = 0
     total_pagado_pacientes: float = 0
     total_pendiente_pacientes: float = 0
+    total_ecuasanitas: float = 0
 
     # Gimnasio: pagos verificados de membresía mensual y pase diario.
     total_gimnasio_pagado: float = 0
@@ -215,12 +224,14 @@ class ClinicaSemanalOut(BaseModel):
     ganancia_fisios_terapia_total: float = 0
     ganancia_fisios_terapia_cobrada: float = 0
     ganancia_fisios_terapia_pendiente: float = 0
+    ganancia_fisios_terapia_ecuasanitas: float = 0
     ganancia_fisios_gimnasio_cobrada: float = 0
 
     # Desglose de clínica.
     ganancia_clinica_terapia_total: float = 0
     ganancia_clinica_terapia_cobrada: float = 0
     ganancia_clinica_terapia_pendiente: float = 0
+    ganancia_clinica_terapia_ecuasanitas: float = 0
     ganancia_clinica_gimnasio_cobrada: float = 0
 
     # Totales finales para compatibilidad con el frontend existente.

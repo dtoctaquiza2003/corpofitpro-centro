@@ -20,6 +20,9 @@ class Paciente(Base):
     ocupacion = Column(String(100))
     correoelectronico = Column(String(100))
     tiposeguro = Column(String(100))
+    # Convenio/seguro Ecuasanitas: paga directamente a la clínica.
+    # Se usa en reportes para no marcar al paciente como pendiente de cobro.
+    esecuasanitas = Column(Boolean, nullable=False, default=False, server_default="false")
     motivoconsulta = Column(String(500))
     examenescomplementarios = Column(Text)
     consentimientofirmado = Column(Boolean, default=False)

@@ -2,7 +2,7 @@ from datetime import date, datetime, time, timedelta
 from typing import Dict, List, Optional, Set, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import Date, cast, exists, func
+from sqlalchemy import Date, cast, exists, func, or_
 from sqlalchemy.orm import Session, joinedload
 
 from ..models.alerta import Alerta
@@ -86,6 +86,33 @@ def _precio_aplicado(tratamiento: Optional[TratamientoPaciente]) -> float:
     if not tratamiento or tratamiento.precio_sesion_aplicado is None:
         return 0.0
     return float(tratamiento.precio_sesion_aplicado)
+
+
+def _es_paciente_ecuasanitas(paciente: Optional[Paciente]) -> bool:
+    """Devuelve True si el paciente está cubierto por Ecuasanitas.
+
+    Regla de negocio: Ecuasanitas SOLO aplica a terapias.
+    No usar esta condición para perdonar, anular o excluir cobros de
+    gimnasio mensual ni gimnasio diario; gimnasio se cobra normal.
+
+    Usa el campo nuevo `esecuasanitas` y mantiene compatibilidad con
+    pacientes antiguos que solo tenían `tiposeguro = Ecuasanitas`.
+    """
+    if not paciente:
+        return False
+
+    if bool(getattr(paciente, "esecuasanitas", False)):
+        return True
+
+    tipo_seguro = (getattr(paciente, "tiposeguro", None) or "").strip().lower()
+    return "ecuasanitas" in tipo_seguro
+
+
+def _condicion_paciente_ecuasanitas():
+    return or_(
+        Paciente.esecuasanitas == True,
+        Paciente.tiposeguro.ilike("%ecuasanitas%"),
+    )
 
 
 def _columna_paciente_alerta():
@@ -328,6 +355,9 @@ def _pagos_gimnasio_por_terapeuta(
     """
     Pagos verificados de gimnasio mensual y pase diario agrupados por terapeuta.
 
+    Importante: Ecuasanitas NO cubre gimnasio. Aunque el paciente sea
+    Ecuasanitas, gimnasio mensual y gimnasio diario se cobran normal.
+
     Regla de negocio:
     - Terapia: 35% para fisioterapeuta.
     - Gimnasio mensual y diario: 50% para fisioterapeuta.
@@ -394,7 +424,10 @@ def _pagos_gimnasio_por_consultorio(
     terapeutaid: Optional[int] = None,
     consultorioid: Optional[int] = None,
 ):
-    """Pagos verificados de gimnasio mensual/diario agrupados por consultorio."""
+    """Pagos verificados de gimnasio mensual/diario agrupados por consultorio.
+
+    Ecuasanitas no afecta esta consulta: gimnasio mensual y diario se cobran.
+    """
     _validar_filtros_para_rol(current_user, terapeutaid)
     consultorioid = _resolver_consultorioid_gimnasio_para_rol(
         current_user,
@@ -469,7 +502,9 @@ def _calcular_cuentas_tratamientos(
     """
     Calcula cuentas de tratamientos usando toda la vida del tratamiento.
     """
-    tratamientos_query = db.query(TratamientoPaciente)
+    tratamientos_query = db.query(TratamientoPaciente).options(
+        joinedload(TratamientoPaciente.paciente)
+    )
 
     tratamientos_query = _aplicar_filtros_tratamientos(
         tratamientos_query,
@@ -535,8 +570,20 @@ def _calcular_cuentas_tratamientos(
         total_generado = sesiones * precio
         pagado_verificado = pagos_map.get(tratamiento.id, {}).get(2, 0.0)
         pendiente_verificacion = pagos_map.get(tratamiento.id, {}).get(1, 0.0)
-        saldo = max(total_generado - pagado_verificado, 0.0)
-        saldo_favor = max(pagado_verificado - total_generado, 0.0)
+        es_ecuasanitas = _es_paciente_ecuasanitas(tratamiento.paciente)
+        cubierto_ecuasanitas = total_generado if es_ecuasanitas else 0.0
+
+        # Ecuasanitas SOLO aplica a tratamientos/sesiones de terapia.
+        # La deuda de terapia no se marca como pendiente del paciente.
+        # La sesión sí genera comisión del 35% para el terapeuta y 65%
+        # para la clínica. Gimnasio mensual/diario se cobra normal y
+        # no entra en esta cuenta.
+        if es_ecuasanitas:
+            saldo = 0.0
+            saldo_favor = max(pagado_verificado - total_generado, 0.0)
+        else:
+            saldo = max(total_generado - pagado_verificado, 0.0)
+            saldo_favor = max(pagado_verificado - total_generado, 0.0)
 
         result[tratamiento.id] = {
             "precio": precio,
@@ -546,6 +593,8 @@ def _calcular_cuentas_tratamientos(
             "pendiente_verificacion": pendiente_verificacion,
             "saldo": saldo,
             "saldo_favor": saldo_favor,
+            "es_ecuasanitas": 1.0 if es_ecuasanitas else 0.0,
+            "cubierto_ecuasanitas": cubierto_ecuasanitas,
         }
 
     return result
@@ -1212,7 +1261,10 @@ def reporte_terapias(
 
     sesiones_query = (
         db.query(SesionTerapia)
-        .options(joinedload(SesionTerapia.tratamiento_paciente))
+        .options(
+            joinedload(SesionTerapia.tratamiento_paciente),
+            joinedload(SesionTerapia.paciente),
+        )
         .filter(
             SesionTerapia.fecha.between(desde, hasta),
             SesionTerapia.horasalida != None,
@@ -1246,6 +1298,16 @@ def reporte_terapias(
     total_generado = sum(
         _precio_aplicado(s.tratamiento_paciente)
         for s in sesiones
+    )
+
+    total_ecuasanitas = sum(
+        _precio_aplicado(s.tratamiento_paciente)
+        for s in sesiones
+        if _es_paciente_ecuasanitas(s.paciente)
+    )
+
+    sesiones_ecuasanitas = sum(
+        1 for s in sesiones if _es_paciente_ecuasanitas(s.paciente)
     )
 
     total_pagado_verificado = sum(
@@ -1335,6 +1397,11 @@ def reporte_terapias(
                 dias_map[sesion.fecha].total_generado + precio,
                 2,
             )
+            if _es_paciente_ecuasanitas(sesion.paciente):
+                dias_map[sesion.fecha].cubierto_ecuasanitas = round(
+                    dias_map[sesion.fecha].cubierto_ecuasanitas + precio,
+                    2,
+                )
 
     pagos_por_dia = (
         pagos_query
@@ -1372,6 +1439,8 @@ def reporte_terapias(
         total_sesiones=len(sesiones),
         total_generado=round(total_generado, 2),
         total_pagado_verificado=round(total_pagado_verificado, 2),
+        total_ecuasanitas=round(total_ecuasanitas, 2),
+        sesiones_ecuasanitas=sesiones_ecuasanitas,
         total_pendiente=round(total_pendiente, 2),
         saldo_a_favor=round(saldo_a_favor, 2),
         transferencias_pendientes=transferencias_pendientes,
@@ -1384,6 +1453,7 @@ def reporte_terapias(
             pendiente_cobro=round(total_pendiente, 2),
             saldo_a_favor=round(saldo_a_favor, 2),
             pendiente_verificacion=round(pendiente_verificacion_total, 2),
+            cubierto_ecuasanitas=round(total_ecuasanitas, 2),
         ),
     )
 
@@ -1470,6 +1540,7 @@ def reporte_fisioterapeutas_semanal(
                 ),
                 "sesiones": 0,
                 "total_generado": 0.0,
+                "total_ecuasanitas": 0.0,
                 "total_gimnasio_pagado": 0.0,
             },
         )
@@ -1477,10 +1548,15 @@ def reporte_fisioterapeutas_semanal(
         item["sesiones"] = int(item["sesiones"]) + 1
         item["total_generado"] = float(item["total_generado"]) + precio
 
-        key = (terapeuta_id, tratamiento_id)
-        generado_por_tratamiento_en_rango[key] = (
-            generado_por_tratamiento_en_rango.get(key, 0.0) + precio
-        )
+        if _es_paciente_ecuasanitas(sesion.paciente):
+            item["total_ecuasanitas"] = (
+                float(item.get("total_ecuasanitas", 0.0)) + precio
+            )
+        else:
+            key = (terapeuta_id, tratamiento_id)
+            generado_por_tratamiento_en_rango[key] = (
+                generado_por_tratamiento_en_rango.get(key, 0.0) + precio
+            )
 
     for row in pagos_gimnasio_rows:
         terapeuta_id = int(row.terapeutaid)
@@ -1498,6 +1574,7 @@ def reporte_fisioterapeutas_semanal(
                 ),
                 "sesiones": 0,
                 "total_generado": 0.0,
+                "total_ecuasanitas": 0.0,
                 "total_gimnasio_pagado": 0.0,
             },
         )
@@ -1525,12 +1602,15 @@ def reporte_fisioterapeutas_semanal(
 
     for tid, item in data.items():
         total_terapia_generado = float(item["total_generado"])
+        total_ecuasanitas = float(item.get("total_ecuasanitas", 0.0))
         total_terapia_pagado = float(pagado_por_terapeuta.get(tid, 0.0))
-        pendiente_terapia = max(total_terapia_generado - total_terapia_pagado, 0.0)
+        total_no_ecuasanitas = max(total_terapia_generado - total_ecuasanitas, 0.0)
+        pendiente_terapia = max(total_no_ecuasanitas - total_terapia_pagado, 0.0)
         total_gimnasio_pagado = float(item.get("total_gimnasio_pagado", 0.0))
 
         ganancia_terapia_total = total_terapia_generado * PORCENTAJE_FISIO_TERAPIA
-        ganancia_terapia_cobrada = total_terapia_pagado * PORCENTAJE_FISIO_TERAPIA
+        ganancia_terapia_ecuasanitas = total_ecuasanitas * PORCENTAJE_FISIO_TERAPIA
+        ganancia_terapia_cobrada = (total_terapia_pagado + total_ecuasanitas) * PORCENTAJE_FISIO_TERAPIA
         ganancia_terapia_pendiente = pendiente_terapia * PORCENTAJE_FISIO_TERAPIA
         ganancia_gimnasio_cobrada = total_gimnasio_pagado * PORCENTAJE_FISIO_GIMNASIO
 
@@ -1544,10 +1624,12 @@ def reporte_fisioterapeutas_semanal(
                 total_generado=round(total_terapia_generado, 2),
                 total_pagado_pacientes=round(total_terapia_pagado, 2),
                 total_pendiente_pacientes=round(pendiente_terapia, 2),
+                total_ecuasanitas=round(total_ecuasanitas, 2),
                 total_gimnasio_pagado=round(total_gimnasio_pagado, 2),
                 ganancia_terapia_total=round(ganancia_terapia_total, 2),
                 ganancia_terapia_cobrada=round(ganancia_terapia_cobrada, 2),
                 ganancia_terapia_pendiente=round(ganancia_terapia_pendiente, 2),
+                ganancia_terapia_ecuasanitas=round(ganancia_terapia_ecuasanitas, 2),
                 ganancia_gimnasio_cobrada=round(ganancia_gimnasio_cobrada, 2),
                 ganancia_fisio_total=round(ganancia_terapia_total + ganancia_gimnasio_cobrada, 2),
                 ganancia_fisio_cobrada=round(ganancia_terapia_cobrada + ganancia_gimnasio_cobrada, 2),
@@ -1645,22 +1727,36 @@ def reporte_fisioterapeuta_detalle(
                 "sesiones": 0,
                 "precio_sesion": _precio_aplicado(tratamiento),
                 "total_generado": 0.0,
+                "es_ecuasanitas": _es_paciente_ecuasanitas(sesion.paciente),
             },
         )
 
         precio = _precio_aplicado(tratamiento)
         item["sesiones"] += 1
         item["total_generado"] += precio
+        if _es_paciente_ecuasanitas(sesion.paciente):
+            item["es_ecuasanitas"] = True
 
     pacientes: List[FisioDetallePacienteOut] = []
 
     for (_, tratamiento_id), item in agrupado.items():
         generado = float(item["total_generado"])
-        disponible = disponible_pagado.get(tratamiento_id, 0.0)
-        pagado = min(generado, disponible)
-        pendiente = max(generado - pagado, 0.0)
+        es_ecuasanitas = bool(item.get("es_ecuasanitas", False))
 
-        disponible_pagado[tratamiento_id] = max(disponible - pagado, 0.0)
+        if es_ecuasanitas:
+            pagado = 0.0
+            pendiente = 0.0
+            cubierto_ecuasanitas = generado
+            ganancia_cobrada = generado * PORCENTAJE_FISIO_TERAPIA
+            ganancia_pendiente = 0.0
+        else:
+            disponible = disponible_pagado.get(tratamiento_id, 0.0)
+            pagado = min(generado, disponible)
+            pendiente = max(generado - pagado, 0.0)
+            cubierto_ecuasanitas = 0.0
+            ganancia_cobrada = pagado * PORCENTAJE_FISIO_TERAPIA
+            ganancia_pendiente = pendiente * PORCENTAJE_FISIO_TERAPIA
+            disponible_pagado[tratamiento_id] = max(disponible - pagado, 0.0)
 
         pacientes.append(
             FisioDetallePacienteOut(
@@ -1675,9 +1771,11 @@ def reporte_fisioterapeuta_detalle(
                 total_generado=round(generado, 2),
                 pagado_paciente=round(pagado, 2),
                 pendiente_paciente=round(pendiente, 2),
-                ganancia_fisio=round(generado * PORCENTAJE_FISIO, 2),
-                ganancia_cobrada=round(pagado * PORCENTAJE_FISIO, 2),
-                ganancia_pendiente=round(pendiente * PORCENTAJE_FISIO, 2),
+                es_ecuasanitas=es_ecuasanitas,
+                cubierto_ecuasanitas=round(cubierto_ecuasanitas, 2),
+                ganancia_fisio=round(generado * PORCENTAJE_FISIO_TERAPIA, 2),
+                ganancia_cobrada=round(ganancia_cobrada, 2),
+                ganancia_pendiente=round(ganancia_pendiente, 2),
             )
         )
 
@@ -1772,6 +1870,7 @@ def reporte_clinicas_semanal(
                 ),
                 "sesiones": 0,
                 "total_generado": 0.0,
+                "total_ecuasanitas": 0.0,
                 "total_gimnasio_pagado": 0.0,
             },
         )
@@ -1779,10 +1878,15 @@ def reporte_clinicas_semanal(
         item["sesiones"] = int(item["sesiones"]) + 1
         item["total_generado"] = float(item["total_generado"]) + precio
 
-        key = (consultorio_id, tratamiento_id)
-        generado_por_clinica_tratamiento[key] = (
-            generado_por_clinica_tratamiento.get(key, 0.0) + precio
-        )
+        if _es_paciente_ecuasanitas(sesion.paciente):
+            item["total_ecuasanitas"] = (
+                float(item.get("total_ecuasanitas", 0.0)) + precio
+            )
+        else:
+            key = (consultorio_id, tratamiento_id)
+            generado_por_clinica_tratamiento[key] = (
+                generado_por_clinica_tratamiento.get(key, 0.0) + precio
+            )
 
     for row in pagos_gimnasio_rows:
         consultorio_id = row.consultorioid
@@ -1798,6 +1902,7 @@ def reporte_clinicas_semanal(
                 ),
                 "sesiones": 0,
                 "total_generado": 0.0,
+                "total_ecuasanitas": 0.0,
                 "total_gimnasio_pagado": 0.0,
             },
         )
@@ -1825,16 +1930,21 @@ def reporte_clinicas_semanal(
 
     for consultorio_id, item in data.items():
         total_terapia_generado = float(item["total_generado"])
+        total_ecuasanitas = float(item.get("total_ecuasanitas", 0.0))
         total_terapia_pagado = float(pagado_por_clinica.get(consultorio_id, 0.0))
-        pendiente_terapia = max(total_terapia_generado - total_terapia_pagado, 0.0)
+        total_no_ecuasanitas = max(total_terapia_generado - total_ecuasanitas, 0.0)
+        pendiente_terapia = max(total_no_ecuasanitas - total_terapia_pagado, 0.0)
+        total_cobrado_o_cubierto = total_terapia_pagado + total_ecuasanitas
         total_gimnasio_pagado = float(item.get("total_gimnasio_pagado", 0.0))
 
         ganancia_fisios_terapia_total = total_terapia_generado * PORCENTAJE_FISIO_TERAPIA
-        ganancia_fisios_terapia_cobrada = total_terapia_pagado * PORCENTAJE_FISIO_TERAPIA
+        ganancia_fisios_terapia_cobrada = total_cobrado_o_cubierto * PORCENTAJE_FISIO_TERAPIA
         ganancia_fisios_terapia_pendiente = pendiente_terapia * PORCENTAJE_FISIO_TERAPIA
+        ganancia_fisios_terapia_ecuasanitas = total_ecuasanitas * PORCENTAJE_FISIO_TERAPIA
         ganancia_clinica_terapia_total = total_terapia_generado * PORCENTAJE_CLINICA_TERAPIA
-        ganancia_clinica_terapia_cobrada = total_terapia_pagado * PORCENTAJE_CLINICA_TERAPIA
+        ganancia_clinica_terapia_cobrada = total_cobrado_o_cubierto * PORCENTAJE_CLINICA_TERAPIA
         ganancia_clinica_terapia_pendiente = pendiente_terapia * PORCENTAJE_CLINICA_TERAPIA
+        ganancia_clinica_terapia_ecuasanitas = total_ecuasanitas * PORCENTAJE_CLINICA_TERAPIA
         ganancia_fisios_gimnasio_cobrada = total_gimnasio_pagado * PORCENTAJE_FISIO_GIMNASIO
         ganancia_clinica_gimnasio_cobrada = total_gimnasio_pagado * PORCENTAJE_CLINICA_GIMNASIO
 
@@ -1846,14 +1956,17 @@ def reporte_clinicas_semanal(
                 total_generado=round(total_terapia_generado, 2),
                 total_pagado_pacientes=round(total_terapia_pagado, 2),
                 total_pendiente_pacientes=round(pendiente_terapia, 2),
+                total_ecuasanitas=round(total_ecuasanitas, 2),
                 total_gimnasio_pagado=round(total_gimnasio_pagado, 2),
                 ganancia_fisios_terapia_total=round(ganancia_fisios_terapia_total, 2),
                 ganancia_fisios_terapia_cobrada=round(ganancia_fisios_terapia_cobrada, 2),
                 ganancia_fisios_terapia_pendiente=round(ganancia_fisios_terapia_pendiente, 2),
+                ganancia_fisios_terapia_ecuasanitas=round(ganancia_fisios_terapia_ecuasanitas, 2),
                 ganancia_fisios_gimnasio_cobrada=round(ganancia_fisios_gimnasio_cobrada, 2),
                 ganancia_clinica_terapia_total=round(ganancia_clinica_terapia_total, 2),
                 ganancia_clinica_terapia_cobrada=round(ganancia_clinica_terapia_cobrada, 2),
                 ganancia_clinica_terapia_pendiente=round(ganancia_clinica_terapia_pendiente, 2),
+                ganancia_clinica_terapia_ecuasanitas=round(ganancia_clinica_terapia_ecuasanitas, 2),
                 ganancia_clinica_gimnasio_cobrada=round(ganancia_clinica_gimnasio_cobrada, 2),
                 ganancia_fisios_total=round(ganancia_fisios_terapia_total + ganancia_fisios_gimnasio_cobrada, 2),
                 ganancia_fisios_cobrada=round(ganancia_fisios_terapia_cobrada + ganancia_fisios_gimnasio_cobrada, 2),
