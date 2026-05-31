@@ -156,6 +156,39 @@ class CuentaPaqueteOut(BaseModel):
     pagos: List[PagoSimpleOut] = Field(default_factory=list)
 
 
+class CuentaEcuasanitasOut(BaseModel):
+    """
+    Cuenta de terapias cubiertas por Ecuasanitas.
+
+    No representa deuda del paciente ni ingreso de caja del día.
+    Sirve para que la clínica vea cuánto debe cubrir/facturar el seguro
+    por terapias recibidas. Gimnasio no se incluye aquí.
+    """
+
+    tratamientopacienteid: int
+    pacienteid: int
+    paciente: str
+
+    terapeutaid: Optional[int] = None
+    terapeuta: Optional[str] = None
+
+    tratamiento: str
+    tipoterapiaid: Optional[int] = None
+    tipo_terapia: Optional[str] = None
+
+    precio_sesion_aplicado: float = 0
+    sesiones_cubiertas: int = 0
+    total_cubierto: float = 0
+
+    ganancia_terapeuta: float = 0
+    valor_clinica: float = 0
+
+    fecha_ultima_sesion: Optional[date] = None
+    estado: str = "POR FACTURAR"
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class CuentaTratamientoOut(BaseModel):
     tratamientopacienteid: int
     pacienteid: int

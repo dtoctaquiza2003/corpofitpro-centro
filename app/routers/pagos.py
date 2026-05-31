@@ -3,13 +3,14 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, UploadFile, status, Query
-from sqlalchemy import func, or_
+from sqlalchemy import exists, func, or_
 from sqlalchemy.orm import Session, joinedload
 
 from app.schemas.pago import (
     CuentaMembresiaGimnasioOut,
     CuentaPaqueteOut,
     CuentaTratamientoOut,
+    CuentaEcuasanitasOut,
     PagoCreate,
     PagoPrevioTratamientoCreate,
     PagoPrevioGimnasioCreate,
@@ -40,6 +41,11 @@ from ..services.supabase_storage import (
 
 router = APIRouter(prefix="/api/pagos", tags=["pagos"])
 
+# Terapias: 35% fisioterapeuta / 65% clínica.
+# Ecuasanitas solo aplica a terapias, no a gimnasio.
+PORCENTAJE_FISIO_TERAPIA = 0.35
+PORCENTAJE_CLINICA_TERAPIA = 0.65
+
 
 # ============================================================
 # HELPERS
@@ -66,6 +72,20 @@ def _estado_cuenta(total_generado: float, pagado: float, saldo: float) -> str:
         return "PARCIAL"
 
     return "PAGADO"
+
+
+
+
+def _condicion_paciente_ecuasanitas():
+    """Pacientes cuyo seguro/convenio cubre terapias por Ecuasanitas.
+
+    Esta condición solo aplica a terapias; gimnasio mensual y diario se
+    cobran normal aunque el paciente tenga Ecuasanitas.
+    """
+    return or_(
+        Paciente.esecuasanitas == True,
+        Paciente.tiposeguro.ilike("%ecuasanitas%"),
+    )
 
 
 def _validar_paciente(
@@ -601,6 +621,158 @@ def listar_cuentas_paquetes(
 
     return resultado
 
+
+
+# ============================================================
+# CUENTAS ECUASANITAS - SOLO TERAPIAS
+# ============================================================
+
+@router.get("/cuentas-ecuasanitas", response_model=List[CuentaEcuasanitasOut])
+def listar_cuentas_ecuasanitas(
+    limit: int = Query(default=40, ge=1, le=50),
+    offset: int = Query(default=0, ge=0),
+    buscar: Optional[str] = Query(default=None),
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(get_current_user),
+):
+    """
+    Lista cuánto debe cubrir/facturar Ecuasanitas por terapias recibidas.
+
+    Optimización: primero pagina tratamientos Ecuasanitas y luego cuenta
+    sesiones finalizadas solo para esos ids. Así no se cargan pagos, caja,
+    gimnasio ni historiales completos al abrir la pantalla de pagos.
+    """
+    tiene_sesiones_finalizadas = (
+        exists()
+        .where(SesionTerapia.tratamientopacienteid == TratamientoPaciente.id)
+        .where(SesionTerapia.horasalida != None)
+    )
+
+    query = (
+        db.query(TratamientoPaciente, Paciente, Usuario)
+        .options(joinedload(TratamientoPaciente.tipo_terapia))
+        .join(Paciente, Paciente.id == TratamientoPaciente.pacienteid)
+        .outerjoin(Usuario, Usuario.id == Paciente.terapeutaasignadoid)
+        .filter(
+            _condicion_paciente_ecuasanitas(),
+            tiene_sesiones_finalizadas,
+        )
+    )
+
+    if current_user.rol == 2:
+        query = query.filter(Paciente.terapeutaasignadoid == current_user.id)
+
+    elif current_user.rol == 1:
+        validar_consultorio_secretario(
+            current_user,
+            current_user.consultorioid,
+        )
+        query = query.filter(Paciente.consultorioid == current_user.consultorioid)
+
+    elif current_user.rol == 3:
+        pass
+
+    else:
+        raise HTTPException(status_code=403, detail="No autorizado")
+
+    if buscar and buscar.strip():
+        texto = f"%{buscar.strip()}%"
+        nombre_completo = func.concat(Paciente.nombres, " ", Paciente.apellidos)
+
+        query = query.filter(
+            or_(
+                Paciente.nombres.ilike(texto),
+                Paciente.apellidos.ilike(texto),
+                Paciente.cedula.ilike(texto),
+                nombre_completo.ilike(texto),
+                TratamientoPaciente.tipotratamiento.ilike(texto),
+            )
+        )
+
+    tratamientos = (
+        query.order_by(
+            TratamientoPaciente.activo.desc(),
+            TratamientoPaciente.fechainicio.desc(),
+            TratamientoPaciente.id.desc(),
+        )
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+
+    if not tratamientos:
+        return []
+
+    tratamiento_ids = [tratamiento.id for tratamiento, _, _ in tratamientos]
+
+    sesiones_rows = (
+        db.query(
+            SesionTerapia.tratamientopacienteid,
+            func.count(SesionTerapia.id).label("sesiones_cubiertas"),
+            func.max(SesionTerapia.fecha).label("fecha_ultima_sesion"),
+        )
+        .filter(
+            SesionTerapia.tratamientopacienteid.in_(tratamiento_ids),
+            SesionTerapia.horasalida != None,
+        )
+        .group_by(SesionTerapia.tratamientopacienteid)
+        .all()
+    )
+
+    sesiones_por_tratamiento = {
+        tratamiento_id: {
+            "sesiones": int(sesiones or 0),
+            "ultima": ultima,
+        }
+        for tratamiento_id, sesiones, ultima in sesiones_rows
+    }
+
+    resultado: list[CuentaEcuasanitasOut] = []
+
+    for tratamiento, paciente, terapeuta in tratamientos:
+        data_sesiones = sesiones_por_tratamiento.get(tratamiento.id, {})
+        sesiones_cubiertas = int(data_sesiones.get("sesiones", 0) or 0)
+
+        if sesiones_cubiertas <= 0:
+            continue
+
+        precio_sesion = (
+            float(tratamiento.precio_sesion_aplicado)
+            if tratamiento.precio_sesion_aplicado is not None
+            else 0.0
+        )
+
+        total_cubierto = round(precio_sesion * sesiones_cubiertas, 2)
+        nombre_terapeuta = None
+
+        if terapeuta:
+            nombre_terapeuta = f"{terapeuta.nombres} {terapeuta.apellidos}".strip()
+
+        nombre_tipo_terapia = None
+        if tratamiento.tipo_terapia:
+            nombre_tipo_terapia = tratamiento.tipo_terapia.nombre
+
+        resultado.append(
+            CuentaEcuasanitasOut(
+                tratamientopacienteid=tratamiento.id,
+                pacienteid=paciente.id,
+                paciente=f"{paciente.nombres} {paciente.apellidos}".strip(),
+                terapeutaid=paciente.terapeutaasignadoid,
+                terapeuta=nombre_terapeuta,
+                tratamiento=tratamiento.tipotratamiento,
+                tipoterapiaid=tratamiento.tipoterapiaid,
+                tipo_terapia=nombre_tipo_terapia,
+                precio_sesion_aplicado=precio_sesion,
+                sesiones_cubiertas=sesiones_cubiertas,
+                total_cubierto=total_cubierto,
+                ganancia_terapeuta=round(total_cubierto * PORCENTAJE_FISIO_TERAPIA, 2),
+                valor_clinica=round(total_cubierto * PORCENTAJE_CLINICA_TERAPIA, 2),
+                fecha_ultima_sesion=data_sesiones.get("ultima"),
+                estado="POR FACTURAR",
+            )
+        )
+
+    return resultado
 
 # ============================================================
 # CUENTAS POR TRATAMIENTO - NUEVO SISTEMA
