@@ -6,7 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 TIPO_REGISTRO_RETROACTIVO = "registro_retroactivo_sesiones"
 TIPO_ADMIN_TEMPORAL = "administrador_temporal_consultorio"
-TIPO_CREAR_TRATAMIENTOS_PACIENTE = "crear_tratamientos_paciente"
+TIPO_CREAR_TRATAMIENTOS = "crear_tratamientos_paciente"
 
 
 class PermisoTemporalCreate(BaseModel):

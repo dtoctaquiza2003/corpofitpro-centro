@@ -179,6 +179,7 @@ def validar_usuario_mismo_consultorio_para_secretario(
 
 TIPO_REGISTRO_RETROACTIVO = "registro_retroactivo_sesiones"
 TIPO_ADMIN_TEMPORAL = "administrador_temporal_consultorio"
+TIPO_CREAR_TRATAMIENTOS = "crear_tratamientos_paciente"
 
 
 def permiso_temporal_activo(

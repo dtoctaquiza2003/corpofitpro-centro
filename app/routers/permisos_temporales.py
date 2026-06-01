@@ -15,7 +15,7 @@ from ..schemas.permiso_temporal import (
     PermisoTemporalEstadoOut,
     PermisoTemporalOut,
     TIPO_ADMIN_TEMPORAL,
-    TIPO_CREAR_TRATAMIENTOS_PACIENTE,
+    TIPO_CREAR_TRATAMIENTOS,
     TIPO_REGISTRO_RETROACTIVO,
 )
 
@@ -27,7 +27,7 @@ router = APIRouter(
 TIPOS_PERMITIDOS = {
     TIPO_REGISTRO_RETROACTIVO,
     TIPO_ADMIN_TEMPORAL,
-    TIPO_CREAR_TRATAMIENTOS_PACIENTE,
+    TIPO_CREAR_TRATAMIENTOS,
 }
 
 
@@ -61,8 +61,8 @@ def _tipo_permiso_legible(tipo_permiso: str) -> str:
     if tipo_permiso == TIPO_ADMIN_TEMPORAL:
         return "administrador temporal de consultorio"
 
-    if tipo_permiso == TIPO_CREAR_TRATAMIENTOS_PACIENTE:
-        return "crear tratamientos de pacientes"
+    if tipo_permiso == TIPO_CREAR_TRATAMIENTOS:
+        return "creación temporal de tratamientos"
 
     return tipo_permiso.replace("_", " ")
 
@@ -91,11 +91,10 @@ def _mensaje_permiso_otorgado(
             f"Válido hasta: {fecha_fin}.\n"
             f"Autorizado por: {autorizador_nombre}."
         )
-    elif permiso.tipo_permiso == TIPO_CREAR_TRATAMIENTOS_PACIENTE:
+    elif permiso.tipo_permiso == TIPO_CREAR_TRATAMIENTOS:
         mensaje = (
-            "Se te otorgó permiso temporal para crear tratamientos de tus pacientes.\n"
-            "Alcance: solo pacientes asignados o compartidos contigo.\n"
-            "No habilita edición ni eliminación de tratamientos existentes.\n"
+            "Se te otorgó permiso para crear tratamientos temporalmente.\n"
+            "Alcance: solo pacientes a los que ya tienes acceso.\n"
             f"Válido hasta: {fecha_fin}.\n"
             f"Autorizado por: {autorizador_nombre}."
         )
@@ -122,10 +121,10 @@ def _mensaje_permiso_desactivado(
             "Desde este momento ya no podrás registrar atenciones retroactivas.\n"
             f"Desactivado por: {autorizador_nombre}."
         )
-    elif permiso.tipo_permiso == TIPO_CREAR_TRATAMIENTOS_PACIENTE:
+    elif permiso.tipo_permiso == TIPO_CREAR_TRATAMIENTOS:
         mensaje = (
-            "Tu permiso para crear tratamientos de pacientes fue desactivado.\n"
-            "Desde este momento ya no podrás crear tratamientos con autorización temporal.\n"
+            "Tu permiso para crear tratamientos fue desactivado.\n"
+            "Desde este momento ya no podrás crear tratamientos temporalmente.\n"
             f"Desactivado por: {autorizador_nombre}."
         )
     else:
@@ -182,7 +181,6 @@ def _notificar_permiso_temporal(
                 "permisos_temporales",
                 "sesiones",
                 "tratamientos",
-                "pacientes",
                 "dashboard",
                 "notificaciones",
             ],
@@ -220,9 +218,8 @@ def _validar_autorizador(
 ) -> None:
     """
     Reglas:
-    - Jefe puede activar todos los permisos.
-    - Secretario puede activar registro retroactivo y creación temporal de tratamientos
-      para usuarios de su consultorio.
+    - Jefe puede activar permisos retroactivos, creación de tratamientos y admin temporal.
+    - Secretario puede activar registro retroactivo y creación de tratamientos solo para usuarios de su consultorio.
     - Administrador temporal NO puede crear permisos temporales.
     """
 
@@ -232,17 +229,12 @@ def _validar_autorizador(
     if current_user.rol == 1:
         validar_consultorio_secretario(current_user, current_user.consultorioid)
 
-        tipos_secretario = {
-            TIPO_REGISTRO_RETROACTIVO,
-            TIPO_CREAR_TRATAMIENTOS_PACIENTE,
-        }
-
-        if tipo_permiso not in tipos_secretario:
+        if tipo_permiso not in (TIPO_REGISTRO_RETROACTIVO, TIPO_CREAR_TRATAMIENTOS):
             raise HTTPException(
                 status_code=403,
                 detail=(
-                    "El secretario solo puede activar permisos retroactivos "
-                    "o permisos temporales para crear tratamientos."
+                    "El secretario solo puede activar permisos de registro "
+                    "retroactivo o creación temporal de tratamientos."
                 ),
             )
 
@@ -435,6 +427,9 @@ def crear_permiso_temporal(
         # El permiso retroactivo permite desde el lunes de la semana actual.
         dias_atras_permitidos = hoy_ecuador.weekday()
 
+    if data.tipo_permiso == TIPO_CREAR_TRATAMIENTOS:
+        dias_atras_permitidos = 0
+
     if data.tipo_permiso == TIPO_ADMIN_TEMPORAL:
         if current_user.rol != 3:
             raise HTTPException(
@@ -447,9 +442,6 @@ def crear_permiso_temporal(
                 status_code=400,
                 detail="El permiso de administrador temporal no usa días atrás.",
             )
-
-    if data.tipo_permiso == TIPO_CREAR_TRATAMIENTOS_PACIENTE:
-        dias_atras_permitidos = 0
 
     # Desactiva permisos anteriores del mismo tipo para evitar duplicados activos.
     db.query(UsuarioPermisoTemporal).filter(
