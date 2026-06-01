@@ -39,6 +39,47 @@ def now_ecuador() -> datetime:
 
 
 
+
+def _normalizar_rango_permiso(data: PermisoTemporalCreate) -> tuple[datetime, datetime]:
+    """
+    Usa la hora del servidor como fuente de verdad.
+
+    El problema detectado fue que algunos celulares enviaban fecha_inicio/fecha_fin
+    atrasadas. El permiso se creaba con activo=true, pero vencido, por eso no
+    aparecía en la lista ni servía para crear tratamientos/registrar retroactivos.
+
+    Reglas:
+    - Si la app envía duracion_horas, se respeta esa duración desde la hora del servidor.
+    - Si una app anterior envía fecha_inicio/fecha_fin, se calcula la duración entre ambas
+      y se aplica desde la hora del servidor.
+    - Si no hay datos válidos, se usa 8 horas por defecto.
+    """
+    inicio_servidor = now_utc()
+
+    duracion_horas = getattr(data, "duracion_horas", None)
+
+    if duracion_horas is None and data.fecha_inicio is not None and data.fecha_fin is not None:
+        duracion = data.fecha_fin - data.fecha_inicio
+        segundos = int(duracion.total_seconds())
+
+        if segundos > 0:
+            duracion_horas = max(1, min(72, int(round(segundos / 3600))))
+
+    if duracion_horas is None and data.fecha_fin is not None:
+        duracion = data.fecha_fin - inicio_servidor
+        segundos = int(duracion.total_seconds())
+
+        if segundos > 0:
+            duracion_horas = max(1, min(72, int(round(segundos / 3600))))
+
+    if duracion_horas is None:
+        duracion_horas = 8
+
+    fecha_fin = inicio_servidor + timedelta(hours=duracion_horas)
+
+    return inicio_servidor, fecha_fin
+
+
 def _nombre_usuario(usuario: Usuario | None) -> str:
     if not usuario:
         return "Usuario"
@@ -410,13 +451,7 @@ def crear_permiso_temporal(
         tipo_permiso=data.tipo_permiso,
     )
 
-    fecha_inicio = data.fecha_inicio or now_utc()
-
-    if data.fecha_fin <= fecha_inicio:
-        raise HTTPException(
-            status_code=400,
-            detail="La fecha fin debe ser mayor a la fecha inicio.",
-        )
+    fecha_inicio, fecha_fin = _normalizar_rango_permiso(data)
 
     dias_atras_permitidos = data.dias_atras_permitidos
 
@@ -459,7 +494,7 @@ def crear_permiso_temporal(
         consultorioid=usuario_objetivo.consultorioid,
         tipo_permiso=data.tipo_permiso,
         fecha_inicio=fecha_inicio,
-        fecha_fin=data.fecha_fin,
+        fecha_fin=fecha_fin,
         dias_atras_permitidos=dias_atras_permitidos,
         motivo=data.motivo,
         activo=True,
