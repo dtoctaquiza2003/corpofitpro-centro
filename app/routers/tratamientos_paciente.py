@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -11,11 +12,13 @@ from ..models.paciente import Paciente
 from ..models.tipo_terapia import TipoTerapia
 from ..models.tratamiento_paciente import TratamientoPaciente
 from ..models.usuario import Usuario
+from ..models.usuario_permiso_temporal import UsuarioPermisoTemporal
 from ..schemas.tratamiento_paciente import (
     TratamientoPacienteCreate,
     TratamientoPacienteOut,
     TratamientoPacienteUpdate,
 )
+from ..schemas.permiso_temporal import TIPO_CREAR_TRATAMIENTOS_PACIENTE
 from ..services.notificacion_service import crear_notificacion_usuario
 
 router = APIRouter(
@@ -119,6 +122,61 @@ def _validar_precio_especial(
 def _nombre_paciente(paciente: Paciente) -> str:
     return f"{paciente.nombres} {paciente.apellidos}".strip()
 
+
+def _tiene_permiso_crear_tratamientos(
+    db: Session,
+    current_user: Usuario,
+) -> bool:
+    if current_user.rol != 2:
+        return False
+
+    ahora = datetime.now(timezone.utc)
+
+    return (
+        db.query(UsuarioPermisoTemporal.id)
+        .filter(
+            UsuarioPermisoTemporal.usuarioid == current_user.id,
+            UsuarioPermisoTemporal.tipo_permiso == TIPO_CREAR_TRATAMIENTOS_PACIENTE,
+            UsuarioPermisoTemporal.activo == True,
+            UsuarioPermisoTemporal.fecha_inicio <= ahora,
+            UsuarioPermisoTemporal.fecha_fin >= ahora,
+        )
+        .first()
+        is not None
+    )
+
+
+def _validar_puede_crear_tratamiento(
+    db: Session,
+    paciente: Paciente,
+    current_user: Usuario,
+) -> None:
+    # Secretario y jefe mantienen el flujo normal.
+    if current_user.rol in (1, 3):
+        return
+
+    # Terapeuta solo puede crear tratamientos con permiso temporal activo
+    # y solo para pacientes a los que ya tenga acceso por rol/asignación/cesión.
+    if current_user.rol == 2 and _tiene_permiso_crear_tratamientos(
+        db=db,
+        current_user=current_user,
+    ):
+        if paciente.consultorioid != current_user.consultorioid:
+            raise HTTPException(
+                status_code=403,
+                detail="El permiso temporal solo aplica dentro de tu consultorio.",
+            )
+        return
+
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            "No autorizado para crear tratamientos. Solicita un permiso temporal "
+            "al jefe o secretario de tu consultorio."
+        ),
+    )
+
+
 @router.get("/paciente/{paciente_id}", response_model=List[TratamientoPacienteOut])
 def listar_tratamientos_paciente(
     paciente_id: int,
@@ -153,11 +211,17 @@ def listar_tratamientos_paciente(
 def crear_tratamiento_paciente(
     tratamiento: TratamientoPacienteCreate,
     db: Session = Depends(get_db),
-    current_user: Usuario = Depends(get_current_secretary),
+    current_user: Usuario = Depends(get_current_user),
 ):
     paciente = _validar_paciente(
         db=db,
         paciente_id=tratamiento.pacienteid,
+        current_user=current_user,
+    )
+
+    _validar_puede_crear_tratamiento(
+        db=db,
+        paciente=paciente,
         current_user=current_user,
     )
 
@@ -207,7 +271,7 @@ def crear_tratamiento_paciente(
     db.add(nuevo)
     db.flush()
 
-    if paciente.terapeutaasignadoid:
+    if paciente.terapeutaasignadoid and paciente.terapeutaasignadoid != current_user.id:
         nombre_paciente = _nombre_paciente(paciente)
 
         crear_notificacion_usuario(
@@ -224,6 +288,7 @@ def crear_tratamiento_paciente(
                 "diagnostico_id": nuevo.diagnosticoid,
                 "consultorioid": paciente.consultorioid,
                 "creado_por_id": current_user.id,
+                "creado_con_permiso_temporal": current_user.rol == 2,
                 "actualizar": [
                     "tratamientos",
                     "diagnosticos",
