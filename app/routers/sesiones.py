@@ -1,3 +1,4 @@
+import os
 from datetime import datetime, timezone, timedelta, date, time
 from typing import List, Optional
 
@@ -32,6 +33,12 @@ from app.models import tratamiento
 
 
 router = APIRouter(prefix="/api/sesiones", tags=["sesiones"])
+
+# Cantidad máxima de días entre sesiones para considerarlas
+# "relativamente seguidas" en el análisis de progreso del dolor.
+PAIN_PROGRESS_MAX_GAP_DAYS = int(
+    os.getenv("PAIN_PROGRESS_MAX_GAP_DAYS", "14")
+)
 
 
 def now_ecuador() -> datetime:
@@ -120,6 +127,90 @@ def _terapeuta_puede_atender_paciente(
     return False
 
 
+def _terapeuta_asignado_activo_para_paciente(
+    db: Session,
+    paciente: Paciente,
+) -> Usuario:
+    if not paciente.terapeutaasignadoid:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Este paciente no tiene fisioterapeuta asignado. "
+                "Asigne un terapeuta antes de iniciar la atención."
+            ),
+        )
+
+    terapeuta = (
+        db.query(Usuario)
+        .filter(
+            Usuario.id == paciente.terapeutaasignadoid,
+            Usuario.rol == 2,
+            Usuario.activo == True,
+        )
+        .first()
+    )
+
+    if not terapeuta:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "El fisioterapeuta asignado al paciente no existe "
+                "o está inactivo."
+            ),
+        )
+
+    return terapeuta
+
+
+def _obtener_terapeuta_registro_atencion(
+    db: Session,
+    paciente: Paciente,
+    current_user: Usuario,
+) -> Usuario:
+    """
+    Define qué terapeuta queda responsable de la sesión.
+
+    - Terapeuta: atiende pacientes propios, compartidos o cedidos.
+    - Secretario: puede iniciar por apoyo solo pacientes de su consultorio;
+      la sesión queda asignada al terapeuta principal del paciente.
+    - Jefe: puede iniciar por apoyo; la sesión queda asignada al terapeuta
+      principal del paciente.
+    """
+
+    if current_user.rol == 2:
+        if not _terapeuta_puede_atender_paciente(
+            db=db,
+            paciente=paciente,
+            current_user=current_user,
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "No puedes atender este paciente. "
+                    "Debe estar asignado a ti, compartido contigo "
+                    "o cedido temporalmente."
+                ),
+            )
+
+        return current_user
+
+    if current_user.rol == 1:
+        validar_consultorio_secretario(
+            current_user,
+            paciente.consultorioid,
+        )
+
+        return _terapeuta_asignado_activo_para_paciente(db, paciente)
+
+    if current_user.rol == 3:
+        return _terapeuta_asignado_activo_para_paciente(db, paciente)
+
+    raise HTTPException(
+        status_code=403,
+        detail="No autorizado para iniciar atenciones.",
+    )
+
+
 def build_sesion_out(
     sesion: SesionTerapia,
     db: Session,
@@ -176,6 +267,24 @@ def build_sesion_out(
         precio_sesion_aplicado=precio_sesion_aplicado,
         estado="FINALIZADA" if sesion.horasalida else "EN_CURSO",
         tratamientos=tratamientos_aplicados,
+        analisisdolorrequerido=bool(
+            getattr(sesion, "analisisdolorrequerido", False)
+        ),
+        motivodolornodisminuye=getattr(
+            sesion,
+            "motivodolornodisminuye",
+            None,
+        ),
+        dolorreferenciaprogreso=getattr(
+            sesion,
+            "dolorreferenciaprogreso",
+            None,
+        ),
+        doloractualprogreso=getattr(
+            sesion,
+            "doloractualprogreso",
+            None,
+        ),
     )
 
 
@@ -449,6 +558,36 @@ def _nombre_usuario(usuario: Usuario | None) -> str:
     return f"Usuario {usuario.id}"
 
 
+def _nombre_tratamiento_sesion(sesion: SesionTerapia | None) -> str:
+    if not sesion or not getattr(sesion, "tratamiento_paciente", None):
+        return "Tratamiento no especificado"
+
+    tratamiento = sesion.tratamiento_paciente
+
+    for attr in ("tipotratamiento", "nombre", "descripcion"):
+        valor = getattr(tratamiento, attr, None)
+        if valor:
+            return str(valor).strip()
+
+    return f"Tratamiento #{getattr(tratamiento, 'id', '')}".strip()
+
+
+def _texto_corto(texto: str | None, max_len: int = 180) -> str:
+    limpio = (texto or "").strip()
+
+    if len(limpio) <= max_len:
+        return limpio
+
+    return limpio[: max_len - 1].rstrip() + "…"
+
+
+def _formatear_fecha_corta(fecha: date | None) -> str:
+    if fecha is None:
+        return "sin fecha"
+
+    return fecha.strftime("%d/%m/%Y")
+
+
 def _agregar_usuario_unico(
     usuarios: list[Usuario],
     usuarios_ids: set[int],
@@ -683,7 +822,28 @@ def _notificar_alerta_clinica(
             f"Terapeuta(s) a cargo: {terapeutas_texto}"
         )
 
+    elif alerta.tipo == "pain_no_reduction":
+        tratamiento_nombre = _nombre_tratamiento_sesion(sesion)
+        motivo = _texto_corto(
+            getattr(sesion, "motivodolornodisminuye", None),
+            max_len=180,
+        )
+        dolor_referencia = getattr(sesion, "dolorreferenciaprogreso", None)
+        dolor_actual = getattr(sesion, "doloractualprogreso", None)
+
+        titulo = "Seguimiento clínico: dolor sin reducción"
+        mensaje = (
+            f"Paciente: {nombre_paciente}\n"
+            f"Tratamiento: {tratamiento_nombre}\n"
+            f"Dolor en 3 terapias: {dolor_referencia}/10 → {dolor_actual}/10\n"
+            f"Motivo registrado: {motivo or 'No especificado'}\n"
+            f"Registró: {nombre_terapeuta_sesion}\n"
+            f"Fisio(s) a cargo: {terapeutas_texto}"
+        )
+
     elif alerta.tipo == "pain_increase":
+        # Compatibilidad con alertas antiguas. El flujo nuevo ya no crea
+        # alertas por cada aumento aislado de dolor.
         titulo = "Alerta clínica: aumento de dolor"
         mensaje = (
             f"Paciente: {nombre_paciente}\n"
@@ -737,6 +897,22 @@ def _notificar_alerta_clinica(
                 "dolor_salida": sesion.escaladolorsalida,
                 "terapeuta_id": sesion.terapeutaid,
                 "terapeuta_nombre": nombre_terapeuta_sesion,
+                "tratamiento_nombre": _nombre_tratamiento_sesion(sesion),
+                "motivo_dolor_no_disminuye": getattr(
+                    sesion,
+                    "motivodolornodisminuye",
+                    None,
+                ),
+                "dolor_referencia_progreso": getattr(
+                    sesion,
+                    "dolorreferenciaprogreso",
+                    None,
+                ),
+                "dolor_actual_progreso": getattr(
+                    sesion,
+                    "doloractualprogreso",
+                    None,
+                ),
                 "terapeutas_a_cargo": nombres_terapeutas_a_cargo,
                 "terapeutas_a_cargo_ids": [
                     terapeuta.id for terapeuta in terapeutas_a_cargo
@@ -760,6 +936,171 @@ def _notificar_alerta_clinica(
         f"{notificaciones_creadas} para alerta {alerta.id}"
     )
 
+
+def _dolor_final_sesion(sesion: SesionTerapia) -> int:
+    if sesion.escaladolorsalida is not None:
+        return int(sesion.escaladolorsalida)
+
+    return int(sesion.escaladolorentrada or 0)
+
+
+def _analizar_dolor_ultimas_tres_sesiones(
+    db: Session,
+    sesion_actual: SesionTerapia,
+    dolor_salida_actual: int,
+) -> Optional[dict]:
+    """
+    Consulta liviana: solo toma las 2 sesiones finalizadas anteriores
+    del mismo tratamiento y paciente. Con la actual forman las últimas 3.
+
+    Si entre sesiones hay una separación mayor a PAIN_PROGRESS_MAX_GAP_DAYS,
+    no se dispara la alerta porque no se consideran relativamente seguidas.
+    """
+
+    if not sesion_actual.tratamientopacienteid:
+        return None
+
+    anteriores_desc = (
+        db.query(SesionTerapia)
+        .filter(
+            SesionTerapia.pacienteid == sesion_actual.pacienteid,
+            SesionTerapia.tratamientopacienteid == sesion_actual.tratamientopacienteid,
+            SesionTerapia.id != sesion_actual.id,
+            SesionTerapia.horasalida != None,
+        )
+        .order_by(
+            SesionTerapia.fecha.desc(),
+            SesionTerapia.horaingreso.desc(),
+        )
+        .limit(2)
+        .all()
+    )
+
+    if len(anteriores_desc) < 2:
+        return None
+
+    sesiones = list(reversed(anteriores_desc)) + [sesion_actual]
+
+    for index in range(1, len(sesiones)):
+        dias = (sesiones[index].fecha - sesiones[index - 1].fecha).days
+
+        if dias < 0 or dias > PAIN_PROGRESS_MAX_GAP_DAYS:
+            return None
+
+    dolor_referencia = _dolor_final_sesion(sesiones[0])
+    dolor_actual = int(dolor_salida_actual)
+
+    if dolor_actual < dolor_referencia:
+        return None
+
+    return {
+        "dolor_referencia": dolor_referencia,
+        "dolor_actual": dolor_actual,
+        "fecha_referencia": sesiones[0].fecha.isoformat(),
+        "fecha_actual": sesion_actual.fecha.isoformat(),
+        "max_gap_days": PAIN_PROGRESS_MAX_GAP_DAYS,
+    }
+
+
+def _normalizar_motivo_dolor_no_disminuye(motivo: Optional[str]) -> Optional[str]:
+    if motivo is None:
+        return None
+
+    texto = motivo.strip()
+
+    if not texto:
+        return None
+
+    return texto[:600]
+
+
+def _exigir_motivo_dolor_no_disminuye_si_corresponde(
+    db: Session,
+    sesion: SesionTerapia,
+    data: FinalizarSesionCreate,
+) -> Optional[dict]:
+    analisis = _analizar_dolor_ultimas_tres_sesiones(
+        db=db,
+        sesion_actual=sesion,
+        dolor_salida_actual=data.escaladolorsalida,
+    )
+
+    if not analisis:
+        sesion.analisisdolorrequerido = False
+        sesion.motivodolornodisminuye = None
+        sesion.dolorreferenciaprogreso = None
+        sesion.doloractualprogreso = None
+        return None
+
+    motivo = _normalizar_motivo_dolor_no_disminuye(
+        data.motivo_dolor_no_disminuye
+    )
+
+    if not motivo:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "MOTIVO_DOLOR_NO_DISMINUYE_REQUERIDO",
+                "message": (
+                    "El dolor no ha disminuido en las últimas 3 terapias "
+                    "relativamente seguidas. Registre un motivo clínico "
+                    "antes de finalizar la atención."
+                ),
+                "dolor_referencia": analisis["dolor_referencia"],
+                "dolor_actual": analisis["dolor_actual"],
+                "max_gap_days": analisis["max_gap_days"],
+            },
+        )
+
+    sesion.analisisdolorrequerido = True
+    sesion.motivodolornodisminuye = motivo
+    sesion.dolorreferenciaprogreso = analisis["dolor_referencia"]
+    sesion.doloractualprogreso = analisis["dolor_actual"]
+
+    return analisis
+
+
+def _crear_alerta_dolor_no_disminuye(
+    db: Session,
+    sesion: SesionTerapia,
+    paciente: Paciente | None,
+    current_user: Usuario,
+    analisis: dict | None,
+) -> None:
+    if not paciente or not analisis:
+        return
+
+    motivo = _normalizar_motivo_dolor_no_disminuye(
+        sesion.motivodolornodisminuye
+    ) or "No especificado"
+
+    descripcion = (
+        "Dolor sin reducción en las últimas 3 terapias seguidas. "
+        f"Dolor referencia: {analisis['dolor_referencia']}/10 "
+        f"({_formatear_fecha_corta(sesion.fecha if not analisis.get('fecha_referencia') else datetime.fromisoformat(analisis['fecha_referencia']).date())}); "
+        f"dolor actual: {analisis['dolor_actual']}/10 "
+        f"({_formatear_fecha_corta(sesion.fecha)}). "
+        f"Motivo registrado: {_texto_corto(motivo, max_len=220)}"
+    )
+
+    alerta = Alerta(
+        paciente_id=sesion.pacienteid,
+        tipo="pain_no_reduction",
+        descripcion=_texto_corto(descripcion, max_len=490),
+    )
+
+    db.add(alerta)
+    db.flush()
+
+    _notificar_alerta_clinica(
+        db=db,
+        alerta=alerta,
+        paciente=paciente,
+        sesion=sesion,
+        current_user=current_user,
+    )
+
+
 @router.post(
     "/iniciar",
     response_model=SesionAtencionOut,
@@ -769,7 +1110,7 @@ def _notificar_alerta_clinica(
 def iniciar_sesion(
     data: InicioSesionCreate,
     db: Session = Depends(get_db),
-    current_user: Usuario = Depends(get_current_terapeuta),
+    current_user: Usuario = Depends(get_current_user),
 ):
     paciente = db.query(Paciente).filter(Paciente.id == data.pacienteid).first()
 
@@ -779,18 +1120,11 @@ def iniciar_sesion(
             detail="Paciente no encontrado",
         )
 
-    if not _terapeuta_puede_atender_paciente(
+    terapeuta_responsable = _obtener_terapeuta_registro_atencion(
         db=db,
         paciente=paciente,
         current_user=current_user,
-    ):
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                "No puedes atender este paciente. "
-                "Debe estar asignado a ti, compartido contigo o cedido temporalmente."
-            ),
-        )
+    )
 
     sesion_abierta = (
         db.query(SesionTerapia)
@@ -885,7 +1219,7 @@ def iniciar_sesion(
 
     nueva_sesion = SesionTerapia(
         pacienteid=data.pacienteid,
-        terapeutaid=current_user.id,
+        terapeutaid=terapeuta_responsable.id,
         fecha=fecha_sesion,
         horaingreso=hora_ingreso,
         horasalida=hora_salida,
@@ -915,21 +1249,40 @@ def iniciar_sesion(
 @router.get("/en-curso", response_model=List[SesionAtencionOut])
 def listar_sesiones_en_curso(
     db: Session = Depends(get_db),
-    current_user: Usuario = Depends(get_current_terapeuta),
+    current_user: Usuario = Depends(get_current_user),
 ):
-    sesiones = (
-        db.query(SesionTerapia)
-        .options(
-            joinedload(SesionTerapia.paciente),
-            joinedload(SesionTerapia.tratamiento_paciente),
+    query = db.query(SesionTerapia).options(
+        joinedload(SesionTerapia.paciente),
+        joinedload(SesionTerapia.tratamiento_paciente),
+    ).filter(SesionTerapia.horasalida == None)
+
+    if current_user.rol == 2:
+        query = query.filter(SesionTerapia.terapeutaid == current_user.id)
+
+    elif current_user.rol == 1:
+        validar_consultorio_secretario(
+            current_user,
+            current_user.consultorioid,
         )
-        .filter(
-            SesionTerapia.terapeutaid == current_user.id,
-            SesionTerapia.horasalida == None,
+
+        query = query.join(
+            Paciente,
+            Paciente.id == SesionTerapia.pacienteid,
+        ).filter(Paciente.consultorioid == current_user.consultorioid)
+
+    elif current_user.rol == 3:
+        pass
+
+    else:
+        raise HTTPException(
+            status_code=403,
+            detail="No autorizado para consultar sesiones en curso.",
         )
-        .order_by(SesionTerapia.horaingreso.asc())
-        .all()
-    )
+
+    sesiones = query.order_by(
+        SesionTerapia.fecha.asc(),
+        SesionTerapia.horaingreso.asc(),
+    ).limit(120).all()
 
     return _build_sesiones_out(sesiones, db)
 
@@ -1037,46 +1390,19 @@ def finalizar_sesion(
             .first()
         )
 
-    sesion_anterior = (
-        db.query(SesionTerapia)
-        .filter(
-            SesionTerapia.pacienteid == sesion.pacienteid,
-            SesionTerapia.id != sesion.id,
-            SesionTerapia.horasalida != None,
-        )
-        .order_by(
-            SesionTerapia.fecha.desc(),
-            SesionTerapia.horaingreso.desc(),
-        )
-        .first()
+    analisis_dolor = _exigir_motivo_dolor_no_disminuye_si_corresponde(
+        db=db,
+        sesion=sesion,
+        data=data,
     )
 
-    if sesion_anterior:
-        dolor_salida_anterior = sesion_anterior.escaladolorsalida or 0
-        aumento = sesion.escaladolorentrada - dolor_salida_anterior
-
-        if aumento >= 2:
-            alerta_aumento = Alerta(
-                paciente_id=sesion.pacienteid,
-                tipo="pain_increase",
-                descripcion=(
-                    f"Aumento de dolor: "
-                    f"{dolor_salida_anterior} → "
-                    f"{sesion.escaladolorentrada}"
-                ),
-            )
-
-            db.add(alerta_aumento)
-            db.flush()
-
-            if paciente:
-                _notificar_alerta_clinica(
-                    db=db,
-                    alerta=alerta_aumento,
-                    paciente=paciente,
-                    sesion=sesion,
-                    current_user=current_user,
-                )
+    _crear_alerta_dolor_no_disminuye(
+        db=db,
+        sesion=sesion,
+        paciente=paciente,
+        current_user=current_user,
+        analisis=analisis_dolor,
+    )
 
     if sesion.escaladolorentrada >= 8:
         alerta_dolor_alto = Alerta(
@@ -1170,7 +1496,7 @@ def obtener_resumen_tratamiento_sesion(
     tratamiento_paciente_id: int,
     fecha_atencion: Optional[date] = None,
     db: Session = Depends(get_db),
-    current_user: Usuario = Depends(get_current_terapeuta),
+    current_user: Usuario = Depends(get_current_user),
 ):
     tratamiento = (
         db.query(TratamientoPaciente)
@@ -1199,11 +1525,27 @@ def obtener_resumen_tratamiento_sesion(
             detail="Paciente no encontrado.",
         )
 
-    if not _terapeuta_puede_atender_paciente(
-        db=db,
-        paciente=paciente,
-        current_user=current_user,
-    ):
+    if current_user.rol == 2:
+        if not _terapeuta_puede_atender_paciente(
+            db=db,
+            paciente=paciente,
+            current_user=current_user,
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="No autorizado para consultar este tratamiento.",
+            )
+
+    elif current_user.rol == 1:
+        validar_consultorio_secretario(
+            current_user,
+            paciente.consultorioid,
+        )
+
+    elif current_user.rol == 3:
+        pass
+
+    else:
         raise HTTPException(
             status_code=403,
             detail="No autorizado para consultar este tratamiento.",

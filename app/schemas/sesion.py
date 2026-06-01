@@ -33,6 +33,13 @@ class FinalizarSesionCreate(BaseModel):
     escaladolorsalida: int = Field(..., ge=0, le=10)
     tratamientos: List[int] = Field(default_factory=list)
 
+    # Se exige solo cuando el backend detecta que las últimas 3 terapias
+    # relativamente seguidas no redujeron el dolor del paciente.
+    motivo_dolor_no_disminuye: Optional[str] = Field(
+        default=None,
+        max_length=600,
+    )
+
     model_config = ConfigDict(populate_by_name=True)
 
 
@@ -60,6 +67,11 @@ class SesionAtencionOut(BaseModel):
 
     estado: str
     tratamientos: List[str] = Field(default_factory=list)
+
+    analisisdolorrequerido: bool = False
+    motivodolornodisminuye: Optional[str] = None
+    dolorreferenciaprogreso: Optional[int] = None
+    doloractualprogreso: Optional[int] = None
 
     model_config = ConfigDict(from_attributes=True)
 

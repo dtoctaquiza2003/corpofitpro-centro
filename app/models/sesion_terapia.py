@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, Date, Time, SmallInteger, ForeignKey, FetchedValue
+from sqlalchemy import Boolean, Column, Integer, Date, Time, SmallInteger, String, ForeignKey, FetchedValue
 from sqlalchemy.orm import relationship, synonym
 
 from ..database import Base
@@ -44,6 +44,31 @@ class SesionTerapia(Base):
         server_onupdate=FetchedValue(),
     )
 
+    # Análisis clínico liviano: se marca solo cuando las últimas 3 sesiones
+    # relativamente seguidas no muestran reducción del dolor.
+    analisisdolorrequerido = Column(
+        "analisisdolorrequerido",
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default="false",
+    )
+    motivodolornodisminuye = Column(
+        "motivodolornodisminuye",
+        String(600),
+        nullable=True,
+    )
+    dolorreferenciaprogreso = Column(
+        "dolorreferenciaprogreso",
+        SmallInteger,
+        nullable=True,
+    )
+    doloractualprogreso = Column(
+        "doloractualprogreso",
+        SmallInteger,
+        nullable=True,
+    )
+
     paciente = relationship("Paciente")
     terapeuta = relationship("Usuario")
     tratamiento_paciente = relationship("TratamientoPaciente")
@@ -58,3 +83,7 @@ class SesionTerapia(Base):
     paciente_paquete_id = synonym("pacientepaqueteid")
     tratamiento_paciente_id = synonym("tratamientopacienteid")
     duracion_minutos = synonym("duracionminutos")
+    analisis_dolor_requerido = synonym("analisisdolorrequerido")
+    motivo_dolor_no_disminuye = synonym("motivodolornodisminuye")
+    dolor_referencia_progreso = synonym("dolorreferenciaprogreso")
+    dolor_actual_progreso = synonym("doloractualprogreso")
