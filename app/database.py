@@ -46,7 +46,7 @@ DB_MAX_OVERFLOW = _env_int(
 
 # No conviene dejar 40-45s: Render marca el health check como fallido en 5s.
 # Si el pool está ocupado, fallamos rápido y dejamos que la app se recupere.
-DB_POOL_TIMEOUT = _env_int("DB_POOL_TIMEOUT", 8)
+DB_POOL_TIMEOUT = _env_int("DB_POOL_TIMEOUT", 20)
 DB_POOL_RECYCLE = _env_int("DB_POOL_RECYCLE", 180)
 DB_CONNECT_TIMEOUT = _env_int("DB_CONNECT_TIMEOUT", 10)
 DB_SSLMODE = _env_str("DB_SSLMODE", "require")
