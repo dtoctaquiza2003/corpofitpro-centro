@@ -38,7 +38,7 @@ IS_TRANSACTION_POOLER = (
     or _env_str("DB_POOL_MODE", "").lower() in {"transaction", "transaccional"}
 )
 
-DB_POOL_SIZE = _env_int("DB_POOL_SIZE", 3)
+DB_POOL_SIZE = _env_int("DB_POOL_SIZE", 5)
 DB_MAX_OVERFLOW = _env_int(
     "DB_MAX_OVERFLOW", 0)
 
