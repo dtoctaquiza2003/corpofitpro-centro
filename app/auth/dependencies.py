@@ -40,13 +40,18 @@ def _usuario_a_cache(user: Usuario) -> UsuarioCacheado:
     )
 
 
-def _cache_a_usuario(db: Session, cached: UsuarioCacheado) -> Usuario:
+def _cache_a_usuario(db: Session, cached: UsuarioCacheado) -> Optional[Usuario]:
     """
     Recarga el objeto ORM desde la sesión actual usando el ID cacheado.
-    Solo se ejecuta cuando el token está en caché — 1 query por clave primaria
-    (instantáneo, usa el identity map de SQLAlchemy).
     """
-    return db.query(Usuario).filter(Usuario.id == cached.id).first()
+    return (
+        db.query(Usuario)
+        .filter(
+            Usuario.id == cached.id,
+            Usuario.activo == True,
+        )
+        .first()
+    )
 
 
 async def get_current_user(
@@ -71,8 +76,9 @@ async def get_current_user(
     if payload is None:
         raise credentials_exception
 
-    user_id: int = payload.get("sub")
-    if user_id is None:
+    try:
+        user_id = int(payload.get("sub"))
+    except (TypeError, ValueError):
         raise credentials_exception
 
     user = db.query(Usuario).filter(
