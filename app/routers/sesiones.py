@@ -611,40 +611,32 @@ def _obtener_terapeutas_a_cargo_paciente(
     paciente: Paciente,
     sesion: SesionTerapia | None = None,
 ) -> list[Usuario]:
-    terapeutas: list[Usuario] = []
-    terapeutas_ids: set[int] = set()
+    """
+    Versión optimizada: resuelve todos los terapeutas en 1 sola query
+    usando UNION en lugar de 3-4 queries separadas.
+    """
+    from sqlalchemy import union_all, literal_column
+
     hoy = now_ecuador().date()
 
-    # 1. Terapeuta principal asignado al paciente.
+    # IDs a resolver en una sola query final
+    terapeuta_ids: set[int] = set()
+
+    # 1. Terapeuta principal asignado
     if paciente.terapeutaasignadoid:
-        terapeuta_principal = (
-            db.query(Usuario)
-            .filter(
-                Usuario.id == paciente.terapeutaasignadoid,
-                Usuario.rol == 2,
-                Usuario.activo == True,
-            )
-            .first()
-        )
+        terapeuta_ids.add(paciente.terapeutaasignadoid)
 
-        _agregar_usuario_unico(
-            terapeutas,
-            terapeutas_ids,
-            terapeuta_principal,
-        )
+    # 2. Terapeuta que atendió la sesión
+    if sesion and sesion.terapeutaid:
+        terapeuta_ids.add(sesion.terapeutaid)
 
-    # 2. Terapeutas compartidos/autorizados activos.
-    terapeutas_compartidos = (
-        db.query(Usuario)
-        .join(
-            PacienteTerapeutaCompartido,
-            PacienteTerapeutaCompartido.terapeutaid == Usuario.id,
-        )
+    # 3. Terapeutas compartidos activos — 1 query
+    compartidos_ids = [
+        row.terapeutaid
+        for row in db.query(PacienteTerapeutaCompartido.terapeutaid)
         .filter(
             PacienteTerapeutaCompartido.pacienteid == paciente.id,
             PacienteTerapeutaCompartido.activo == True,
-            Usuario.rol == 2,
-            Usuario.activo == True,
             or_(
                 PacienteTerapeutaCompartido.fecha_inicio == None,
                 PacienteTerapeutaCompartido.fecha_inicio <= hoy,
@@ -655,75 +647,38 @@ def _obtener_terapeutas_a_cargo_paciente(
             ),
         )
         .all()
-    )
+    ]
+    terapeuta_ids.update(compartidos_ids)
 
-    for terapeuta in terapeutas_compartidos:
-        _agregar_usuario_unico(
-            terapeutas,
-            terapeutas_ids,
-            terapeuta,
+    # 4. Terapeutas por cesión — 1 query con JOIN en vez de cargar
+    #    todas las transferencias con joinedload
+    cedidos_ids = [
+        row.terapeuta_destino_id
+        for row in db.query(Transferencia.terapeuta_destino_id)
+        .join(
+            Transferencia.pacientes
         )
-
-    # 3. Terapeutas por cesión temporal activa.
-    transferencias = (
-        db.query(Transferencia)
         .filter(
             Transferencia.activo == True,
+            Paciente.id == paciente.id,
         )
-        .options(joinedload(Transferencia.pacientes))
+        .all()
+    ]
+    terapeuta_ids.update(cedidos_ids)
+
+    if not terapeuta_ids:
+        return []
+
+    # 1 sola query final para traer todos los objetos Usuario
+    return (
+        db.query(Usuario)
+        .filter(
+            Usuario.id.in_(list(terapeuta_ids)),
+            Usuario.rol == 2,
+            Usuario.activo == True,
+        )
         .all()
     )
-
-    terapeutas_cedidos_ids: set[int] = set()
-
-    for transferencia in transferencias:
-        paciente_esta_en_transferencia = any(
-            paciente_transferido.id == paciente.id
-            for paciente_transferido in transferencia.pacientes
-        )
-
-        if paciente_esta_en_transferencia and transferencia.terapeuta_destino_id:
-            terapeutas_cedidos_ids.add(transferencia.terapeuta_destino_id)
-
-    if terapeutas_cedidos_ids:
-        terapeutas_cedidos = (
-            db.query(Usuario)
-            .filter(
-                Usuario.id.in_(list(terapeutas_cedidos_ids)),
-                Usuario.rol == 2,
-                Usuario.activo == True,
-            )
-            .all()
-        )
-
-        for terapeuta in terapeutas_cedidos:
-            _agregar_usuario_unico(
-                terapeutas,
-                terapeutas_ids,
-                terapeuta,
-            )
-
-    # 4. Terapeuta que atendió la sesión.
-    # Esto asegura que también se nombre al terapeuta compartido o cedido
-    # que registró la atención.
-    if sesion and sesion.terapeutaid:
-        terapeuta_sesion = (
-            db.query(Usuario)
-            .filter(
-                Usuario.id == sesion.terapeutaid,
-                Usuario.rol == 2,
-                Usuario.activo == True,
-            )
-            .first()
-        )
-
-        _agregar_usuario_unico(
-            terapeutas,
-            terapeutas_ids,
-            terapeuta_sesion,
-        )
-
-    return terapeutas
 
 
 def _obtener_usuarios_para_alerta(
@@ -792,15 +747,14 @@ def _notificar_alerta_clinica(
     paciente: Paciente,
     sesion: SesionTerapia,
     current_user: Usuario,
+    terapeutas_a_cargo: list[Usuario] | None = None,  # <- nuevo parámetro
 ) -> None:
+    if terapeutas_a_cargo is None:
+        terapeutas_a_cargo = _obtener_terapeutas_a_cargo_paciente(
+            db=db, paciente=paciente, sesion=sesion,
+        )
     nombre_paciente = _nombre_paciente(paciente)
     nombre_terapeuta_sesion = _nombre_usuario(current_user)
-
-    terapeutas_a_cargo = _obtener_terapeutas_a_cargo_paciente(
-        db=db,
-        paciente=paciente,
-        sesion=sesion,
-    )
 
     nombres_terapeutas_a_cargo = [
         _nombre_usuario(terapeuta)
@@ -1066,6 +1020,7 @@ def _crear_alerta_dolor_no_disminuye(
     paciente: Paciente | None,
     current_user: Usuario,
     analisis: dict | None,
+    terapeutas_a_cargo: list[Usuario] | None = None,  # <- nuevo parámetro
 ) -> None:
     if not paciente or not analisis:
         return
@@ -1098,6 +1053,7 @@ def _crear_alerta_dolor_no_disminuye(
         paciente=paciente,
         sesion=sesion,
         current_user=current_user,
+        terapeutas_a_cargo=terapeutas_a_cargo,  # <- pasa el parámetro
     )
 
 
@@ -1396,12 +1352,21 @@ def finalizar_sesion(
         data=data,
     )
 
+    # Calculamos los terapeutas UNA sola vez y los reutilizamos
+    # en _crear_alerta y _notificar para no repetir las queries.
+    terapeutas_a_cargo = _obtener_terapeutas_a_cargo_paciente(
+        db=db,
+        paciente=paciente,
+        sesion=sesion,
+    )
+
     _crear_alerta_dolor_no_disminuye(
         db=db,
         sesion=sesion,
         paciente=paciente,
         current_user=current_user,
         analisis=analisis_dolor,
+        terapeutas_a_cargo=terapeutas_a_cargo,  # <- pasamos el resultado
     )
 
     if sesion.escaladolorentrada >= 8:
@@ -1421,6 +1386,7 @@ def finalizar_sesion(
                 paciente=paciente,
                 sesion=sesion,
                 current_user=current_user,
+                terapeutas_a_cargo=terapeutas_a_cargo,  # <- reutilizamos
             )
 
     db.commit()
