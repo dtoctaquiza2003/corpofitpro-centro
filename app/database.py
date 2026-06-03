@@ -40,7 +40,7 @@ IS_TRANSACTION_POOLER = (
 
 DB_POOL_SIZE = _env_int("DB_POOL_SIZE", 5)
 DB_MAX_OVERFLOW = _env_int(
-    "DB_MAX_OVERFLOW", 0)
+    "DB_MAX_OVERFLOW", 1)
 
 # No conviene dejar 40-45s: Render marca el health check como fallido en 5s.
 # Si el pool está ocupado, fallamos rápido y dejamos que la app se recupere.
