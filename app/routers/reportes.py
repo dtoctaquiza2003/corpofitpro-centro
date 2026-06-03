@@ -793,155 +793,228 @@ def dashboard_acciones(
 ):
     """
     Endpoint liviano para el panel principal.
-
-    Solo usa COUNT/SUM simples y consultas limitadas por rol.
-    No calcula cuentas, saldos ni reportes financieros pesados.
+    Versión optimizada: consolida las 11 queries originales en 5
+    usando COUNT con CASE condicional por tabla.
     """
+    from sqlalchemy import case as sa_case
+
     _validar_filtros_para_rol(current_user, terapeutaid)
 
     hoy = date.today()
-    inicio_semana = hoy - timedelta(days=hoy.weekday())
-    inicio_semana_dt = datetime.combine(inicio_semana, time.min)
+    inicio_semana_dt = datetime.combine(
+        hoy - timedelta(days=hoy.weekday()), time.min
+    )
     hace_7_dias = hoy - timedelta(days=7)
 
-    # Sesiones de hoy
-    sesiones_hoy_query = db.query(SesionTerapia).filter(
-        SesionTerapia.fecha == hoy,
+    consultorio_resuelto = _resolver_consultorioid_para_rol(
+        current_user, consultorioid
     )
-    sesiones_hoy_query = _aplicar_filtros_sesiones(
-        sesiones_hoy_query,
-        current_user,
-        terapeutaid=terapeutaid,
-        consultorioid=consultorioid,
-    )
-    sesiones_hoy = sesiones_hoy_query.count()
 
-    # Sesiones actualmente en curso. No se restringe por fecha para detectar
-    # sesiones que hayan quedado abiertas por error.
-    sesiones_en_curso_query = db.query(SesionTerapia).filter(
-        SesionTerapia.horasalida == None,
-    )
-    sesiones_en_curso_query = _aplicar_filtros_sesiones(
-        sesiones_en_curso_query,
-        current_user,
-        terapeutaid=terapeutaid,
-        consultorioid=consultorioid,
-    )
-    sesiones_en_curso = sesiones_en_curso_query.count()
-
-    sesiones_finalizadas_hoy_query = db.query(SesionTerapia).filter(
-        SesionTerapia.fecha == hoy,
-        SesionTerapia.horasalida != None,
-    )
-    sesiones_finalizadas_hoy_query = _aplicar_filtros_sesiones(
-        sesiones_finalizadas_hoy_query,
-        current_user,
-        terapeutaid=terapeutaid,
-        consultorioid=consultorioid,
-    )
-    sesiones_finalizadas_hoy = sesiones_finalizadas_hoy_query.count()
-
-    # Pacientes activos según rol.
-    pacientes_query = db.query(Paciente).filter(Paciente.estadopaciente == 1)
+    # ------------------------------------------------------------------
+    # QUERY 1 — Sesiones: hoy / en curso / finalizadas hoy
+    # 3 COUNTs → 1 sola pasada con CASE
+    # ------------------------------------------------------------------
+    sesiones_q = db.query(
+        func.count(
+            sa_case(
+                (SesionTerapia.fecha == hoy, 1),
+            )
+        ).label("hoy"),
+        func.count(
+            sa_case(
+                (SesionTerapia.horasalida == None, 1),
+            )
+        ).label("en_curso"),
+        func.count(
+            sa_case(
+                (
+                    (SesionTerapia.fecha == hoy)
+                    & (SesionTerapia.horasalida != None),
+                    1,
+                ),
+            )
+        ).label("finalizadas_hoy"),
+    ).select_from(SesionTerapia)
 
     if current_user.rol == 2:
-        pacientes_query = pacientes_query.filter(
-            Paciente.terapeutaasignadoid == current_user.id,
+        sesiones_q = sesiones_q.filter(
+            SesionTerapia.terapeutaid == current_user.id
+        )
+    elif terapeutaid is not None:
+        sesiones_q = sesiones_q.filter(
+            SesionTerapia.terapeutaid == terapeutaid
+        )
+
+    if consultorio_resuelto is not None:
+        sesiones_q = sesiones_q.join(
+            Paciente, Paciente.id == SesionTerapia.pacienteid
+        ).filter(Paciente.consultorioid == consultorio_resuelto)
+
+    row_sesiones = sesiones_q.one()
+    sesiones_hoy = row_sesiones.hoy or 0
+    sesiones_en_curso = row_sesiones.en_curso or 0
+    sesiones_finalizadas_hoy = row_sesiones.finalizadas_hoy or 0
+
+    # ------------------------------------------------------------------
+    # QUERY 2 — Pacientes: activos y nuevos esta semana
+    # 2 COUNTs → 1 sola pasada con CASE
+    # ------------------------------------------------------------------
+    pacientes_q = db.query(
+        func.count(
+            sa_case(
+                (Paciente.estadopaciente == 1, 1),
+            )
+        ).label("activos"),
+        func.count(
+            sa_case(
+                (
+                    (Paciente.estadopaciente == 1)
+                    & (Paciente.fechainicio >= inicio_semana_dt),
+                    1,
+                ),
+            )
+        ).label("nuevos_semana"),
+    ).select_from(Paciente)
+
+    if current_user.rol == 2:
+        pacientes_q = pacientes_q.filter(
+            Paciente.terapeutaasignadoid == current_user.id
         )
     elif current_user.rol == 1:
-        consultorio_resuelto = _resolver_consultorioid_para_rol(current_user)
-        pacientes_query = pacientes_query.filter(
-            Paciente.consultorioid == consultorio_resuelto,
+        pacientes_q = pacientes_q.filter(
+            Paciente.consultorioid == consultorio_resuelto
         )
     elif current_user.rol == 3:
         if consultorioid is not None:
-            pacientes_query = pacientes_query.filter(
-                Paciente.consultorioid == consultorioid,
+            pacientes_q = pacientes_q.filter(
+                Paciente.consultorioid == consultorioid
             )
         if terapeutaid is not None:
-            pacientes_query = pacientes_query.filter(
-                Paciente.terapeutaasignadoid == terapeutaid,
+            pacientes_q = pacientes_q.filter(
+                Paciente.terapeutaasignadoid == terapeutaid
             )
-    else:
-        raise HTTPException(status_code=403, detail="No autorizado")
 
-    pacientes_activos = pacientes_query.count()
-    pacientes_nuevos_semana = pacientes_query.filter(
-        Paciente.fechainicio >= inicio_semana_dt,
-    ).count()
+    row_pac = pacientes_q.one()
+    pacientes_activos = row_pac.activos or 0
+    pacientes_nuevos_semana = row_pac.nuevos_semana or 0
 
-    # Tratamientos activos y tratamientos que requieren revisión por no tener
-    # sesión finalizada en los últimos 7 días.
-    tratamientos_query = db.query(TratamientoPaciente).filter(
-        TratamientoPaciente.activo == True,
-    )
-    tratamientos_query = _aplicar_filtros_tratamientos(
-        tratamientos_query,
-        current_user,
-        terapeutaid=terapeutaid,
-        consultorioid=consultorioid,
-    )
-
-    tratamientos_activos = tratamientos_query.count()
-
+    # ------------------------------------------------------------------
+    # QUERY 3 — Tratamientos: activos y sin sesión en 7 días
+    # 2 COUNTs → 1 sola pasada con EXISTS como subquery
+    # ------------------------------------------------------------------
     sesion_reciente_exists = exists().where(
         SesionTerapia.tratamientopacienteid == TratamientoPaciente.id,
         SesionTerapia.horasalida != None,
         SesionTerapia.fecha >= hace_7_dias,
     )
 
-    tratamientos_sin_sesion_7_dias = tratamientos_query.filter(
-        ~sesion_reciente_exists,
-    ).count()
-
-    # Transferencias pendientes de verificación. Es solo COUNT, no suma cuentas.
-    transferencias_pendientes_query = db.query(Pago).filter(
-        Pago.estadopago == 1,
-        Pago.anulado == False,
-        Pago.tratamientopacienteid != None,
+    tratamientos_q = (
+        db.query(
+            func.count(TratamientoPaciente.id).label("activos"),
+            func.count(
+                sa_case(
+                    (~sesion_reciente_exists, 1),
+                )
+            ).label("sin_sesion_7_dias"),
+        )
+        .select_from(TratamientoPaciente)
+        .join(Paciente, Paciente.id == TratamientoPaciente.pacienteid)
+        .filter(TratamientoPaciente.activo == True)
     )
-    transferencias_pendientes_query = _aplicar_filtros_pagos(
-        transferencias_pendientes_query,
-        current_user,
-        terapeutaid=terapeutaid,
-        consultorioid=consultorioid,
-    )
-    transferencias_pendientes = transferencias_pendientes_query.count()
-
-    # Alertas no leídas.
-    alertas_query = db.query(Alerta).join(
-        Paciente,
-        Paciente.id == _columna_paciente_alerta(),
-    ).filter(Alerta.leida == False)
 
     if current_user.rol == 2:
-        alertas_query = alertas_query.filter(
-            Paciente.terapeutaasignadoid == current_user.id,
+        tratamientos_q = tratamientos_q.filter(
+            Paciente.terapeutaasignadoid == current_user.id
+        )
+    elif terapeutaid is not None:
+        tratamientos_q = tratamientos_q.filter(
+            Paciente.terapeutaasignadoid == terapeutaid
+        )
+
+    if consultorio_resuelto is not None:
+        tratamientos_q = tratamientos_q.filter(
+            Paciente.consultorioid == consultorio_resuelto
+        )
+
+    row_trat = tratamientos_q.one()
+    tratamientos_activos = row_trat.activos or 0
+    tratamientos_sin_sesion_7_dias = row_trat.sin_sesion_7_dias or 0
+
+    # ------------------------------------------------------------------
+    # QUERY 4 — Pagos pendientes + alertas no leídas
+    # Siguen siendo queries separadas porque tocan tablas distintas
+    # con JOINs diferentes, consolidarlas no ahorraría nada.
+    # ------------------------------------------------------------------
+    pagos_q = (
+        db.query(func.count(Pago.id))
+        .join(
+            TratamientoPaciente,
+            TratamientoPaciente.id == Pago.tratamientopacienteid,
+        )
+        .join(Paciente, Paciente.id == TratamientoPaciente.pacienteid)
+        .filter(
+            Pago.estadopago == 1,
+            Pago.anulado == False,
+            Pago.tratamientopacienteid != None,
+        )
+    )
+
+    if current_user.rol == 2:
+        pagos_q = pagos_q.filter(
+            Paciente.terapeutaasignadoid == current_user.id
+        )
+    elif terapeutaid is not None:
+        pagos_q = pagos_q.filter(
+            Paciente.terapeutaasignadoid == terapeutaid
+        )
+    if consultorio_resuelto is not None:
+        pagos_q = pagos_q.filter(
+            Paciente.consultorioid == consultorio_resuelto
+        )
+
+    transferencias_pendientes = pagos_q.scalar() or 0
+
+    alertas_q = (
+        db.query(func.count(Alerta.id))
+        .join(Paciente, Paciente.id == _columna_paciente_alerta())
+        .filter(Alerta.leida == False)
+    )
+
+    if current_user.rol == 2:
+        alertas_q = alertas_q.filter(
+            Paciente.terapeutaasignadoid == current_user.id
         )
     elif current_user.rol == 1:
-        consultorio_resuelto = _resolver_consultorioid_para_rol(current_user)
-        alertas_query = alertas_query.filter(
-            Paciente.consultorioid == consultorio_resuelto,
+        alertas_q = alertas_q.filter(
+            Paciente.consultorioid == consultorio_resuelto
         )
     elif current_user.rol == 3 and consultorioid is not None:
-        alertas_query = alertas_query.filter(Paciente.consultorioid == consultorioid)
+        alertas_q = alertas_q.filter(
+            Paciente.consultorioid == consultorioid
+        )
 
-    alertas_no_leidas = alertas_query.count()
+    alertas_no_leidas = alertas_q.scalar() or 0
 
+    # ------------------------------------------------------------------
+    # QUERY 5 — Notificaciones no leídas + cesiones activas
+    # 2 COUNTs simples sobre tablas sin JOIN pesado → 1 query con UNION
+    # es más complejo que útil; mejor 2 scalars directos.
+    # ------------------------------------------------------------------
     notificaciones_no_leidas = (
-        db.query(Notificacion)
+        db.query(func.count(Notificacion.id))
         .filter(
             Notificacion.usuarioid == current_user.id,
             Notificacion.leida == False,
         )
-        .count()
+        .scalar()
+        or 0
     )
 
-    # Cesiones activas. Mantiene la misma lógica del dashboard anterior.
-    cesiones_query = db.query(Transferencia).filter(Transferencia.activo == True)
+    cesiones_q = db.query(func.count(Transferencia.id)).filter(
+        Transferencia.activo == True
+    )
 
     if current_user.rol == 1:
-        consultorio_resuelto = _resolver_consultorioid_para_rol(current_user)
         terapeutas_ids = [
             row.id
             for row in db.query(Usuario.id)
@@ -952,23 +1025,19 @@ def dashboard_acciones(
             )
             .all()
         ]
-
         if terapeutas_ids:
-            cesiones_query = cesiones_query.filter(
+            cesiones_q = cesiones_q.filter(
                 Transferencia.terapeuta_origen_id.in_(terapeutas_ids),
                 Transferencia.terapeuta_destino_id.in_(terapeutas_ids),
             )
         else:
-            cesiones_query = cesiones_query.filter(Transferencia.id == -1)
-
+            cesiones_q = cesiones_q.filter(Transferencia.id == -1)
     elif current_user.rol == 2:
-        cesiones_query = cesiones_query.filter(
-            Transferencia.terapeuta_destino_id == current_user.id,
+        cesiones_q = cesiones_q.filter(
+            Transferencia.terapeuta_destino_id == current_user.id
         )
-    elif current_user.rol == 3:
-        pass
 
-    cesiones_activas = cesiones_query.count()
+    cesiones_activas = cesiones_q.scalar() or 0
 
     return DashboardAccionesOut(
         sesiones_hoy=sesiones_hoy,
