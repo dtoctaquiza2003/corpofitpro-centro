@@ -40,6 +40,13 @@ PAIN_PROGRESS_MAX_GAP_DAYS = int(
     os.getenv("PAIN_PROGRESS_MAX_GAP_DAYS", "14")
 )
 
+# Umbral mínimo para activar la alerta de dolor sin reducción.
+# 7 coincide con la clasificación visual del front: Bajo 0-3, Medio 4-6, Alto 7-10.
+# Así evitamos falsos positivos como 0 -> 0, 3 -> 3 o 6 -> 6.
+PAIN_NO_REDUCTION_MIN_LEVEL = int(
+    os.getenv("PAIN_NO_REDUCTION_MIN_LEVEL", "7")
+)
+
 
 def now_ecuador() -> datetime:
     return datetime.now(timezone(timedelta(hours=-5)))
@@ -944,6 +951,12 @@ def _analizar_dolor_ultimas_tres_sesiones(
     dolor_referencia = _dolor_final_sesion(sesiones[0])
     dolor_actual = int(dolor_salida_actual)
 
+    # No generar alerta cuando el dolor actual está en nivel bajo o medio.
+    # Antes 0 -> 0, 3 -> 3 o 6 -> 6 disparaban la alerta porque
+    # matemáticamente "no disminuyeron", aunque clínicamente no son dolor alto.
+    if dolor_actual < PAIN_NO_REDUCTION_MIN_LEVEL:
+        return None
+
     if dolor_actual < dolor_referencia:
         return None
 
@@ -953,6 +966,7 @@ def _analizar_dolor_ultimas_tres_sesiones(
         "fecha_referencia": sesiones[0].fecha.isoformat(),
         "fecha_actual": sesion_actual.fecha.isoformat(),
         "max_gap_days": PAIN_PROGRESS_MAX_GAP_DAYS,
+        "min_pain_level": PAIN_NO_REDUCTION_MIN_LEVEL,
     }
 
 
@@ -1003,6 +1017,10 @@ def _exigir_motivo_dolor_no_disminuye_si_corresponde(
                 "dolor_referencia": analisis["dolor_referencia"],
                 "dolor_actual": analisis["dolor_actual"],
                 "max_gap_days": analisis["max_gap_days"],
+                "min_pain_level": analisis.get(
+                    "min_pain_level",
+                    PAIN_NO_REDUCTION_MIN_LEVEL,
+                ),
             },
         )
 
