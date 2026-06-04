@@ -85,22 +85,22 @@ def _tiene_cesion_temporal_activa(
     paciente_id: int,
     terapeuta_id: int,
 ) -> bool:
-    transferencias = (
-        db.query(Transferencia)
+    """
+    Verifica si el paciente está cedido temporalmente al terapeuta.
+    Versión optimizada: usa JOIN directo y no carga todas las transferencias.
+    """
+    existe = (
+        db.query(Transferencia.id)
+        .join(Transferencia.pacientes)
         .filter(
             Transferencia.terapeuta_destino_id == terapeuta_id,
             Transferencia.activo == True,
+            Paciente.id == paciente_id,
         )
-        .options(joinedload(Transferencia.pacientes))
-        .all()
+        .first()
     )
 
-    for transferencia in transferencias:
-        for paciente in transferencia.pacientes:
-            if paciente.id == paciente_id:
-                return True
-
-    return False
+    return existe is not None
 
 
 def _terapeuta_puede_atender_paciente(

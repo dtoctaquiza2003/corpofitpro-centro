@@ -726,37 +726,59 @@ def listar_pases_diarios_paciente(
         .all()
     )
 
+    if not pases:
+        return []
+
+    pase_ids = [pase.id for pase in pases]
+
+    movimientos = (
+        db.query(MovimientoGimnasio)
+        .filter(
+            MovimientoGimnasio.membresiaid.in_(pase_ids),
+            MovimientoGimnasio.tipo == TIPO_ASISTENCIA_GIMNASIO,
+        )
+        .order_by(MovimientoGimnasio.id.desc())
+        .all()
+    )
+
+    ultimo_movimiento_por_membresia = {}
+
+    for movimiento in movimientos:
+        if movimiento.membresiaid not in ultimo_movimiento_por_membresia:
+            ultimo_movimiento_por_membresia[movimiento.membresiaid] = movimiento
+
+    pagos = (
+        db.query(Pago)
+        .filter(Pago.membresiagimnasioid.in_(pase_ids))
+        .order_by(Pago.id.desc())
+        .all()
+    )
+
+    ultimo_pago_por_membresia = {}
+
+    for pago in pagos:
+        if pago.membresiagimnasioid not in ultimo_pago_por_membresia:
+            ultimo_pago_por_membresia[pago.membresiagimnasioid] = pago
+
+    nombre_paciente = f"{paciente.nombres} {paciente.apellidos}"
+
     resultado = []
 
     for pase in pases:
-        movimiento = (
-            db.query(MovimientoGimnasio)
-            .filter(
-                MovimientoGimnasio.membresiaid == pase.id,
-                MovimientoGimnasio.tipo == TIPO_ASISTENCIA_GIMNASIO,
-            )
-            .order_by(MovimientoGimnasio.id.desc())
-            .first()
-        )
+        movimiento = ultimo_movimiento_por_membresia.get(pase.id)
 
         if not movimiento:
             continue
 
-        pago = (
-            db.query(Pago)
-            .filter(Pago.membresiagimnasioid == pase.id)
-            .order_by(Pago.id.desc())
-            .first()
-        )
-
         resultado.append(
             PaseDiarioGimnasioOut(
-                paciente=f"{paciente.nombres} {paciente.apellidos}",
+                paciente=nombre_paciente,
                 membresia=pase,
                 movimiento=movimiento,
-                pago=pago,
+                pago=ultimo_pago_por_membresia.get(pase.id),
             )
         )
+
     return resultado
 
 @router.get(

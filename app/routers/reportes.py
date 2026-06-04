@@ -1,4 +1,4 @@
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Dict, List, Optional, Set, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -62,6 +62,16 @@ PORCENTAJE_CLINICA_GIMNASIO = 0.50
 # Compatibilidad con cálculos antiguos de terapias.
 PORCENTAJE_FISIO = PORCENTAJE_FISIO_TERAPIA
 PORCENTAJE_CLINICA = PORCENTAJE_CLINICA_TERAPIA
+
+ECUADOR_TZ = timezone(timedelta(hours=-5))
+
+
+def now_ecuador() -> datetime:
+    return datetime.now(ECUADOR_TZ)
+
+
+def fecha_ecuador() -> date:
+    return now_ecuador().date()
 
 
 def _nombre_usuario(usuario: Optional[Usuario]) -> str:
@@ -800,7 +810,7 @@ def dashboard_acciones(
 
     _validar_filtros_para_rol(current_user, terapeutaid)
 
-    hoy = date.today()
+    hoy = fecha_ecuador()
     inicio_semana_dt = datetime.combine(
         hoy - timedelta(days=hoy.weekday()), time.min
     )
