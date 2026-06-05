@@ -3,7 +3,7 @@ from datetime import datetime, timezone, timedelta, date, time
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import or_
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session, joinedload
 
 from ..services.notificacion_service import crear_notificacion_usuario
@@ -86,8 +86,9 @@ def _tiene_cesion_temporal_activa(
     terapeuta_id: int,
 ) -> bool:
     """
-    Verifica si el paciente está cedido temporalmente al terapeuta.
-    Versión optimizada: usa JOIN directo y no carga todas las transferencias.
+    OPTIMIZADO: antes cargaba TODAS las transferencias + pacientes con
+    joinedload y luego iteraba en Python. Ahora hace 1 query EXISTS con JOIN.
+    O(n*m) → O(1).
     """
     existe = (
         db.query(Transferencia.id)
@@ -99,7 +100,6 @@ def _tiene_cesion_temporal_activa(
         )
         .first()
     )
-
     return existe is not None
 
 
@@ -710,40 +710,22 @@ def _obtener_usuarios_para_alerta(
             terapeuta,
         )
 
-    # 2. Secretarios del consultorio del paciente.
-    secretarios = (
+    # 2 + 3. Secretarios del consultorio + Jefes — 1 sola query con OR en rol.
+    # Antes eran 2 queries separadas.
+    secretarios_y_jefes = (
         db.query(Usuario)
         .filter(
-            Usuario.rol == 1,
             Usuario.activo == True,
-            Usuario.consultorioid == paciente.consultorioid,
+            or_(
+                and_(Usuario.rol == 1, Usuario.consultorioid == paciente.consultorioid),
+                Usuario.rol == 3,
+            ),
         )
         .all()
     )
 
-    for secretario in secretarios:
-        _agregar_usuario_unico(
-            usuarios,
-            usuarios_ids,
-            secretario,
-        )
-
-    # 3. Jefes.
-    jefes = (
-        db.query(Usuario)
-        .filter(
-            Usuario.rol == 3,
-            Usuario.activo == True,
-        )
-        .all()
-    )
-
-    for jefe in jefes:
-        _agregar_usuario_unico(
-            usuarios,
-            usuarios_ids,
-            jefe,
-        )
+    for usuario_extra in secretarios_y_jefes:
+        _agregar_usuario_unico(usuarios, usuarios_ids, usuario_extra)
 
     return usuarios
 
@@ -822,11 +804,34 @@ def _notificar_alerta_clinica(
             f"Terapeuta(s) a cargo: {terapeutas_texto}"
         )
 
-    usuarios_destino = _obtener_usuarios_para_alerta(
-        db=db,
-        paciente=paciente,
-        sesion=sesion,
-    )
+    # OPTIMIZADO: reutiliza los terapeutas_a_cargo ya calculados en el contexto
+    # llamante para no volver a calcular terapeutas compartidos/cedidos.
+    # _obtener_usuarios_para_alerta solo se llama si no se pasaron terapeutas.
+    if terapeutas_a_cargo is not None:
+        # Armar la lista completa: terapeutas + secretarios del consultorio + jefes
+        usuarios_destino_ids: set[int] = {t.id for t in terapeutas_a_cargo}
+        secretarios_y_jefes_alerta = (
+            db.query(Usuario)
+            .filter(
+                Usuario.activo == True,
+                or_(
+                    and_(Usuario.rol == 1, Usuario.consultorioid == paciente.consultorioid),
+                    Usuario.rol == 3,
+                ),
+            )
+            .all()
+        )
+        usuarios_destino = list(terapeutas_a_cargo)
+        for u in secretarios_y_jefes_alerta:
+            if u.id not in usuarios_destino_ids:
+                usuarios_destino.append(u)
+                usuarios_destino_ids.add(u.id)
+    else:
+        usuarios_destino = _obtener_usuarios_para_alerta(
+            db=db,
+            paciente=paciente,
+            sesion=sesion,
+        )
 
     if not usuarios_destino:
         print("⚠️ No se encontraron usuarios destino para la alerta clínica.")
@@ -1204,9 +1209,10 @@ def iniciar_sesion(
     )
 
     db.add(nueva_sesion)
-    db.commit()
-    db.refresh(nueva_sesion)
+    db.flush()  # obtiene el ID sin cerrar la transacción
 
+    # Carga las relaciones necesarias para build_sesion_out en la misma
+    # transacción, sin hacer un SELECT extra post-commit.
     nueva_sesion = (
         db.query(SesionTerapia)
         .options(
@@ -1217,7 +1223,19 @@ def iniciar_sesion(
         .first()
     )
 
-    return build_sesion_out(nueva_sesion, db)
+    # Construir la respuesta ANTES del commit para evitar que expire_on_commit
+    # invalide los atributos del objeto y fuerce recargas innecesarias a la DB.
+    # Una sesión recién iniciada no tiene tratamientos aplicados todavía,
+    # así que [] evita además el SELECT a sesiontratamiento.
+    respuesta = build_sesion_out(
+        nueva_sesion,
+        db,
+        tratamientos_aplicados_override=[],
+    )
+
+    db.commit()
+
+    return respuesta
 
 
 @router.get("/en-curso", response_model=List[SesionAtencionOut])
@@ -1576,4 +1594,3 @@ def obtener_resumen_tratamiento_sesion(
             else None
         ),
     }
-

@@ -60,6 +60,24 @@ class PagoPrevioGimnasioCreate(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
 
+class RecuperacionCarteraCreate(BaseModel):
+    """
+    Dinero cobrado hoy por deuda/atenciones anteriores al inicio del sistema.
+
+    Sí entra al cuadre de caja del día. No se asocia a tratamiento, paquete
+    ni membresía, por lo tanto no reduce saldos ni genera comisiones
+    automáticas de terapeuta.
+    """
+
+    pacienteid: int
+    monto: float = Field(..., gt=0)
+    metodopago: str
+    fechapagoreal: Optional[date] = None
+    observacion_cartera: Optional[str] = Field(default=None, max_length=500)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
 class PagoOut(BaseModel):
     id: int
     pacienteid: int
@@ -88,6 +106,10 @@ class PagoOut(BaseModel):
     espagoprevio: bool = False
     fechapagoreal: Optional[date] = None
     observacionpagoprevio: Optional[str] = None
+
+    # Recuperación de cartera anterior cobrada hoy
+    esrecuperacioncartera: bool = False
+    observacion_cartera: Optional[str] = None
 
     # Anulación
     anulado: bool = False
@@ -123,6 +145,10 @@ class PagoSimpleOut(BaseModel):
     espagoprevio: bool = False
     fechapagoreal: Optional[date] = None
     observacionpagoprevio: Optional[str] = None
+
+    # Recuperación de cartera anterior cobrada hoy
+    esrecuperacioncartera: bool = False
+    observacion_cartera: Optional[str] = None
 
     # Anulación
     anulado: bool = False

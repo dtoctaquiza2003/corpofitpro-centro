@@ -11,9 +11,12 @@ from sqlalchemy import (
     Text,
 )
 from sqlalchemy.sql import func
+from datetime import datetime, timezone
 
 from ..database import Base
 
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
 class Pago(Base):
     __tablename__ = "pagos"
@@ -39,7 +42,9 @@ class Pago(Base):
 
     fechapago = Column(
         DateTime(timezone=True),
-        server_default=func.current_timestamp(),
+        default=now_utc,
+        server_default=func.now(),
+        nullable=False,
     )
 
     numerocomprobante = Column(String(100), nullable=True)
@@ -63,6 +68,12 @@ class Pago(Base):
     espagoprevio = Column(Boolean, default=False, nullable=False)
     fechapagoreal = Column(Date, nullable=True)
     observacionpagoprevio = Column(Text, nullable=True)
+
+    # Recuperación de cartera: dinero cobrado HOY por atenciones anteriores
+    # al inicio del sistema. SÍ entra a caja, pero NO reduce saldos de
+    # tratamientos/membresías porque esas sesiones no existen en el sistema.
+    esrecuperacioncartera = Column(Boolean, default=False, nullable=False)
+    observacion_cartera = Column(Text, nullable=True)
 
     # Anulación de pagos
     anulado = Column(Boolean, default=False, nullable=False)

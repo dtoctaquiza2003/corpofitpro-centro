@@ -1,10 +1,11 @@
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import List, Optional
 
 from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, UploadFile, status, Query
-from sqlalchemy import exists, func, or_
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import and_, case, exists, func, or_
+from sqlalchemy.orm import Session, aliased, joinedload
 
 from app.schemas.pago import (
     CuentaMembresiaGimnasioOut,
@@ -14,9 +15,10 @@ from app.schemas.pago import (
     PagoCreate,
     PagoPrevioTratamientoCreate,
     PagoPrevioGimnasioCreate,
+    RecuperacionCarteraCreate,
     PagoOut,
     PagoSimpleOut,
-    PagoAnularRequest
+    PagoAnularRequest,
 )
 
 from ..auth.dependencies import get_current_secretary, get_current_user
@@ -74,10 +76,9 @@ def _estado_cuenta(total_generado: float, pagado: float, saldo: float) -> str:
     return "PAGADO"
 
 
-
-
 def _condicion_paciente_ecuasanitas():
-    """Pacientes cuyo seguro/convenio cubre terapias por Ecuasanitas.
+    """
+    Pacientes cuyo seguro/convenio cubre terapias por Ecuasanitas.
 
     Esta condición solo aplica a terapias; gimnasio mensual y diario se
     cobran normal aunque el paciente tenga Ecuasanitas.
@@ -88,10 +89,102 @@ def _condicion_paciente_ecuasanitas():
     )
 
 
+def _sesion_finalizada_tratamiento_en_consultorio_exists(consultorioid: int):
+    """
+    Condición SQL optimizada para pacientes compartidos.
+
+    Un tratamiento es visible para una sede si:
+    - el paciente pertenece a esa sede, o
+    - el tratamiento ya tiene una sesión finalizada atendida por un terapeuta
+      de esa sede.
+    """
+    terapeuta_sesion = aliased(Usuario)
+
+    return exists().where(
+        and_(
+            SesionTerapia.tratamientopacienteid == TratamientoPaciente.id,
+            SesionTerapia.terapeutaid == terapeuta_sesion.id,
+            terapeuta_sesion.consultorioid == consultorioid,
+            SesionTerapia.horasalida != None,
+        )
+    )
+
+
+def _tratamiento_visible_para_consultorio_filter(consultorioid: int):
+    return or_(
+        Paciente.consultorioid == consultorioid,
+        _sesion_finalizada_tratamiento_en_consultorio_exists(consultorioid),
+    )
+
+
+def _tratamiento_visible_para_terapeuta_filter(terapeutaid: int):
+    return or_(
+        Paciente.terapeutaasignadoid == terapeutaid,
+        exists().where(
+            and_(
+                SesionTerapia.tratamientopacienteid == TratamientoPaciente.id,
+                SesionTerapia.terapeutaid == terapeutaid,
+                SesionTerapia.horasalida != None,
+            )
+        ),
+    )
+
+
+def _pago_visible_para_consultorio_filter(consultorioid: int):
+    """
+    Para listar/verificar pagos de pacientes compartidos.
+
+    Incluye pagos del paciente de la sede y pagos aplicados a tratamientos
+    que tienen atención realizada por terapeutas de la sede.
+    """
+    terapeuta_sesion = aliased(Usuario)
+
+    return or_(
+        Paciente.consultorioid == consultorioid,
+        exists().where(
+            and_(
+                SesionTerapia.tratamientopacienteid == Pago.tratamientopacienteid,
+                SesionTerapia.terapeutaid == terapeuta_sesion.id,
+                terapeuta_sesion.consultorioid == consultorioid,
+                SesionTerapia.horasalida != None,
+            )
+        ),
+    )
+
+
+def _paciente_tiene_atencion_en_consultorio(
+    db: Session,
+    pacienteid: int,
+    consultorioid: Optional[int],
+    tratamientopacienteid: Optional[int] = None,
+) -> bool:
+    if consultorioid is None:
+        return False
+
+    query = (
+        db.query(SesionTerapia.id)
+        .join(Usuario, Usuario.id == SesionTerapia.terapeutaid)
+        .filter(
+            SesionTerapia.pacienteid == pacienteid,
+            Usuario.consultorioid == consultorioid,
+            SesionTerapia.horasalida != None,
+        )
+    )
+
+    if tratamientopacienteid is not None:
+        query = query.filter(
+            SesionTerapia.tratamientopacienteid == tratamientopacienteid
+        )
+
+    return query.first() is not None
+
+
 def _validar_paciente(
     db: Session,
     pacienteid: int,
     current_user: Usuario,
+    tratamientopacienteid: Optional[int] = None,
+    permitir_atencion_compartida: bool = False,
 ) -> Paciente:
     paciente = db.query(Paciente).filter(Paciente.id == pacienteid).first()
 
@@ -101,16 +194,39 @@ def _validar_paciente(
             detail="Paciente no encontrado",
         )
 
-    validar_acceso_paciente_por_rol(paciente, current_user)
+    try:
+        validar_acceso_paciente_por_rol(paciente, current_user)
+        return paciente
+    except HTTPException as exc:
+        # Pacientes compartidos:
+        # El paciente puede pertenecer al Centro, pero si ya fue atendido por
+        # un terapeuta de Atahualpa, la secretaria de Atahualpa debe poder
+        # cobrar/verificar ese tratamiento.
+        if (
+            permitir_atencion_compartida
+            and current_user.rol == 1
+            and current_user.consultorioid is not None
+            and _paciente_tiene_atencion_en_consultorio(
+                db=db,
+                pacienteid=pacienteid,
+                consultorioid=current_user.consultorioid,
+                tratamientopacienteid=tratamientopacienteid,
+            )
+        ):
+            return paciente
 
-    return paciente
+        raise exc
 
 
 def _obtener_pago_con_acceso(
     db: Session,
     pago_id: int,
     current_user: Usuario,
-) -> Pago:
+) -> tuple[Pago, Paciente]:
+    """
+    Devuelve (pago, paciente) para evitar que los callers tengan que
+    volver a consultar el paciente.
+    """
     pago = db.query(Pago).filter(Pago.id == pago_id).first()
 
     if not pago:
@@ -127,9 +243,15 @@ def _obtener_pago_con_acceso(
             detail="Paciente del pago no encontrado",
         )
 
-    validar_acceso_paciente_por_rol(paciente, current_user)
+    _validar_paciente(
+        db=db,
+        pacienteid=paciente.id,
+        current_user=current_user,
+        tratamientopacienteid=pago.tratamientopacienteid,
+        permitir_atencion_compartida=True,
+    )
 
-    return pago
+    return pago, paciente
 
 
 def _validar_paciente_paquete(
@@ -243,28 +365,32 @@ def _validar_saldo_paquete(
     if paciente_paquete is None:
         return
 
-    query = db.query(Pago).filter(Pago.pacientepaqueteid == paciente_paquete.id)
+    query = db.query(
+        func.coalesce(
+            func.sum(
+                case((Pago.estadopago == 2, Pago.monto), else_=0)
+            ),
+            0,
+        ).label("verificado"),
+        func.coalesce(
+            func.sum(
+                case((Pago.estadopago == 1, Pago.monto), else_=0)
+            ),
+            0,
+        ).label("pendiente"),
+    ).filter(
+        Pago.pacientepaqueteid == paciente_paquete.id,
+        Pago.anulado == False,
+    )
 
     if excluir_pago_id is not None:
         query = query.filter(Pago.id != excluir_pago_id)
 
-    pagos_actuales = query.all()
-
-    total_pagado_verificado = sum(
-        float(p.monto)
-        for p in pagos_actuales
-        if p.estadopago == 2
-    )
-
-    total_pendiente_verificacion = sum(
-        float(p.monto)
-        for p in pagos_actuales
-        if p.estadopago == 1
-    )
+    totales = query.one()
 
     precio_final = float(paciente_paquete.preciofinal)
 
-    if total_pagado_verificado + total_pendiente_verificacion + float(monto) > precio_final:
+    if float(totales.verificado) + float(totales.pendiente) + float(monto) > precio_final:
         raise HTTPException(
             status_code=400,
             detail="El abono supera el saldo pendiente del paquete.",
@@ -285,7 +411,20 @@ def _validar_saldo_membresia_gimnasio(
     if precio <= 0:
         return
 
-    query = db.query(Pago).filter(
+    query = db.query(
+        func.coalesce(
+            func.sum(
+                case((Pago.estadopago == 2, Pago.monto), else_=0)
+            ),
+            0,
+        ).label("verificado"),
+        func.coalesce(
+            func.sum(
+                case((Pago.estadopago == 1, Pago.monto), else_=0)
+            ),
+            0,
+        ).label("pendiente"),
+    ).filter(
         Pago.membresiagimnasioid == membresia.id,
         Pago.anulado == False,
     )
@@ -293,21 +432,9 @@ def _validar_saldo_membresia_gimnasio(
     if excluir_pago_id is not None:
         query = query.filter(Pago.id != excluir_pago_id)
 
-    pagos_actuales = query.all()
+    totales = query.one()
 
-    total_pagado_verificado = sum(
-        float(p.monto)
-        for p in pagos_actuales
-        if p.estadopago == 2
-    )
-
-    total_pendiente_verificacion = sum(
-        float(p.monto)
-        for p in pagos_actuales
-        if p.estadopago == 1
-    )
-
-    if total_pagado_verificado + total_pendiente_verificacion + float(monto) > precio:
+    if float(totales.verificado) + float(totales.pendiente) + float(monto) > precio:
         raise HTTPException(
             status_code=400,
             detail="El abono supera el saldo pendiente de la membresía de gimnasio.",
@@ -317,55 +444,57 @@ def _validar_saldo_membresia_gimnasio(
 def now_ecuador() -> datetime:
     return datetime.now(timezone(timedelta(hours=-5)))
 
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
-def _nombre_paciente(paciente: Paciente) -> str:
+
+def _nombre_paciente(paciente) -> str:
     return f"{paciente.nombres} {paciente.apellidos}".strip()
 
 
 def _obtener_usuarios_verificadores_pago(
     db: Session,
-    paciente: Paciente,
+    paciente,
     current_user: Usuario,
 ) -> list[Usuario]:
-    usuarios: list[Usuario] = []
-    usuarios_ids = set()
+    """
+    Optimizado: antes hacía 2 queries separadas, secretarios + jefes.
+    Ahora hace 1 sola query con OR.
+    """
+    consultorio_ids = {
+        cid
+        for cid in (
+            getattr(paciente, "consultorioid", None),
+            getattr(current_user, "consultorioid", None),
+        )
+        if cid is not None
+    }
 
-    secretarios = (
-        db.query(Usuario)
-        .filter(
+    condicion_secretarios = Usuario.rol == 1
+    if consultorio_ids:
+        condicion_secretarios = and_(
             Usuario.rol == 1,
-            Usuario.activo == True,
-            Usuario.consultorioid == paciente.consultorioid,
+            Usuario.consultorioid.in_(list(consultorio_ids)),
         )
-        .all()
-    )
 
-    for secretario in secretarios:
-        if secretario.id != current_user.id and secretario.id not in usuarios_ids:
-            usuarios.append(secretario)
-            usuarios_ids.add(secretario.id)
-
-    jefes = (
+    return (
         db.query(Usuario)
         .filter(
-            Usuario.rol == 3,
             Usuario.activo == True,
+            Usuario.id != current_user.id,
+            or_(
+                condicion_secretarios,
+                Usuario.rol == 3,
+            ),
         )
         .all()
     )
-
-    for jefe in jefes:
-        if jefe.id != current_user.id and jefe.id not in usuarios_ids:
-            usuarios.append(jefe)
-            usuarios_ids.add(jefe.id)
-
-    return usuarios
 
 
 def _notificar_pago_transferencia_pendiente(
     db: Session,
     pago: Pago,
-    paciente: Paciente,
+    paciente,
     current_user: Usuario,
 ) -> None:
     usuarios_destino = _obtener_usuarios_verificadores_pago(
@@ -472,9 +601,17 @@ def _notificar_resultado_pago_transferencia(
 
 @router.get("/", response_model=List[PagoOut])
 def listar_pagos(
+    limit: int = Query(default=20, ge=1, le=50),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
     current_user: Usuario = Depends(get_current_secretary),
 ):
+    # limit=20 para scroll infinito.
+    # Front:
+    # /api/pagos/?limit=20&offset=0
+    # /api/pagos/?limit=20&offset=20
+    # /api/pagos/?limit=20&offset=40
+
     query = (
         db.query(Pago)
         .join(Paciente, Paciente.id == Pago.pacienteid)
@@ -487,7 +624,7 @@ def listar_pagos(
         )
 
         query = query.filter(
-            Paciente.consultorioid == current_user.consultorioid
+            _pago_visible_para_consultorio_filter(current_user.consultorioid)
         )
 
     elif current_user.rol == 3:
@@ -499,7 +636,13 @@ def listar_pagos(
             detail="No autorizado",
         )
 
-    return query.order_by(Pago.fechapago.desc()).all()
+    return (
+        query
+        .order_by(Pago.fechapago.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
 
 
 # ============================================================
@@ -541,27 +684,43 @@ def listar_cuentas_paquetes(
 
     asignaciones = query.order_by(PacientePaquete.id.desc()).all()
 
+    if not asignaciones:
+        return []
+
+    paquete_ids = [pp.id for pp, _, _ in asignaciones]
+
+    pagos_rows = (
+        db.query(Pago)
+        .filter(Pago.pacientepaqueteid.in_(paquete_ids))
+        .order_by(Pago.fechapago.asc())
+        .all()
+    )
+
+    pagos_por_paquete: dict[int, list[Pago]] = defaultdict(list)
+
+    for pago in pagos_rows:
+        pagos_por_paquete[pago.pacientepaqueteid].append(pago)
+
     resultado = []
 
     for paciente_paquete, paciente, paquete in asignaciones:
-        pagos = (
-            db.query(Pago)
-            .filter(Pago.pacientepaqueteid == paciente_paquete.id)
-            .order_by(Pago.fechapago.asc())
-            .all()
-        )
+        pagos = pagos_por_paquete.get(paciente_paquete.id, [])
+        pagos_no_anulados = [
+            pago for pago in pagos
+            if not bool(getattr(pago, "anulado", False))
+        ]
 
         precio_final = float(paciente_paquete.preciofinal)
 
         pagado_verificado = sum(
             float(pago.monto)
-            for pago in pagos
+            for pago in pagos_no_anulados
             if pago.estadopago == 2
         )
 
         pendiente_verificacion = sum(
             float(pago.monto)
-            for pago in pagos
+            for pago in pagos_no_anulados
             if pago.estadopago == 1
         )
 
@@ -622,7 +781,6 @@ def listar_cuentas_paquetes(
     return resultado
 
 
-
 # ============================================================
 # CUENTAS ECUASANITAS - SOLO TERAPIAS
 # ============================================================
@@ -637,10 +795,6 @@ def listar_cuentas_ecuasanitas(
 ):
     """
     Lista cuánto debe cubrir/facturar Ecuasanitas por terapias recibidas.
-
-    Optimización: primero pagina tratamientos Ecuasanitas y luego cuenta
-    sesiones finalizadas solo para esos ids. Así no se cargan pagos, caja,
-    gimnasio ni historiales completos al abrir la pantalla de pagos.
     """
     tiene_sesiones_finalizadas = (
         exists()
@@ -660,14 +814,18 @@ def listar_cuentas_ecuasanitas(
     )
 
     if current_user.rol == 2:
-        query = query.filter(Paciente.terapeutaasignadoid == current_user.id)
+        query = query.filter(
+            _tratamiento_visible_para_terapeuta_filter(current_user.id)
+        )
 
     elif current_user.rol == 1:
         validar_consultorio_secretario(
             current_user,
             current_user.consultorioid,
         )
-        query = query.filter(Paciente.consultorioid == current_user.consultorioid)
+        query = query.filter(
+            _tratamiento_visible_para_consultorio_filter(current_user.consultorioid)
+        )
 
     elif current_user.rol == 3:
         pass
@@ -703,7 +861,10 @@ def listar_cuentas_ecuasanitas(
     if not tratamientos:
         return []
 
-    tratamiento_ids = [tratamiento.id for tratamiento, _, _ in tratamientos]
+    tratamiento_ids = [
+        tratamiento.id
+        for tratamiento, _, _ in tratamientos
+    ]
 
     sesiones_rows = (
         db.query(
@@ -743,8 +904,8 @@ def listar_cuentas_ecuasanitas(
         )
 
         total_cubierto = round(precio_sesion * sesiones_cubiertas, 2)
-        nombre_terapeuta = None
 
+        nombre_terapeuta = None
         if terapeuta:
             nombre_terapeuta = f"{terapeuta.nombres} {terapeuta.apellidos}".strip()
 
@@ -765,14 +926,21 @@ def listar_cuentas_ecuasanitas(
                 precio_sesion_aplicado=precio_sesion,
                 sesiones_cubiertas=sesiones_cubiertas,
                 total_cubierto=total_cubierto,
-                ganancia_terapeuta=round(total_cubierto * PORCENTAJE_FISIO_TERAPIA, 2),
-                valor_clinica=round(total_cubierto * PORCENTAJE_CLINICA_TERAPIA, 2),
+                ganancia_terapeuta=round(
+                    total_cubierto * PORCENTAJE_FISIO_TERAPIA,
+                    2,
+                ),
+                valor_clinica=round(
+                    total_cubierto * PORCENTAJE_CLINICA_TERAPIA,
+                    2,
+                ),
                 fecha_ultima_sesion=data_sesiones.get("ultima"),
                 estado="POR FACTURAR",
             )
         )
 
     return resultado
+
 
 # ============================================================
 # CUENTAS POR TRATAMIENTO - NUEVO SISTEMA
@@ -783,6 +951,8 @@ def listar_cuentas_tratamientos(
     limit: int = Query(default=20, ge=1, le=50),
     offset: int = Query(default=0, ge=0),
     buscar: Optional[str] = Query(default=None),
+    solo_transferencias_pendientes: bool = Query(default=False),
+    consultorioid: Optional[int] = Query(default=None),
     db: Session = Depends(get_db),
     current_user: Usuario = Depends(get_current_user),
 ):
@@ -792,18 +962,39 @@ def listar_cuentas_tratamientos(
         .join(Paciente, Paciente.id == TratamientoPaciente.pacienteid)
     )
 
+    consultorio_operativo_id: Optional[int] = None
+    terapeuta_operativo_id: Optional[int] = None
+
     if current_user.rol == 2:
-        query = query.filter(Paciente.terapeutaasignadoid == current_user.id)
+        terapeuta_operativo_id = current_user.id
+
+        query = query.filter(
+            _tratamiento_visible_para_terapeuta_filter(current_user.id)
+        )
 
     elif current_user.rol == 1:
         validar_consultorio_secretario(
             current_user,
             current_user.consultorioid,
         )
-        query = query.filter(Paciente.consultorioid == current_user.consultorioid)
+
+        consultorio_operativo_id = current_user.consultorioid
+
+        query = query.filter(
+            _tratamiento_visible_para_consultorio_filter(
+                current_user.consultorioid
+            )
+        )
 
     elif current_user.rol == 3:
-        pass
+        # Jefe:
+        # - Sin consultorioid: ve cálculo global.
+        # - Con consultorioid: ve cálculo operativo de esa sucursal.
+        if consultorioid is not None:
+            consultorio_operativo_id = consultorioid
+            query = query.filter(
+                _tratamiento_visible_para_consultorio_filter(consultorioid)
+            )
 
     else:
         raise HTTPException(status_code=403, detail="No autorizado")
@@ -825,6 +1016,30 @@ def listar_cuentas_tratamientos(
             )
         )
 
+    if solo_transferencias_pendientes:
+        condiciones_transferencia = [
+            Pago.tratamientopacienteid == TratamientoPaciente.id,
+            Pago.estadopago == 1,
+            or_(Pago.anulado == False, Pago.anulado.is_(None)),
+            Pago.metodopago.ilike("%transfer%"),
+        ]
+
+        # Si estoy viendo una sucursal específica, solo quiero las
+        # transferencias registradas/cobradas por usuarios de esa sucursal.
+        if consultorio_operativo_id is not None:
+            condiciones_transferencia.extend(
+                [
+                    Pago.creado_por_id == Usuario.id,
+                    Usuario.consultorioid == consultorio_operativo_id,
+                ]
+            )
+
+        tiene_transferencia_pendiente = exists().where(
+            and_(*condiciones_transferencia)
+        )
+
+        query = query.filter(tiene_transferencia_pendiente)
+
     tratamientos = (
         query.order_by(
             TratamientoPaciente.activo.desc(),
@@ -839,17 +1054,55 @@ def listar_cuentas_tratamientos(
     if not tratamientos:
         return []
 
-    tratamiento_ids = [tratamiento.id for tratamiento, _ in tratamientos]
+    tratamiento_ids = [
+        tratamiento.id
+        for tratamiento, _ in tratamientos
+    ]
 
-    sesiones_rows = (
+    # ============================================================
+    # SESIONES
+    # Importante:
+    # - Secretaria Atahualpa: cuenta solo sesiones hechas por terapeutas
+    #   de Atahualpa.
+    # - Secretaria Centro: cuenta solo sesiones hechas por terapeutas
+    #   del Centro.
+    # - Terapeuta: cuenta solo sus propias sesiones.
+    # - Jefe sin filtro: cuenta todo.
+    # ============================================================
+
+    sesiones_query = (
         db.query(
             SesionTerapia.tratamientopacienteid,
             func.count(SesionTerapia.id),
         )
+        .select_from(SesionTerapia)
         .filter(
             SesionTerapia.tratamientopacienteid.in_(tratamiento_ids),
             SesionTerapia.horasalida != None,
         )
+    )
+
+    if terapeuta_operativo_id is not None:
+        sesiones_query = sesiones_query.filter(
+            SesionTerapia.terapeutaid == terapeuta_operativo_id
+        )
+
+    elif consultorio_operativo_id is not None:
+        TerapeutaSesion = aliased(Usuario)
+
+        sesiones_query = (
+            sesiones_query
+            .join(
+                TerapeutaSesion,
+                TerapeutaSesion.id == SesionTerapia.terapeutaid,
+            )
+            .filter(
+                TerapeutaSesion.consultorioid == consultorio_operativo_id
+            )
+        )
+
+    sesiones_rows = (
+        sesiones_query
         .group_by(SesionTerapia.tratamientopacienteid)
         .all()
     )
@@ -859,9 +1112,131 @@ def listar_cuentas_tratamientos(
         for tratamiento_id, total in sesiones_rows
     }
 
-    pagos_rows = (
+    # ============================================================
+    # PAGOS
+    # Se filtran por la sucursal que registró/cobró el pago.
+    #
+    # Nota:
+    # Esta es la mejor solución con tu estructura actual.
+    # Lo ideal más adelante sería agregar Pago.consultorioid_cobro
+    # para no depender de creado_por_id.
+    # ============================================================
+
+    pago_no_anulado = or_(Pago.anulado == False, Pago.anulado.is_(None))
+    no_es_recuperacion_cartera = or_(
+        Pago.esrecuperacioncartera == False,
+        Pago.esrecuperacioncartera.is_(None),
+    )
+    no_es_pago_previo = or_(
+        Pago.espagoprevio == False,
+        Pago.espagoprevio.is_(None),
+    )
+
+    pagos_agregados_query = (
+        db.query(
+            Pago.tratamientopacienteid.label("tratamiento_id"),
+            func.coalesce(
+                func.sum(
+                    case(
+                        (
+                            and_(
+                                Pago.estadopago == 2,
+                                pago_no_anulado,
+                                no_es_recuperacion_cartera,
+                                no_es_pago_previo,
+                            ),
+                            Pago.monto,
+                        ),
+                        else_=0,
+                    )
+                ),
+                0,
+            ).label("pagado_caja_verificado"),
+            func.coalesce(
+                func.sum(
+                    case(
+                        (
+                            and_(
+                                Pago.estadopago == 2,
+                                pago_no_anulado,
+                                no_es_recuperacion_cartera,
+                                Pago.espagoprevio == True,
+                            ),
+                            Pago.monto,
+                        ),
+                        else_=0,
+                    )
+                ),
+                0,
+            ).label("pago_previo_verificado"),
+            func.coalesce(
+                func.sum(
+                    case(
+                        (
+                            and_(
+                                Pago.estadopago == 1,
+                                pago_no_anulado,
+                                no_es_recuperacion_cartera,
+                            ),
+                            Pago.monto,
+                        ),
+                        else_=0,
+                    )
+                ),
+                0,
+            ).label("pendiente_verificacion"),
+        )
+        .filter(Pago.tratamientopacienteid.in_(tratamiento_ids))
+    )
+
+    pagos_detalle_query = (
         db.query(Pago)
         .filter(Pago.tratamientopacienteid.in_(tratamiento_ids))
+    )
+
+    if consultorio_operativo_id is not None:
+        CobradorAgregado = aliased(Usuario)
+        CobradorDetalle = aliased(Usuario)
+
+        pagos_agregados_query = (
+            pagos_agregados_query
+            .join(
+                CobradorAgregado,
+                CobradorAgregado.id == Pago.creado_por_id,
+            )
+            .filter(
+                CobradorAgregado.consultorioid == consultorio_operativo_id
+            )
+        )
+
+        pagos_detalle_query = (
+            pagos_detalle_query
+            .join(
+                CobradorDetalle,
+                CobradorDetalle.id == Pago.creado_por_id,
+            )
+            .filter(
+                CobradorDetalle.consultorioid == consultorio_operativo_id
+            )
+        )
+
+    pagos_agregados_rows = (
+        pagos_agregados_query
+        .group_by(Pago.tratamientopacienteid)
+        .all()
+    )
+
+    pagos_totales_por_tratamiento = {
+        row.tratamiento_id: {
+            "pagado_caja_verificado": float(row.pagado_caja_verificado or 0),
+            "pago_previo_verificado": float(row.pago_previo_verificado or 0),
+            "pendiente_verificacion": float(row.pendiente_verificacion or 0),
+        }
+        for row in pagos_agregados_rows
+    }
+
+    pagos_rows = (
+        pagos_detalle_query
         .order_by(Pago.fechapago.asc())
         .all()
     )
@@ -883,28 +1258,27 @@ def listar_cuentas_tratamientos(
         )
 
         total_generado = float(sesiones_realizadas) * precio_aplicado
-        pagos = pagos_por_tratamiento.get(tratamiento.id, [])
-        pagos_no_anulados = [pago for pago in pagos if not bool(pago.anulado)]
 
-        pagado_caja_verificado = sum(
-            float(pago.monto or 0)
-            for pago in pagos_no_anulados
-            if pago.estadopago == 2 and not bool(getattr(pago, "espagoprevio", False))
+        pagos_totales = pagos_totales_por_tratamiento.get(
+            tratamiento.id,
+            {
+                "pagado_caja_verificado": 0.0,
+                "pago_previo_verificado": 0.0,
+                "pendiente_verificacion": 0.0,
+            },
         )
 
-        pago_previo_verificado = sum(
-            float(pago.monto or 0)
-            for pago in pagos_no_anulados
-            if pago.estadopago == 2 and bool(getattr(pago, "espagoprevio", False))
+        pagado_caja_verificado = float(
+            pagos_totales["pagado_caja_verificado"]
+        )
+        pago_previo_verificado = float(
+            pagos_totales["pago_previo_verificado"]
+        )
+        pendiente_verificacion = float(
+            pagos_totales["pendiente_verificacion"]
         )
 
         pagado_verificado = pagado_caja_verificado + pago_previo_verificado
-
-        pendiente_verificacion = sum(
-            float(pago.monto or 0)
-            for pago in pagos_no_anulados
-            if pago.estadopago == 1
-        )
 
         saldo = max(total_generado - pagado_verificado, 0)
         saldo_favor = max(pagado_verificado - total_generado, 0)
@@ -912,6 +1286,8 @@ def listar_cuentas_tratamientos(
         nombre_tipo_terapia = None
         if tratamiento.tipo_terapia:
             nombre_tipo_terapia = tratamiento.tipo_terapia.nombre
+
+        pagos = pagos_por_tratamiento.get(tratamiento.id, [])
 
         resultado.append(
             CuentaTratamientoOut(
@@ -962,11 +1338,21 @@ def listar_cuentas_tratamientos(
                         verificado_por_id=pago.verificado_por_id,
                         fecha_verificacion=pago.fecha_verificacion,
                         motivo_rechazo=pago.motivo_rechazo,
-                        espagoprevio=bool(getattr(pago, "espagoprevio", False)),
+                        espagoprevio=bool(
+                            getattr(pago, "espagoprevio", False)
+                        ),
                         fechapagoreal=getattr(pago, "fechapagoreal", None),
                         observacionpagoprevio=getattr(
                             pago,
                             "observacionpagoprevio",
+                            None,
+                        ),
+                        esrecuperacioncartera=bool(
+                            getattr(pago, "esrecuperacioncartera", False)
+                        ),
+                        observacion_cartera=getattr(
+                            pago,
+                            "observacion_cartera",
                             None,
                         ),
                         anulado=bool(pago.anulado),
@@ -981,16 +1367,17 @@ def listar_cuentas_tratamientos(
 
     return resultado
 
+
 # ============================================================
 # CUENTAS POR GIMNASIO
 # ============================================================
-
 
 @router.get("/cuentas-gimnasio", response_model=List[CuentaMembresiaGimnasioOut])
 def listar_cuentas_gimnasio(
     limit: int = Query(default=20, ge=1, le=50),
     offset: int = Query(default=0, ge=0),
     buscar: Optional[str] = Query(default=None),
+    solo_transferencias_pendientes: bool = Query(default=False),
     db: Session = Depends(get_db),
     current_user: Usuario = Depends(get_current_user),
 ):
@@ -1018,6 +1405,7 @@ def listar_cuentas_gimnasio(
 
     if buscar and buscar.strip():
         texto = f"%{buscar.strip()}%"
+
         query = query.filter(
             or_(
                 Paciente.nombres.ilike(texto),
@@ -1025,6 +1413,17 @@ def listar_cuentas_gimnasio(
                 MembresiaGimnasio.observaciones.ilike(texto),
             )
         )
+    
+    if solo_transferencias_pendientes:
+        tiene_transferencia_pendiente = (
+            exists()
+            .where(Pago.membresiagimnasioid == MembresiaGimnasio.id)
+            .where(Pago.estadopago == 1)
+            .where(Pago.anulado == False)
+            .where(Pago.metodopago.ilike("%transfer%"))
+        )
+
+        query = query.filter(tiene_transferencia_pendiente)
 
     membresias = (
         query.order_by(
@@ -1040,7 +1439,10 @@ def listar_cuentas_gimnasio(
     if not membresias:
         return []
 
-    membresia_ids = [membresia.id for membresia, _ in membresias]
+    membresia_ids = [
+        membresia.id
+        for membresia, _ in membresias
+    ]
 
     pagos_rows = (
         db.query(Pago)
@@ -1058,19 +1460,25 @@ def listar_cuentas_gimnasio(
 
     for membresia, paciente in membresias:
         precio = float(membresia.precio or 0)
+
         pagos = pagos_por_membresia.get(membresia.id, [])
-        pagos_no_anulados = [pago for pago in pagos if not bool(pago.anulado)]
+        pagos_no_anulados = [
+            pago for pago in pagos
+            if not bool(pago.anulado)
+        ]
 
         pagado_caja_verificado = sum(
             float(pago.monto or 0)
             for pago in pagos_no_anulados
-            if pago.estadopago == 2 and not bool(getattr(pago, "espagoprevio", False))
+            if pago.estadopago == 2
+            and not bool(getattr(pago, "espagoprevio", False))
         )
 
         pago_previo_verificado = sum(
             float(pago.monto or 0)
             for pago in pagos_no_anulados
-            if pago.estadopago == 2 and bool(getattr(pago, "espagoprevio", False))
+            if pago.estadopago == 2
+            and bool(getattr(pago, "espagoprevio", False))
         )
 
         pagado_verificado = pagado_caja_verificado + pago_previo_verificado
@@ -1139,7 +1547,6 @@ def listar_cuentas_gimnasio(
     return resultado
 
 
-
 # ============================================================
 # REGISTRAR PAGO PREVIO DE TERAPIAS
 # ============================================================
@@ -1157,10 +1564,8 @@ def registrar_pago_previo_tratamiento(
     """
     Registra dinero que el paciente ya había pagado antes de usar el sistema.
 
-    Solo aplica para terapias/tratamientos. Para gimnasio existe
-    /api/pagos/pago-previo-gimnasio.
     Este movimiento reduce el saldo del tratamiento, pero no debe contarse
-    como ingreso de caja del día ni como método de pago cobrado ahora.
+    como ingreso de caja del día.
     """
     paciente = _validar_paciente(
         db=db,
@@ -1188,7 +1593,8 @@ def registrar_pago_previo_tratamiento(
         estadopago=2,
         creado_por_id=current_user.id,
         verificado_por_id=current_user.id,
-        fecha_verificacion=now_ecuador(),
+        fechapago=now_utc(),
+        fecha_verificacion=now_utc(),
         motivo_rechazo=None,
         espagoprevio=True,
         fechapagoreal=data.fechapagoreal,
@@ -1205,8 +1611,6 @@ def registrar_pago_previo_tratamiento(
     )
 
     return nuevo_pago
-
-
 
 
 # ============================================================
@@ -1226,10 +1630,6 @@ def registrar_pago_previo_gimnasio(
     """
     Registra dinero que el paciente ya había pagado por gimnasio antes
     de usar el sistema.
-
-    Aplica para membresías mensuales de gimnasio que ya estaban en curso.
-    Reduce el saldo de la membresía, pero no debe contarse como ingreso
-    de caja del día ni como método de pago cobrado ahora.
     """
     paciente = _validar_paciente(
         db=db,
@@ -1263,7 +1663,8 @@ def registrar_pago_previo_gimnasio(
         estadopago=2,
         creado_por_id=current_user.id,
         verificado_por_id=current_user.id,
-        fecha_verificacion=now_ecuador(),
+        fechapago=now_utc(),
+        fecha_verificacion=now_utc(),
         motivo_rechazo=None,
         espagoprevio=True,
         fechapagoreal=data.fechapagoreal,
@@ -1283,6 +1684,87 @@ def registrar_pago_previo_gimnasio(
 
 
 # ============================================================
+# RECUPERACIÓN DE CARTERA
+# Dinero cobrado hoy por atenciones anteriores al sistema.
+# SÍ entra a caja. NO reduce saldos ni genera comisión automática.
+# ============================================================
+
+@router.post(
+    "/recuperacion-cartera",
+    response_model=PagoOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def registrar_recuperacion_cartera(
+    data: RecuperacionCarteraCreate,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(get_current_secretary),
+):
+    """
+    Registra dinero cobrado hoy por deuda anterior al inicio del sistema.
+
+    Ejemplo: el paciente paga $36 hoy; $9 pertenecen a la sesión registrada
+    esta semana y $27 corresponden a atenciones anteriores que no existen en
+    el sistema. Los $27 se registran aquí para que entren a caja sin crear
+    saldo a favor ni sesiones falsas.
+    """
+    _validar_paciente(
+        db=db,
+        pacienteid=data.pacienteid,
+        current_user=current_user,
+    )
+
+    metodo = (data.metodopago or "").strip()
+
+    if not metodo:
+        raise HTTPException(
+            status_code=400,
+            detail="Seleccione un método de pago.",
+        )
+
+    if _es_transferencia(metodo):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Por ahora la recuperación de cartera solo acepta efectivo "
+                "o tarjeta. Para transferencias se debe registrar y verificar "
+                "con comprobante en una actualización posterior."
+            ),
+        )
+
+    observacion = (data.observacion_cartera or "").strip() or None
+
+    nuevo_pago = Pago(
+        pacienteid=data.pacienteid,
+        pacientepaqueteid=None,
+        tratamientopacienteid=None,
+        membresiagimnasioid=None,
+        monto=float(data.monto),
+        metodopago=metodo,
+        numerocomprobante=None,
+        comprobanteurl=None,
+        estadopago=2,
+        creado_por_id=current_user.id,
+        verificado_por_id=current_user.id,
+        fechapago=now_utc(),
+        fecha_verificacion=now_utc(),
+        motivo_rechazo=None,
+        espagoprevio=False,
+        esrecuperacioncartera=True,
+        fechapagoreal=data.fechapagoreal,
+        observacion_cartera=observacion,
+    )
+
+    db.add(nuevo_pago)
+    db.flush()
+
+    respuesta = PagoOut.model_validate(nuevo_pago)
+
+    db.commit()
+
+    return respuesta
+
+
+# ============================================================
 # URL FIRMADA DEL COMPROBANTE
 # ============================================================
 
@@ -1292,7 +1774,7 @@ def obtener_url_comprobante(
     db: Session = Depends(get_db),
     current_user: Usuario = Depends(get_current_user),
 ):
-    pago = _obtener_pago_con_acceso(
+    pago, _ = _obtener_pago_con_acceso(
         db=db,
         pago_id=pago_id,
         current_user=current_user,
@@ -1336,6 +1818,8 @@ def registrar_pago(
         db=db,
         pacienteid=pago.pacienteid,
         current_user=current_user,
+        tratamientopacienteid=pago.tratamientopacienteid,
+        permitir_atencion_compartida=True,
     )
 
     paciente_paquete = _validar_paciente_paquete(
@@ -1390,22 +1874,25 @@ def registrar_pago(
     data["estadopago"] = 2
     data["creado_por_id"] = current_user.id
     data["verificado_por_id"] = current_user.id
-    data["fecha_verificacion"] = now_ecuador()
+    data["fechapago"] = now_utc()
+    data["fecha_verificacion"] = now_utc()
     data["motivo_rechazo"] = None
 
     nuevo_pago = Pago(**data)
 
     db.add(nuevo_pago)
-    db.commit()
-    db.refresh(nuevo_pago)
+    db.flush()
 
-    return nuevo_pago
+    respuesta = PagoOut.model_validate(nuevo_pago)
+
+    db.commit()
+
+    return respuesta
 
 
 # ============================================================
 # REGISTRAR PAGO CON COMPROBANTE
 # Transferencia => pendiente de verificación
-# También permite efectivo/tarjeta sin archivo si lo usas desde el mismo form
 # ============================================================
 
 @router.post(
@@ -1435,6 +1922,8 @@ async def registrar_pago_con_comprobante(
         db=db,
         pacienteid=pacienteid,
         current_user=current_user,
+        tratamientopacienteid=tratamientopacienteid,
+        permitir_atencion_compartida=True,
     )
 
     if monto <= 0:
@@ -1481,6 +1970,19 @@ async def registrar_pago_con_comprobante(
         monto=monto,
     )
 
+    current_user_id = current_user.id
+
+    paciente_ref = SimpleNamespace(
+        id=paciente.id,
+        consultorioid=paciente.consultorioid,
+        nombres=paciente.nombres,
+        apellidos=paciente.apellidos,
+    )
+
+    # Liberar conexión antes de subir imagen.
+    db.rollback()
+    db.close()
+
     comprobante_path = None
     estado_pago = _estado_pago_por_metodo(metodo)
 
@@ -1509,41 +2011,96 @@ async def registrar_pago_con_comprobante(
         comprobante_path = None
         estado_pago = 2
 
-    nuevo_pago = Pago(
-        pacienteid=pacienteid,
-        pacientepaqueteid=pacientepaqueteid,
-        tratamientopacienteid=tratamientopacienteid,
-        membresiagimnasioid=membresiagimnasioid,
-        monto=monto,
-        metodopago=metodo,
-        numerocomprobante=numerocomprobante.strip() if numerocomprobante else None,
-        comprobanteurl=comprobante_path,
-        estadopago=estado_pago,
-        creado_por_id=current_user.id,
-        verificado_por_id=None if estado_pago == 1 else current_user.id,
-        fecha_verificacion=None if estado_pago == 1 else now_ecuador(),
-        motivo_rechazo=None,
-    )
-
-    db.add(nuevo_pago)
-    db.flush()
-
-    if estado_pago == 1:
-        _notificar_pago_transferencia_pendiente(
-            db=db,
-            pago=nuevo_pago,
-            paciente=paciente,
-            current_user=current_user,
+    try:
+        # Reconsultar usuario después del db.close().
+        current_user_db = (
+            db.query(Usuario)
+            .filter(
+                Usuario.id == current_user_id,
+                Usuario.activo == True,
+            )
+            .first()
         )
 
-    db.commit()
-    db.refresh(nuevo_pago)
+        if not current_user_db:
+            raise HTTPException(
+                status_code=401,
+                detail="Usuario no encontrado o inactivo.",
+            )
 
-    return nuevo_pago
+        # Reconsultar entidades después del db.close().
+        paciente_paquete_actual = _validar_paciente_paquete(
+            db=db,
+            pacienteid=pacienteid,
+            pacientepaqueteid=pacientepaqueteid,
+        )
+
+        _validar_tratamiento_paciente(
+            db=db,
+            pacienteid=pacienteid,
+            tratamientopacienteid=tratamientopacienteid,
+        )
+
+        membresia_gimnasio_actual = _validar_membresia_gimnasio(
+            db=db,
+            pacienteid=pacienteid,
+            membresiagimnasioid=membresiagimnasioid,
+        )
+
+        # Revalidar saldo después del upload.
+        _validar_saldo_paquete(
+            db=db,
+            paciente_paquete=paciente_paquete_actual,
+            monto=monto,
+        )
+
+        _validar_saldo_membresia_gimnasio(
+            db=db,
+            membresia=membresia_gimnasio_actual,
+            monto=monto,
+        )
+
+        nuevo_pago = Pago(
+            pacienteid=pacienteid,
+            pacientepaqueteid=pacientepaqueteid,
+            tratamientopacienteid=tratamientopacienteid,
+            membresiagimnasioid=membresiagimnasioid,
+            monto=monto,
+            metodopago=metodo,
+            numerocomprobante=numerocomprobante.strip() if numerocomprobante else None,
+            comprobanteurl=comprobante_path,
+            estadopago=estado_pago,
+            creado_por_id=current_user_db.id,
+            verificado_por_id=None if estado_pago == 1 else current_user_db.id,
+            fechapago=now_utc(),
+            fecha_verificacion=None if estado_pago == 1 else now_utc(),
+            motivo_rechazo=None,
+        )
+
+        db.add(nuevo_pago)
+        db.flush()
+
+        if estado_pago == 1:
+            _notificar_pago_transferencia_pendiente(
+                db=db,
+                pago=nuevo_pago,
+                paciente=paciente_ref,
+                current_user=current_user_db,
+            )
+
+        respuesta = PagoOut.model_validate(nuevo_pago)
+
+        db.commit()
+
+        return respuesta
+
+    except Exception:
+        db.rollback()
+        raise
 
 
 # ============================================================
-# VERIFICAR / RECHAZAR PAGO
+# ANULAR / VERIFICAR / RECHAZAR PAGO
 # ============================================================
 
 @router.put("/{pago_id}/anular", response_model=PagoOut)
@@ -1553,7 +2110,6 @@ def anular_pago(
     db: Session = Depends(get_db),
     current_user: Usuario = Depends(get_current_user),
 ):
-    # Solo jefe o secretario
     if current_user.rol not in [1, 3]:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -1576,7 +2132,7 @@ def anular_pago(
 
     pago.anulado = True
     pago.anulado_por_id = current_user.id
-    pago.fecha_anulacion = datetime.now(timezone.utc)
+    pago.fecha_anulacion = now_utc()
     pago.motivo_anulacion = data.motivo_anulacion.strip()
 
     db.commit()
@@ -1584,29 +2140,22 @@ def anular_pago(
 
     return pago
 
+
 @router.patch("/{pago_id}/verificar", response_model=PagoOut)
 def verificar_pago(
     pago_id: int,
     db: Session = Depends(get_db),
     current_user: Usuario = Depends(get_current_secretary),
 ):
-    pago = _obtener_pago_con_acceso(
+    pago, paciente = _obtener_pago_con_acceso(
         db=db,
         pago_id=pago_id,
         current_user=current_user,
     )
 
-    paciente = db.query(Paciente).filter(Paciente.id == pago.pacienteid).first()
-
-    if not paciente:
-        raise HTTPException(
-            status_code=404,
-            detail="Paciente del pago no encontrado.",
-        )
-
     pago.estadopago = 2
     pago.verificado_por_id = current_user.id
-    pago.fecha_verificacion = now_ecuador()
+    pago.fecha_verificacion = now_utc()
     pago.motivo_rechazo = None
 
     _notificar_resultado_pago_transferencia(
@@ -1630,23 +2179,15 @@ def rechazar_pago(
     db: Session = Depends(get_db),
     current_user: Usuario = Depends(get_current_secretary),
 ):
-    pago = _obtener_pago_con_acceso(
+    pago, paciente = _obtener_pago_con_acceso(
         db=db,
         pago_id=pago_id,
         current_user=current_user,
     )
 
-    paciente = db.query(Paciente).filter(Paciente.id == pago.pacienteid).first()
-
-    if not paciente:
-        raise HTTPException(
-            status_code=404,
-            detail="Paciente del pago no encontrado.",
-        )
-
     pago.estadopago = 3
     pago.verificado_por_id = current_user.id
-    pago.fecha_verificacion = now_ecuador()
+    pago.fecha_verificacion = now_utc()
     pago.motivo_rechazo = (
         motivo_rechazo.strip()
         if motivo_rechazo and motivo_rechazo.strip()

@@ -2,8 +2,8 @@ from datetime import date, datetime, time, timedelta, timezone
 from typing import Dict, List, Optional, Set, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import Date, cast, exists, func, or_
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import Date, and_, cast, exists, func, or_
+from sqlalchemy.orm import Session, aliased, joinedload
 
 from ..models.alerta import Alerta
 from ..models.notificacion import Notificacion
@@ -72,6 +72,39 @@ def now_ecuador() -> datetime:
 
 def fecha_ecuador() -> date:
     return now_ecuador().date()
+
+def rango_fechas_ecuador(desde: date, hasta: date) -> tuple[datetime, datetime]:
+    """Devuelve [inicio, fin) del rango usando día calendario de Ecuador.
+
+    Los pagos se guardan en UTC, pero los cortes de caja/reportes deben
+    hacerse por fecha de Ecuador, sin depender de la zona horaria de Render
+    ni de Supabase.
+    """
+    inicio = datetime.combine(desde, time.min).replace(tzinfo=ECUADOR_TZ)
+    fin = datetime.combine(hasta + timedelta(days=1), time.min).replace(
+        tzinfo=ECUADOR_TZ
+    )
+    return inicio, fin
+
+
+def filtro_fechapago_ecuador(desde: date, hasta: date):
+    inicio, fin = rango_fechas_ecuador(desde, hasta)
+    return and_(
+        Pago.fechapago >= inicio,
+        Pago.fechapago < fin,
+    )
+
+
+def fecha_pago_ecuador_expr():
+    """Fecha local de Ecuador para agrupar pagos por día."""
+    return cast(func.timezone("America/Guayaquil", Pago.fechapago), Date)
+
+
+def fin_dia_ecuador(fecha: date) -> datetime:
+    return datetime.combine(fecha + timedelta(days=1), time.min).replace(
+        tzinfo=ECUADOR_TZ
+    )
+
 
 
 def _nombre_usuario(usuario: Optional[Usuario]) -> str:
@@ -150,14 +183,58 @@ def _pago_no_anulado_filter():
 def _pago_de_caja_filter():
     """Pagos que sí representan dinero cobrado dentro del sistema.
 
-    Los pagos previos reducen saldos, pero no deben entrar al cuadre
-    de caja, ingresos del día ni gráficos por método de pago.
+    Excluye pagos previos porque reducen saldos, pero no son caja actual.
+    Incluye recuperación de cartera porque ese dinero se cobra hoy, aunque
+    no esté asociado a una sesión/tratamiento registrado.
     """
     return or_(Pago.espagoprevio == False, Pago.espagoprevio.is_(None))
 
 
+def _query_recuperacion_cartera(
+    db: Session,
+    current_user: Usuario,
+    desde: date,
+    hasta: date,
+    terapeutaid: Optional[int] = None,
+    consultorioid: Optional[int] = None,
+):
+    """Pagos de recuperación de cartera para caja/reportes.
+
+    No se asocian a tratamiento, sesión ni terapeuta, por eso:
+    - se muestran solo como caja recuperada;
+    - no se suman a productividad ni a comisión de fisioterapeuta;
+    - si se filtra por terapeuta, no deben aparecer.
+    """
+    query = db.query(Pago).filter(
+        Pago.esrecuperacioncartera == True,
+        Pago.estadopago == 2,
+        _pago_no_anulado_filter(),
+        filtro_fechapago_ecuador(desde, hasta),
+    )
+
+    if current_user.rol == 2 or terapeutaid is not None:
+        return query.filter(Pago.id == -1)
+
+    consultorio_resuelto = _resolver_consultorioid_para_rol(
+        current_user,
+        consultorioid,
+    )
+
+    if consultorio_resuelto is not None:
+        cobrador = aliased(Usuario)
+        query = query.join(
+            cobrador,
+            cobrador.id == Pago.creado_por_id,
+        ).filter(
+            cobrador.consultorioid == consultorio_resuelto,
+        )
+
+    return query
+
+
+
 def _default_range(desde: Optional[date], hasta: Optional[date]) -> tuple[date, date]:
-    today = date.today()
+    today = fecha_ecuador()
 
     if desde is None:
         desde = today.replace(day=1)
@@ -266,6 +343,59 @@ def _validar_terapeuta_para_secretario(
         )
 
 
+def _sesion_finalizada_tratamiento_en_consultorio_exists(consultorioid: int):
+    """
+    Pacientes compartidos:
+    Un tratamiento también pertenece operativamente a un consultorio si
+    ya tiene sesiones finalizadas atendidas por terapeutas de ese consultorio.
+    Así Atahualpa ve la sesión de un paciente del Centro si fue atendido
+    por una terapeuta de Atahualpa.
+    """
+    terapeuta_sesion = aliased(Usuario)
+
+    return exists().where(
+        and_(
+            SesionTerapia.tratamientopacienteid == TratamientoPaciente.id,
+            SesionTerapia.terapeutaid == terapeuta_sesion.id,
+            terapeuta_sesion.consultorioid == consultorioid,
+            SesionTerapia.horasalida != None,
+        )
+    )
+
+
+def _tratamiento_visible_para_consultorio_filter(consultorioid: int):
+    """
+    Visibilidad por consultorio para tratamientos/pagos de terapia.
+
+    Incluye:
+    1. Pacientes registrados en el consultorio.
+    2. Pacientes de otro consultorio que ya fueron atendidos por un
+       terapeuta del consultorio actual.
+    """
+    return or_(
+        Paciente.consultorioid == consultorioid,
+        _sesion_finalizada_tratamiento_en_consultorio_exists(consultorioid),
+    )
+
+
+def _tratamiento_visible_para_terapeuta_filter(terapeutaid: int):
+    """
+    Visibilidad para terapeutas:
+    - Pacientes asignados directamente.
+    - Pacientes compartidos/cedidos que ya tienen una sesión atendida por él.
+    """
+    return or_(
+        Paciente.terapeutaasignadoid == terapeutaid,
+        exists().where(
+            and_(
+                SesionTerapia.tratamientopacienteid == TratamientoPaciente.id,
+                SesionTerapia.terapeutaid == terapeutaid,
+                SesionTerapia.horasalida != None,
+            )
+        ),
+    )
+
+
 def _aplicar_filtros_sesiones(
     query,
     current_user: Usuario,
@@ -287,11 +417,14 @@ def _aplicar_filtros_sesiones(
         query = query.filter(SesionTerapia.terapeutaid == terapeutaid)
 
     if consultorioid is not None:
+        # Consultorio operativo: se filtra por el consultorio del terapeuta
+        # que atendió, no por el consultorio de origen del paciente.
+        terapeuta_sesion = aliased(Usuario)
         query = query.join(
-            Paciente,
-            Paciente.id == SesionTerapia.pacienteid,
+            terapeuta_sesion,
+            terapeuta_sesion.id == SesionTerapia.terapeutaid,
         ).filter(
-            Paciente.consultorioid == consultorioid,
+            terapeuta_sesion.consultorioid == consultorioid,
         )
 
     return query
@@ -314,13 +447,19 @@ def _aplicar_filtros_tratamientos(
     query = query.join(Paciente, Paciente.id == TratamientoPaciente.pacienteid)
 
     if current_user.rol == 2:
-        query = query.filter(Paciente.terapeutaasignadoid == current_user.id)
+        query = query.filter(
+            _tratamiento_visible_para_terapeuta_filter(current_user.id)
+        )
 
     elif terapeutaid is not None:
-        query = query.filter(Paciente.terapeutaasignadoid == terapeutaid)
+        query = query.filter(
+            _tratamiento_visible_para_terapeuta_filter(terapeutaid)
+        )
 
     if consultorioid is not None:
-        query = query.filter(Paciente.consultorioid == consultorioid)
+        query = query.filter(
+            _tratamiento_visible_para_consultorio_filter(consultorioid)
+        )
 
     return query
 
@@ -348,13 +487,19 @@ def _aplicar_filtros_pagos(
     )
 
     if current_user.rol == 2:
-        query = query.filter(Paciente.terapeutaasignadoid == current_user.id)
+        query = query.filter(
+            _tratamiento_visible_para_terapeuta_filter(current_user.id)
+        )
 
     elif terapeutaid is not None:
-        query = query.filter(Paciente.terapeutaasignadoid == terapeutaid)
+        query = query.filter(
+            _tratamiento_visible_para_terapeuta_filter(terapeutaid)
+        )
 
     if consultorioid is not None:
-        query = query.filter(Paciente.consultorioid == consultorioid)
+        query = query.filter(
+            _tratamiento_visible_para_consultorio_filter(consultorioid)
+        )
 
     return query
 
@@ -414,7 +559,7 @@ def _pagos_gimnasio_por_terapeuta(
             Pago.estadopago == 2,
             _pago_no_anulado_filter(),
             _pago_de_caja_filter(),
-            cast(Pago.fechapago, Date).between(desde, hasta),
+            filtro_fechapago_ecuador(desde, hasta),
             Paciente.terapeutaasignadoid != None,
             Usuario.rol == 2,
             Usuario.activo == True,
@@ -474,7 +619,7 @@ def _pagos_gimnasio_por_consultorio(
             Pago.estadopago == 2,
             _pago_no_anulado_filter(),
             _pago_de_caja_filter(),
-            cast(Pago.fechapago, Date).between(desde, hasta),
+            filtro_fechapago_ecuador(desde, hasta),
         )
     )
 
@@ -706,7 +851,7 @@ def _pagos_aplicados_a_rango_por_tratamiento(
             _pago_no_anulado_filter(),
             or_(
                 Pago.espagoprevio == True,
-                cast(Pago.fechapago, Date) <= hasta,
+                Pago.fechapago < fin_dia_ecuador(hasta),
             ),
         )
         .group_by(Pago.tratamientopacienteid)
@@ -856,9 +1001,13 @@ def dashboard_acciones(
         )
 
     if consultorio_resuelto is not None:
+        # Consultorio operativo: cuenta la sesión para el consultorio del
+        # terapeuta que atendió, aunque el paciente sea de otra sede.
+        terapeuta_sesion = aliased(Usuario)
         sesiones_q = sesiones_q.join(
-            Paciente, Paciente.id == SesionTerapia.pacienteid
-        ).filter(Paciente.consultorioid == consultorio_resuelto)
+            terapeuta_sesion,
+            terapeuta_sesion.id == SesionTerapia.terapeutaid,
+        ).filter(terapeuta_sesion.consultorioid == consultorio_resuelto)
 
     row_sesiones = sesiones_q.one()
     sesiones_hoy = row_sesiones.hoy or 0
@@ -934,16 +1083,16 @@ def dashboard_acciones(
 
     if current_user.rol == 2:
         tratamientos_q = tratamientos_q.filter(
-            Paciente.terapeutaasignadoid == current_user.id
+            _tratamiento_visible_para_terapeuta_filter(current_user.id)
         )
     elif terapeutaid is not None:
         tratamientos_q = tratamientos_q.filter(
-            Paciente.terapeutaasignadoid == terapeutaid
+            _tratamiento_visible_para_terapeuta_filter(terapeutaid)
         )
 
     if consultorio_resuelto is not None:
         tratamientos_q = tratamientos_q.filter(
-            Paciente.consultorioid == consultorio_resuelto
+            _tratamiento_visible_para_consultorio_filter(consultorio_resuelto)
         )
 
     row_trat = tratamientos_q.one()
@@ -971,15 +1120,15 @@ def dashboard_acciones(
 
     if current_user.rol == 2:
         pagos_q = pagos_q.filter(
-            Paciente.terapeutaasignadoid == current_user.id
+            _tratamiento_visible_para_terapeuta_filter(current_user.id)
         )
     elif terapeutaid is not None:
         pagos_q = pagos_q.filter(
-            Paciente.terapeutaasignadoid == terapeutaid
+            _tratamiento_visible_para_terapeuta_filter(terapeutaid)
         )
     if consultorio_resuelto is not None:
         pagos_q = pagos_q.filter(
-            Paciente.consultorioid == consultorio_resuelto
+            _tratamiento_visible_para_consultorio_filter(consultorio_resuelto)
         )
 
     transferencias_pendientes = pagos_q.scalar() or 0
@@ -1071,7 +1220,7 @@ def dashboard_resumen(
     db: Session = Depends(get_db),
     current_user: Usuario = Depends(get_current_user),
 ):
-    hoy = date.today()
+    hoy = fecha_ecuador()
 
     sesiones_hoy_query = db.query(SesionTerapia).filter(
         SesionTerapia.fecha == hoy
@@ -1107,7 +1256,7 @@ def dashboard_resumen(
     tratamientos_activos = tratamientos_activos_query.count()
 
     pagos_hoy_query = db.query(Pago).filter(
-        cast(Pago.fechapago, Date) == hoy,
+        filtro_fechapago_ecuador(hoy, hoy),
         Pago.estadopago == 2,
         _pago_no_anulado_filter(),
         _pago_de_caja_filter(),
@@ -1479,7 +1628,7 @@ def reporte_terapias(
     )
 
     pagos_query = db.query(Pago).filter(
-        cast(Pago.fechapago, Date).between(desde, hasta),
+        filtro_fechapago_ecuador(desde, hasta),
         Pago.estadopago == 2,
         _pago_no_anulado_filter(),
         _pago_de_caja_filter(),
@@ -1546,20 +1695,63 @@ def reporte_terapias(
                     2,
                 )
 
+    fecha_pago_expr = fecha_pago_ecuador_expr()
+
     pagos_por_dia = (
         pagos_query
         .with_entities(
-            cast(Pago.fechapago, Date),
+            fecha_pago_expr.label("fecha_pago"),
             func.coalesce(func.sum(Pago.monto), 0),
         )
-        .group_by(cast(Pago.fechapago, Date))
+        .group_by(fecha_pago_expr)
         .all()
     )
 
     for fecha_pago, total in pagos_por_dia:
         if fecha_pago in dias_map:
             dias_map[fecha_pago].pagos_verificados = round(
-                float(total or 0),
+                dias_map[fecha_pago].pagos_verificados + float(total or 0),
+                2,
+            )
+
+    recuperacion_cartera_query = _query_recuperacion_cartera(
+        db=db,
+        current_user=current_user,
+        desde=desde,
+        hasta=hasta,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+    )
+
+    total_recuperacion_cartera = float(
+        recuperacion_cartera_query
+        .with_entities(func.coalesce(func.sum(Pago.monto), 0))
+        .scalar()
+        or 0
+    )
+
+    if total_recuperacion_cartera > 0:
+        por_metodo.append(
+            MetodoPagoTotalOut(
+                metodo="Recuperación de cartera",
+                total=round(total_recuperacion_cartera, 2),
+            )
+        )
+
+    recuperacion_por_dia = (
+        recuperacion_cartera_query
+        .with_entities(
+            fecha_pago_expr.label("fecha_pago"),
+            func.coalesce(func.sum(Pago.monto), 0),
+        )
+        .group_by(fecha_pago_expr)
+        .all()
+    )
+
+    for fecha_pago, total in recuperacion_por_dia:
+        if fecha_pago in dias_map:
+            dias_map[fecha_pago].pagos_verificados = round(
+                dias_map[fecha_pago].pagos_verificados + float(total or 0),
                 2,
             )
 
