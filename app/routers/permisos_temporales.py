@@ -17,6 +17,7 @@ from ..schemas.permiso_temporal import (
     TIPO_ADMIN_TEMPORAL,
     TIPO_CREAR_TRATAMIENTOS,
     TIPO_REGISTRO_RETROACTIVO,
+    TIPO_ATENCION_SUCURSAL_TEMPORAL,
 )
 
 router = APIRouter(
@@ -28,6 +29,7 @@ TIPOS_PERMITIDOS = {
     TIPO_REGISTRO_RETROACTIVO,
     TIPO_ADMIN_TEMPORAL,
     TIPO_CREAR_TRATAMIENTOS,
+    TIPO_ATENCION_SUCURSAL_TEMPORAL,
 }
 
 
@@ -38,6 +40,10 @@ def now_ecuador() -> datetime:
     return datetime.now(timezone(timedelta(hours=-5)))
 
 
+def _normalizar_fecha_programada(fecha: datetime) -> datetime:
+    if fecha.tzinfo is None:
+        fecha = fecha.replace(tzinfo=timezone(timedelta(hours=-5)))
+    return fecha.astimezone(timezone.utc)
 
 
 def _normalizar_rango_permiso(data: PermisoTemporalCreate) -> tuple[datetime, datetime]:
@@ -54,6 +60,17 @@ def _normalizar_rango_permiso(data: PermisoTemporalCreate) -> tuple[datetime, da
       y se aplica desde la hora del servidor.
     - Si no hay datos válidos, se usa 8 horas por defecto.
     """
+    if data.tipo_permiso == TIPO_ATENCION_SUCURSAL_TEMPORAL:
+        if data.fecha_inicio is None or data.fecha_fin is None:
+            raise HTTPException(status_code=400, detail="Para atención temporal por sucursal debes enviar fecha_inicio y fecha_fin.")
+        fecha_inicio = _normalizar_fecha_programada(data.fecha_inicio)
+        fecha_fin = _normalizar_fecha_programada(data.fecha_fin)
+        if fecha_fin <= fecha_inicio:
+            raise HTTPException(status_code=400, detail="La fecha fin debe ser mayor que la fecha inicio.")
+        if (fecha_fin - fecha_inicio).total_seconds() > 72 * 3600:
+            raise HTTPException(status_code=400, detail="El permiso no puede durar más de 72 horas.")
+        return fecha_inicio, fecha_fin
+
     inicio_servidor = now_utc()
 
     duracion_horas = getattr(data, "duracion_horas", None)
@@ -105,6 +122,9 @@ def _tipo_permiso_legible(tipo_permiso: str) -> str:
     if tipo_permiso == TIPO_CREAR_TRATAMIENTOS:
         return "creación temporal de tratamientos"
 
+    if tipo_permiso == TIPO_ATENCION_SUCURSAL_TEMPORAL:
+        return "atención temporal por sucursal"
+
     return tipo_permiso.replace("_", " ")
 
 
@@ -137,6 +157,15 @@ def _mensaje_permiso_otorgado(
             "Se te otorgó permiso para crear tratamientos temporalmente.\n"
             "Alcance: solo pacientes a los que ya tienes acceso.\n"
             f"Válido hasta: {fecha_fin}.\n"
+            f"Autorizado por: {autorizador_nombre}."
+        )
+    elif permiso.tipo_permiso == TIPO_ATENCION_SUCURSAL_TEMPORAL:
+        fecha_inicio = _formatear_fecha_permiso(permiso.fecha_inicio)
+        mensaje = (
+            "Se programó tu permiso de atención por sucursal.\n"
+            "Podrás atender pacientes de tu consultorio durante el rango autorizado.\n"
+            f"Inicio: {fecha_inicio}.\n"
+            f"Fin: {fecha_fin}.\n"
             f"Autorizado por: {autorizador_nombre}."
         )
     else:
@@ -270,12 +299,16 @@ def _validar_autorizador(
     if current_user.rol == 1:
         validar_consultorio_secretario(current_user, current_user.consultorioid)
 
-        if tipo_permiso not in (TIPO_REGISTRO_RETROACTIVO, TIPO_CREAR_TRATAMIENTOS):
+        if tipo_permiso not in (
+            TIPO_REGISTRO_RETROACTIVO,
+            TIPO_CREAR_TRATAMIENTOS,
+            TIPO_ATENCION_SUCURSAL_TEMPORAL,
+        ):
             raise HTTPException(
                 status_code=403,
                 detail=(
-                    "El secretario solo puede activar permisos de registro "
-                    "retroactivo o creación temporal de tratamientos."
+                    "El secretario solo puede activar permisos de registro retroactivo, "
+                    "creación temporal de tratamientos o atención temporal por sucursal."
                 ),
             )
 
@@ -463,6 +496,9 @@ def crear_permiso_temporal(
         dias_atras_permitidos = hoy_ecuador.weekday()
 
     if data.tipo_permiso == TIPO_CREAR_TRATAMIENTOS:
+        dias_atras_permitidos = 0
+
+    if data.tipo_permiso == TIPO_ATENCION_SUCURSAL_TEMPORAL:
         dias_atras_permitidos = 0
 
     if data.tipo_permiso == TIPO_ADMIN_TEMPORAL:

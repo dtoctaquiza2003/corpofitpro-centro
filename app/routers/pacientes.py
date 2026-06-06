@@ -17,6 +17,8 @@ from ..schemas.paciente import PacienteCreate, PacienteOut, PacientesPageOut
 from ..auth.permissions import (
     validar_acceso_paciente_por_rol,
     validar_consultorio_secretario,
+    tiene_permiso_temporal,
+    TIPO_ATENCION_SUCURSAL_TEMPORAL,
 )
 
 router = APIRouter(prefix="/api/pacientes", tags=["pacientes"])
@@ -223,12 +225,22 @@ def listar_pacientes_paginado(
         terapeuta_para_compartidos = current_user.id
         compartidos_subq = _compartidos_subquery(db, current_user.id)
 
-        query = db.query(Paciente).filter(
-            or_(
-                Paciente.terapeutaasignadoid == current_user.id,
-                Paciente.id.in_(compartidos_subq),
+        condiciones = [
+            Paciente.terapeutaasignadoid == current_user.id,
+            Paciente.id.in_(compartidos_subq),
+        ]
+
+        if (
+            current_user.consultorioid is not None
+            and tiene_permiso_temporal(
+                db=db,
+                usuario=current_user,
+                tipo_permiso=TIPO_ATENCION_SUCURSAL_TEMPORAL,
             )
-        )
+        ):
+            condiciones.append(Paciente.consultorioid == current_user.consultorioid)
+
+        query = db.query(Paciente).filter(or_(*condiciones))
 
         query = _aplicar_busqueda_pacientes(query, search)
 

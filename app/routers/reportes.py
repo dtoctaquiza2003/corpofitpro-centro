@@ -106,6 +106,38 @@ def fin_dia_ecuador(fecha: date) -> datetime:
     )
 
 
+def _validar_dia_semana(dia_semana: Optional[int]) -> Optional[int]:
+    if dia_semana is None:
+        return None
+    if dia_semana < 0 or dia_semana > 6:
+        raise HTTPException(
+            status_code=400,
+            detail="El día de la semana debe estar entre 0=Lunes y 6=Domingo.",
+        )
+    return dia_semana
+
+
+def _aplicar_filtro_dia_sesion(query, dia_semana: Optional[int]):
+    dia_semana = _validar_dia_semana(dia_semana)
+    if dia_semana is None:
+        return query
+    return query.filter(func.extract("isodow", SesionTerapia.fecha) == dia_semana + 1)
+
+
+def filtro_dia_pago_ecuador(dia_semana: Optional[int]):
+    dia_semana = _validar_dia_semana(dia_semana)
+    if dia_semana is None:
+        return True
+    return func.extract("isodow", func.timezone("America/Guayaquil", Pago.fechapago)) == dia_semana + 1
+
+
+def _generar_dias_reporte_filtrados(desde: date, hasta: date, dia_semana: Optional[int]) -> List[ReporteDiaOut]:
+    dias = _generar_dias_reporte(desde, hasta)
+    dia_semana = _validar_dia_semana(dia_semana)
+    if dia_semana is None:
+        return dias
+    return [item for item in dias if item.fecha.weekday() == dia_semana]
+
 
 def _nombre_usuario(usuario: Optional[Usuario]) -> str:
     if not usuario:
@@ -197,6 +229,7 @@ def _query_recuperacion_cartera(
     hasta: date,
     terapeutaid: Optional[int] = None,
     consultorioid: Optional[int] = None,
+    dia_semana: Optional[int] = None,
 ):
     """Pagos de recuperación de cartera para caja/reportes.
 
@@ -210,6 +243,7 @@ def _query_recuperacion_cartera(
         Pago.estadopago == 2,
         _pago_no_anulado_filter(),
         filtro_fechapago_ecuador(desde, hasta),
+        filtro_dia_pago_ecuador(dia_semana),
     )
 
     if current_user.rol == 2 or terapeutaid is not None:
@@ -519,6 +553,7 @@ def _pagos_gimnasio_por_terapeuta(
     hasta: date,
     terapeutaid: Optional[int] = None,
     consultorioid: Optional[int] = None,
+    dia_semana: Optional[int] = None,
 ):
     """
     Pagos verificados de gimnasio mensual y pase diario agrupados por terapeuta.
@@ -560,6 +595,7 @@ def _pagos_gimnasio_por_terapeuta(
             _pago_no_anulado_filter(),
             _pago_de_caja_filter(),
             filtro_fechapago_ecuador(desde, hasta),
+            filtro_dia_pago_ecuador(dia_semana),
             Paciente.terapeutaasignadoid != None,
             Usuario.rol == 2,
             Usuario.activo == True,
@@ -592,6 +628,7 @@ def _pagos_gimnasio_por_consultorio(
     hasta: date,
     terapeutaid: Optional[int] = None,
     consultorioid: Optional[int] = None,
+    dia_semana: Optional[int] = None,
 ):
     """Pagos verificados de gimnasio mensual/diario agrupados por consultorio.
 
@@ -620,6 +657,7 @@ def _pagos_gimnasio_por_consultorio(
             _pago_no_anulado_filter(),
             _pago_de_caja_filter(),
             filtro_fechapago_ecuador(desde, hasta),
+            filtro_dia_pago_ecuador(dia_semana),
         )
     )
 
@@ -1537,10 +1575,12 @@ def reporte_terapias(
     hasta: Optional[date] = Query(None),
     terapeutaid: Optional[int] = Query(None),
     consultorioid: Optional[int] = Query(None),
+    dia_semana: Optional[int] = Query(None, ge=0, le=6),
     db: Session = Depends(get_db),
     current_user: Usuario = Depends(get_current_user),
 ):
     desde, hasta = _default_range(desde, hasta)
+    dia_semana = _validar_dia_semana(dia_semana)
 
     sesiones_query = (
         db.query(SesionTerapia)
@@ -1554,6 +1594,8 @@ def reporte_terapias(
             SesionTerapia.tratamientopacienteid != None,
         )
     )
+
+    sesiones_query = _aplicar_filtro_dia_sesion(sesiones_query, dia_semana)
 
     sesiones_query = _aplicar_filtros_sesiones(
         sesiones_query,
@@ -1629,6 +1671,7 @@ def reporte_terapias(
 
     pagos_query = db.query(Pago).filter(
         filtro_fechapago_ecuador(desde, hasta),
+        filtro_dia_pago_ecuador(dia_semana),
         Pago.estadopago == 2,
         _pago_no_anulado_filter(),
         _pago_de_caja_filter(),
@@ -1664,7 +1707,7 @@ def reporte_terapias(
 
     dias_map: Dict[date, ReporteDiaOut] = {
         item.fecha: item
-        for item in _generar_dias_reporte(desde, hasta)
+        for item in _generar_dias_reporte_filtrados(desde, hasta, dia_semana)
     }
 
     for sesion in sesiones:
@@ -1721,6 +1764,7 @@ def reporte_terapias(
         hasta=hasta,
         terapeutaid=terapeutaid,
         consultorioid=consultorioid,
+        dia_semana=dia_semana,
     )
 
     total_recuperacion_cartera = float(
@@ -1805,10 +1849,12 @@ def reporte_fisioterapeutas_semanal(
     hasta: date,
     terapeutaid: Optional[int] = Query(None),
     consultorioid: Optional[int] = Query(None),
+    dia_semana: Optional[int] = Query(None, ge=0, le=6),
     db: Session = Depends(get_db),
     current_user: Usuario = Depends(get_current_user),
 ):
     desde, hasta = _default_range(desde, hasta)
+    dia_semana = _validar_dia_semana(dia_semana)
 
     sesiones_query = (
         db.query(SesionTerapia)
@@ -1823,6 +1869,8 @@ def reporte_fisioterapeutas_semanal(
             SesionTerapia.tratamientopacienteid != None,
         )
     )
+
+    sesiones_query = _aplicar_filtro_dia_sesion(sesiones_query, dia_semana)
 
     sesiones_query = _aplicar_filtros_sesiones(
         sesiones_query,
@@ -1842,6 +1890,7 @@ def reporte_fisioterapeutas_semanal(
         hasta=hasta,
         terapeutaid=terapeutaid,
         consultorioid=consultorioid,
+        dia_semana=dia_semana,
     )
 
     tratamiento_ids = {
@@ -1987,10 +2036,12 @@ def reporte_fisioterapeuta_detalle(
     desde: date,
     hasta: date,
     consultorioid: Optional[int] = Query(None),
+    dia_semana: Optional[int] = Query(None, ge=0, le=6),
     db: Session = Depends(get_db),
     current_user: Usuario = Depends(get_current_user),
 ):
     desde, hasta = _default_range(desde, hasta)
+    dia_semana = _validar_dia_semana(dia_semana)
 
     _validar_filtros_para_rol(current_user, terapeutaid)
 
@@ -2017,6 +2068,8 @@ def reporte_fisioterapeuta_detalle(
             SesionTerapia.tratamientopacienteid != None,
         )
     )
+
+    sesiones_query = _aplicar_filtro_dia_sesion(sesiones_query, dia_semana)
 
     sesiones_query = _aplicar_filtros_sesiones(
         sesiones_query,
@@ -2138,10 +2191,12 @@ def reporte_clinicas_semanal(
     hasta: date,
     terapeutaid: Optional[int] = Query(None),
     consultorioid: Optional[int] = Query(None),
+    dia_semana: Optional[int] = Query(None, ge=0, le=6),
     db: Session = Depends(get_db),
     current_user: Usuario = Depends(get_current_user),
 ):
     desde, hasta = _default_range(desde, hasta)
+    dia_semana = _validar_dia_semana(dia_semana)
 
     sesiones_query = (
         db.query(SesionTerapia)
@@ -2155,6 +2210,8 @@ def reporte_clinicas_semanal(
             SesionTerapia.tratamientopacienteid != None,
         )
     )
+
+    sesiones_query = _aplicar_filtro_dia_sesion(sesiones_query, dia_semana)
 
     sesiones_query = _aplicar_filtros_sesiones(
         sesiones_query,
@@ -2174,6 +2231,7 @@ def reporte_clinicas_semanal(
         hasta=hasta,
         terapeutaid=terapeutaid,
         consultorioid=consultorioid,
+        dia_semana=dia_semana,
     )
 
     tratamiento_ids = {

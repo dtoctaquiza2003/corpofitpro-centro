@@ -12,6 +12,7 @@ from ..auth.permissions import (
     validar_consultorio_secretario,
     permiso_temporal_activo,
     TIPO_REGISTRO_RETROACTIVO,
+    terapeuta_tiene_permiso_atencion_sucursal_temporal,
 )
 from ..dependencies.db import get_db
 from ..models.alerta import Alerta
@@ -128,6 +129,14 @@ def _terapeuta_puede_atender_paciente(
         db=db,
         paciente_id=paciente.id,
         terapeuta_id=current_user.id,
+    ):
+        return True
+
+    # 4. Permiso temporal de atención por sucursal
+    if terapeuta_tiene_permiso_atencion_sucursal_temporal(
+        db=db,
+        paciente=paciente,
+        current_user=current_user,
     ):
         return True
 

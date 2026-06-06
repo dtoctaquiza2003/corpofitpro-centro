@@ -146,6 +146,13 @@ def validar_acceso_paciente_por_rol(
         ):
             return
 
+        if db is not None and terapeuta_tiene_permiso_atencion_sucursal_temporal(
+            db=db,
+            paciente=paciente,
+            current_user=current_user,
+        ):
+            return
+
         raise HTTPException(
             status_code=403,
             detail="No autorizado para acceder a este paciente.",
@@ -180,6 +187,7 @@ def validar_usuario_mismo_consultorio_para_secretario(
 TIPO_REGISTRO_RETROACTIVO = "registro_retroactivo_sesiones"
 TIPO_ADMIN_TEMPORAL = "administrador_temporal_consultorio"
 TIPO_CREAR_TRATAMIENTOS = "crear_tratamientos_paciente"
+TIPO_ATENCION_SUCURSAL_TEMPORAL = "atencion_sucursal_temporal"
 
 
 def permiso_temporal_activo(
@@ -214,6 +222,32 @@ def tiene_permiso_temporal(
         tipo_permiso=tipo_permiso,
     ) is not None
 
+
+
+
+def terapeuta_tiene_permiso_atencion_sucursal_temporal(
+    db: Session,
+    paciente: Paciente,
+    current_user: Usuario,
+) -> bool:
+    """Permite atención temporal de pacientes del consultorio del terapeuta."""
+    if not es_terapeuta(current_user):
+        return False
+
+    if current_user.consultorioid is None:
+        return False
+
+    permiso = permiso_temporal_activo(
+        db=db,
+        usuario=current_user,
+        tipo_permiso=TIPO_ATENCION_SUCURSAL_TEMPORAL,
+    )
+
+    if permiso is None:
+        return False
+
+    consultorio_permitido = permiso.consultorioid or current_user.consultorioid
+    return paciente.consultorioid == consultorio_permitido
 
 def es_admin_temporal_consultorio(
     db: Session,
