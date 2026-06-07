@@ -1,7 +1,9 @@
 from datetime import date, datetime, time, timedelta, timezone
+from io import BytesIO
 from typing import Dict, List, Optional, Set, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from sqlalchemy import Date, and_, cast, exists, func, or_
 from sqlalchemy.orm import Session, aliased, joinedload
 
@@ -2376,4 +2378,874 @@ def reporte_clinicas_semanal(
         resultado,
         key=lambda item: item.total_generado,
         reverse=True,
+    )
+
+# -----------------------------------------------------------------------------
+# Exportación profesional a Excel
+# -----------------------------------------------------------------------------
+
+
+def _excel_bool(value: bool | None) -> str:
+    return "Sí" if bool(value) else "No"
+
+
+def _excel_estado_pago(estado: int | None) -> str:
+    return {
+        1: "Pendiente",
+        2: "Verificado",
+        3: "Rechazado",
+    }.get(int(estado or 0), "Sin estado")
+
+
+def _excel_datetime_ecuador(value: Optional[datetime]) -> Optional[datetime]:
+    if value is None:
+        return None
+
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+
+    # openpyxl no acepta datetimes con zona horaria.
+    return value.astimezone(ECUADOR_TZ).replace(tzinfo=None)
+
+
+def _excel_fecha_desde_datetime(value: Optional[datetime]) -> Optional[date]:
+    local_dt = _excel_datetime_ecuador(value)
+    return local_dt.date() if local_dt else None
+
+
+def _excel_hora(value) -> str:
+    if value is None:
+        return ""
+    return value.strftime("%H:%M")
+
+
+def _excel_dia(fecha_value: Optional[date]) -> str:
+    if not fecha_value:
+        return ""
+    return DIAS_SEMANA[fecha_value.weekday()]
+
+
+def _excel_safe_text(value) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _excel_nombre_persona(nombres: Optional[str], apellidos: Optional[str]) -> str:
+    nombre = f"{nombres or ''} {apellidos or ''}".strip()
+    return nombre or "Sin nombre"
+
+
+def _excel_map_usuarios(db: Session, ids: Set[Optional[int]]) -> Dict[int, Usuario]:
+    ids_limpios = {int(item) for item in ids if item is not None}
+    if not ids_limpios:
+        return {}
+    return {u.id: u for u in db.query(Usuario).filter(Usuario.id.in_(ids_limpios)).all()}
+
+
+def _excel_map_pacientes(db: Session, ids: Set[Optional[int]]) -> Dict[int, Paciente]:
+    ids_limpios = {int(item) for item in ids if item is not None}
+    if not ids_limpios:
+        return {}
+    return {p.id: p for p in db.query(Paciente).filter(Paciente.id.in_(ids_limpios)).all()}
+
+
+def _excel_map_tratamientos(db: Session, ids: Set[Optional[int]]) -> Dict[int, TratamientoPaciente]:
+    ids_limpios = {int(item) for item in ids if item is not None}
+    if not ids_limpios:
+        return {}
+    return {
+        t.id: t
+        for t in db.query(TratamientoPaciente).filter(TratamientoPaciente.id.in_(ids_limpios)).all()
+    }
+
+
+def _excel_base_sesiones(
+    db: Session,
+    current_user: Usuario,
+    desde: date,
+    hasta: date,
+    terapeutaid: Optional[int] = None,
+    consultorioid: Optional[int] = None,
+    dia_semana: Optional[int] = None,
+) -> List[List]:
+    sesiones_query = (
+        db.query(SesionTerapia)
+        .options(
+            joinedload(SesionTerapia.paciente),
+            joinedload(SesionTerapia.terapeuta),
+            joinedload(SesionTerapia.tratamiento_paciente),
+        )
+        .filter(
+            SesionTerapia.fecha.between(desde, hasta),
+            SesionTerapia.horasalida != None,
+            SesionTerapia.tratamientopacienteid != None,
+        )
+    )
+
+    sesiones_query = _aplicar_filtro_dia_sesion(sesiones_query, dia_semana)
+    sesiones_query = _aplicar_filtros_sesiones(
+        sesiones_query,
+        current_user,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+    )
+
+    sesiones = sesiones_query.order_by(SesionTerapia.fecha, SesionTerapia.horaingreso).all()
+    consultorios_map = _obtener_consultorios_map(db)
+
+    rows: List[List] = []
+    for sesion in sesiones:
+        paciente = sesion.paciente
+        terapeuta = sesion.terapeuta
+        tratamiento = sesion.tratamiento_paciente
+        precio = round(_precio_aplicado(tratamiento), 2)
+        excel_row_number = len(rows) + 2
+
+        rows.append(
+            [
+                sesion.id,
+                sesion.fecha,
+                _excel_dia(sesion.fecha),
+                _nombre_paciente(paciente),
+                _excel_safe_text(getattr(paciente, "cedula", "")),
+                _nombre_usuario(terapeuta),
+                consultorios_map.get(getattr(terapeuta, "consultorioid", None), "Sin consultorio"),
+                consultorios_map.get(getattr(paciente, "consultorioid", None), "Sin consultorio"),
+                _excel_safe_text(getattr(tratamiento, "tipotratamiento", "Sin tratamiento")),
+                getattr(tratamiento, "id", None),
+                _excel_hora(sesion.horaingreso),
+                _excel_hora(sesion.horasalida),
+                sesion.duracionminutos or 0,
+                sesion.escaladolorentrada,
+                sesion.escaladolorsalida,
+                precio,
+                _excel_bool(_es_paciente_ecuasanitas(paciente)),
+                f"=ROUND(P{excel_row_number}*{PORCENTAJE_FISIO_TERAPIA},2)",
+                f"=ROUND(P{excel_row_number}*{PORCENTAJE_CLINICA_TERAPIA},2)",
+            ]
+        )
+
+    return rows
+
+
+def _excel_base_pagos(
+    db: Session,
+    current_user: Usuario,
+    desde: date,
+    hasta: date,
+    terapeutaid: Optional[int] = None,
+    consultorioid: Optional[int] = None,
+    dia_semana: Optional[int] = None,
+) -> List[List]:
+    consultorios_map = _obtener_consultorios_map(db)
+    rows: List[List] = []
+
+    # Pagos de terapias: incluye verificados, pendientes, rechazados, previos y anulados
+    # para auditoría. La columna "Caja válida" separa lo que sí entra al cuadre.
+    pagos_terapia_query = db.query(Pago).filter(
+        Pago.tratamientopacienteid != None,
+        filtro_fechapago_ecuador(desde, hasta),
+        filtro_dia_pago_ecuador(dia_semana),
+    )
+    pagos_terapia_query = _aplicar_filtros_pagos(
+        pagos_terapia_query,
+        current_user,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+    )
+    pagos_terapia = pagos_terapia_query.order_by(Pago.fechapago, Pago.id).all()
+
+    tratamiento_map = _excel_map_tratamientos(
+        db,
+        {p.tratamientopacienteid for p in pagos_terapia},
+    )
+    pacientes_map = _excel_map_pacientes(
+        db,
+        {p.pacienteid for p in pagos_terapia}
+        | {t.pacienteid for t in tratamiento_map.values() if t is not None},
+    )
+    usuarios_map = _excel_map_usuarios(
+        db,
+        {getattr(pacientes_map.get(p.pacienteid), "terapeutaasignadoid", None) for p in pagos_terapia}
+        | {p.creado_por_id for p in pagos_terapia},
+    )
+
+    def add_pago_row(
+        pago: Pago,
+        paciente: Optional[Paciente],
+        responsable: str,
+        consultorio_nombre: str,
+        tipo: str,
+        referencia: str,
+        observacion: str = "",
+    ) -> None:
+        fecha_pago = _excel_fecha_desde_datetime(pago.fechapago)
+        excel_row_number = len(rows) + 2
+        rows.append(
+            [
+                pago.id,
+                fecha_pago,
+                _excel_dia(fecha_pago),
+                _nombre_paciente(paciente),
+                _excel_safe_text(getattr(paciente, "cedula", "")),
+                responsable,
+                consultorio_nombre,
+                tipo,
+                _excel_safe_text(pago.metodopago) or "Sin método",
+                _excel_estado_pago(pago.estadopago),
+                round(float(pago.monto or 0), 2),
+                _excel_bool(pago.espagoprevio),
+                _excel_bool(pago.esrecuperacioncartera),
+                _excel_bool(pago.anulado),
+                referencia,
+                observacion,
+                pago.creado_por_id,
+                f'=IF(AND(J{excel_row_number}="Verificado",L{excel_row_number}="No",N{excel_row_number}="No"),K{excel_row_number},0)',
+            ]
+        )
+
+    for pago in pagos_terapia:
+        tratamiento = tratamiento_map.get(pago.tratamientopacienteid)
+        paciente = pacientes_map.get(pago.pacienteid) or pacientes_map.get(getattr(tratamiento, "pacienteid", None))
+        terapeuta = usuarios_map.get(getattr(paciente, "terapeutaasignadoid", None))
+        referencia = _excel_safe_text(getattr(tratamiento, "tipotratamiento", "Terapia"))
+        observacion = _excel_safe_text(pago.observacionpagoprevio or pago.motivo_rechazo or pago.motivo_anulacion)
+        add_pago_row(
+            pago=pago,
+            paciente=paciente,
+            responsable=_nombre_usuario(terapeuta),
+            consultorio_nombre=consultorios_map.get(getattr(paciente, "consultorioid", None), "Sin consultorio"),
+            tipo="Terapia",
+            referencia=referencia,
+            observacion=observacion,
+        )
+
+    # Pagos de gimnasio mensual / diario. Gimnasio no se cubre por Ecuasanitas.
+    consultorio_resuelto = _resolver_consultorioid_gimnasio_para_rol(current_user, consultorioid)
+    pagos_gimnasio_query = (
+        db.query(Pago)
+        .join(MembresiaGimnasio, MembresiaGimnasio.id == Pago.membresiagimnasioid)
+        .join(Paciente, Paciente.id == MembresiaGimnasio.pacienteid)
+        .filter(
+            Pago.membresiagimnasioid != None,
+            filtro_fechapago_ecuador(desde, hasta),
+            filtro_dia_pago_ecuador(dia_semana),
+        )
+    )
+
+    if current_user.rol == 2:
+        pagos_gimnasio_query = pagos_gimnasio_query.filter(Paciente.terapeutaasignadoid == current_user.id)
+    elif terapeutaid is not None:
+        pagos_gimnasio_query = pagos_gimnasio_query.filter(Paciente.terapeutaasignadoid == terapeutaid)
+
+    if consultorio_resuelto is not None:
+        pagos_gimnasio_query = pagos_gimnasio_query.filter(Paciente.consultorioid == consultorio_resuelto)
+
+    pagos_gimnasio = pagos_gimnasio_query.order_by(Pago.fechapago, Pago.id).all()
+    pacientes_gym = _excel_map_pacientes(db, {p.pacienteid for p in pagos_gimnasio})
+    usuarios_gym = _excel_map_usuarios(
+        db,
+        {getattr(pacientes_gym.get(p.pacienteid), "terapeutaasignadoid", None) for p in pagos_gimnasio}
+        | {p.creado_por_id for p in pagos_gimnasio},
+    )
+
+    for pago in pagos_gimnasio:
+        paciente = pacientes_gym.get(pago.pacienteid)
+        terapeuta = usuarios_gym.get(getattr(paciente, "terapeutaasignadoid", None))
+        observacion = _excel_safe_text(pago.observacionpagoprevio or pago.motivo_rechazo or pago.motivo_anulacion)
+        add_pago_row(
+            pago=pago,
+            paciente=paciente,
+            responsable=_nombre_usuario(terapeuta),
+            consultorio_nombre=consultorios_map.get(getattr(paciente, "consultorioid", None), "Sin consultorio"),
+            tipo="Gimnasio",
+            referencia=f"Membresía/Pase #{pago.membresiagimnasioid}",
+            observacion=observacion,
+        )
+
+    # Recuperación de cartera: entra a caja, pero no reduce saldos ni genera comisión automática.
+    recuperacion_query = _query_recuperacion_cartera(
+        db=db,
+        current_user=current_user,
+        desde=desde,
+        hasta=hasta,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+        dia_semana=dia_semana,
+    )
+    pagos_recuperacion = recuperacion_query.order_by(Pago.fechapago, Pago.id).all()
+    pacientes_rec = _excel_map_pacientes(db, {p.pacienteid for p in pagos_recuperacion})
+    cobradores_rec = _excel_map_usuarios(db, {p.creado_por_id for p in pagos_recuperacion})
+
+    for pago in pagos_recuperacion:
+        paciente = pacientes_rec.get(pago.pacienteid)
+        cobrador = cobradores_rec.get(pago.creado_por_id)
+        add_pago_row(
+            pago=pago,
+            paciente=paciente,
+            responsable=f"Cobrador: {_nombre_usuario(cobrador)}",
+            consultorio_nombre=consultorios_map.get(getattr(cobrador, "consultorioid", None), "Sin consultorio"),
+            tipo="Recuperación cartera",
+            referencia="Cobro anterior al sistema",
+            observacion=_excel_safe_text(pago.observacion_cartera),
+        )
+
+    rows.sort(key=lambda row: (row[1] or date.min, row[0] or 0))
+    return rows
+
+
+def _excel_aplicar_estilo_workbook(wb) -> None:
+    from openpyxl.styles import Alignment, Font, PatternFill, Side, Border
+
+    azul = "1F4E78"
+    azul_claro = "D9EAF7"
+    gris = "F4F6F8"
+    verde = "E2F0D9"
+    blanco = "FFFFFF"
+    borde = Border(
+        left=Side(style="thin", color="D9E2F3"),
+        right=Side(style="thin", color="D9E2F3"),
+        top=Side(style="thin", color="D9E2F3"),
+        bottom=Side(style="thin", color="D9E2F3"),
+    )
+
+    for ws in wb.worksheets:
+        ws.sheet_view.showGridLines = False
+        for row in ws.iter_rows():
+            for cell in row:
+                cell.alignment = Alignment(vertical="center")
+                if cell.value is not None:
+                    cell.border = borde
+
+        for cell in ws[1]:
+            if cell.value:
+                cell.font = Font(bold=True, color=blanco, size=12)
+                cell.fill = PatternFill("solid", fgColor=azul)
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+
+        # Encabezados de tablas/secciones.
+        for row in ws.iter_rows():
+            first = row[0].value if row else None
+            if isinstance(first, str) and first.startswith("▶"):
+                for cell in row:
+                    if cell.value:
+                        cell.font = Font(bold=True, color="12355B", size=12)
+                        cell.fill = PatternFill("solid", fgColor=azul_claro)
+
+        for col in ws.columns:
+            max_len = 0
+            letter = col[0].column_letter
+            for cell in col:
+                value = cell.value
+                if value is None:
+                    continue
+                text = str(value)
+                max_len = max(max_len, len(text))
+            width = min(max(max_len + 2, 10), 38)
+            if letter in {"P"} and ws.title == "Base_Pagos":
+                width = 42
+            ws.column_dimensions[letter].width = width
+
+        for row in ws.iter_rows():
+            for cell in row:
+                header = str(ws.cell(row=1, column=cell.column).value or "").lower()
+                if any(word in header for word in ["monto", "total", "generado", "pagado", "pendiente", "ganancia", "caja", "ecuasanitas", "precio", "saldo"]):
+                    cell.number_format = '$#,##0.00;[Red]-$#,##0.00'
+                if "fecha" in header:
+                    cell.number_format = "dd/mm/yyyy"
+
+        if ws.max_row > 1:
+            for cell in ws[1]:
+                if cell.value:
+                    cell.fill = PatternFill("solid", fgColor=azul)
+                    cell.font = Font(bold=True, color=blanco)
+
+    # Estilo específico del dashboard.
+    ws = wb["Dashboard"]
+    ws.sheet_view.showGridLines = False
+    for row in range(1, 40):
+        ws.row_dimensions[row].height = 24
+    for col in range(1, 11):
+        ws.column_dimensions[chr(64 + col)].width = 18
+
+    for rng in ["A1:J2", "A4:C6", "D4:F6", "G4:I6", "A8:C10", "D8:F10", "G8:I10"]:
+        for row in ws[rng]:
+            for cell in row:
+                cell.fill = PatternFill("solid", fgColor=gris)
+                cell.border = borde
+                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    ws["A1"].fill = PatternFill("solid", fgColor=azul)
+    ws["A1"].font = Font(bold=True, color=blanco, size=16)
+    ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
+
+    for cell_ref in ["A4", "D4", "G4", "A8", "D8", "G8"]:
+        ws[cell_ref].font = Font(bold=True, color="12355B", size=11)
+    for cell_ref in ["A5", "D5", "G5", "A9", "D9", "G9"]:
+        ws[cell_ref].font = Font(bold=True, color="12355B", size=18)
+        ws[cell_ref].fill = PatternFill("solid", fgColor=verde)
+
+
+def _excel_agregar_tabla(ws, start_row: int, start_col: int, headers: List[str], rows: List[List], table_name: str) -> int:
+    from openpyxl.worksheet.table import Table, TableStyleInfo
+    from openpyxl.utils import get_column_letter
+
+    header_row = start_row
+    for idx, header in enumerate(headers, start=start_col):
+        ws.cell(row=header_row, column=idx, value=header)
+
+    data_rows = rows if rows else [["Sin datos"] + [None] * (len(headers) - 1)]
+    for r_idx, row_values in enumerate(data_rows, start=header_row + 1):
+        for c_idx, value in enumerate(row_values, start=start_col):
+            ws.cell(row=r_idx, column=c_idx, value=value)
+
+    end_row = header_row + len(data_rows)
+    end_col = start_col + len(headers) - 1
+    ref = f"{get_column_letter(start_col)}{header_row}:{get_column_letter(end_col)}{end_row}"
+    tab = Table(displayName=table_name, ref=ref)
+    tab.tableStyleInfo = TableStyleInfo(
+        name="TableStyleMedium2",
+        showFirstColumn=False,
+        showLastColumn=False,
+        showRowStripes=True,
+        showColumnStripes=False,
+    )
+    ws.add_table(tab)
+    ws.auto_filter.ref = ref
+
+    currency_words = [
+        "monto",
+        "total",
+        "generado",
+        "pagado",
+        "pendiente",
+        "ganancia",
+        "caja",
+        "ecuasanitas",
+        "precio",
+        "saldo",
+    ]
+    integer_words = ["sesiones", "duración", "dolor"]
+
+    for offset, header in enumerate(headers):
+        col_idx = start_col + offset
+        header_lower = header.lower()
+        for row_idx in range(header_row + 1, end_row + 1):
+            cell = ws.cell(row=row_idx, column=col_idx)
+            if "fecha" in header_lower:
+                cell.number_format = "dd/mm/yyyy"
+            elif any(word in header_lower for word in currency_words):
+                cell.number_format = '$#,##0.00;[Red]-$#,##0.00'
+            elif any(word in header_lower for word in integer_words):
+                cell.number_format = "0"
+
+    return end_row + 3
+
+
+def _excel_escribir_titulo(ws, titulo: str, subtitulo: str) -> None:
+    ws.merge_cells("A1:J1")
+    ws["A1"] = titulo
+    ws.merge_cells("A2:J2")
+    ws["A2"] = subtitulo
+
+
+def _excel_colocar_kpi(ws, cell: str, titulo: str, valor, detalle: str) -> None:
+    row = ws[cell].row
+    col = ws[cell].column
+    ws.cell(row=row, column=col, value=titulo)
+    ws.cell(row=row + 1, column=col, value=valor)
+    ws.cell(row=row + 2, column=col, value=detalle)
+    ws.merge_cells(start_row=row, start_column=col, end_row=row, end_column=col + 2)
+    ws.merge_cells(start_row=row + 1, start_column=col, end_row=row + 1, end_column=col + 2)
+    ws.merge_cells(start_row=row + 2, start_column=col, end_row=row + 2, end_column=col + 2)
+
+
+def _crear_excel_reporte_corpofit(
+    db: Session,
+    current_user: Usuario,
+    desde: date,
+    hasta: date,
+    terapeutaid: Optional[int] = None,
+    consultorioid: Optional[int] = None,
+    dia_semana: Optional[int] = None,
+) -> bytes:
+    from openpyxl import Workbook
+    from openpyxl.chart import BarChart, Reference, PieChart
+    from openpyxl.styles import Alignment, Font, PatternFill
+
+    general = reporte_terapias(
+        desde=desde,
+        hasta=hasta,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+        dia_semana=dia_semana,
+        db=db,
+        current_user=current_user,
+    )
+    fisios = reporte_fisioterapeutas_semanal(
+        desde=desde,
+        hasta=hasta,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+        dia_semana=dia_semana,
+        db=db,
+        current_user=current_user,
+    )
+    clinicas = reporte_clinicas_semanal(
+        desde=desde,
+        hasta=hasta,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+        dia_semana=dia_semana,
+        db=db,
+        current_user=current_user,
+    )
+
+    base_sesiones = _excel_base_sesiones(
+        db=db,
+        current_user=current_user,
+        desde=desde,
+        hasta=hasta,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+        dia_semana=dia_semana,
+    )
+    base_pagos = _excel_base_pagos(
+        db=db,
+        current_user=current_user,
+        desde=desde,
+        hasta=hasta,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+        dia_semana=dia_semana,
+    )
+
+    wb = Workbook()
+    ws_dashboard = wb.active
+    ws_dashboard.title = "Dashboard"
+    ws_filtros = wb.create_sheet("Filtros_Excel")
+    ws_analisis = wb.create_sheet("Análisis")
+    ws_sesiones = wb.create_sheet("Base_Sesiones")
+    ws_pagos = wb.create_sheet("Base_Pagos")
+
+    subtitulo = (
+        f"Periodo semanal completo: {desde.strftime('%d/%m/%Y')} - {hasta.strftime('%d/%m/%Y')} | "
+        f"Generado: {now_ecuador().strftime('%d/%m/%Y %H:%M')}"
+    )
+
+    _excel_escribir_titulo(ws_dashboard, "CORPOFIT PRO — REPORTE EXCEL", subtitulo)
+    _excel_colocar_kpi(ws_dashboard, "A4", "Sesiones finalizadas", general.total_sesiones, "Terapias del periodo")
+    _excel_colocar_kpi(ws_dashboard, "D4", "Generado terapias", general.total_generado, "Valor producido")
+    _excel_colocar_kpi(ws_dashboard, "G4", "Pagado caja", general.total_pagado_verificado, "Cobros verificados")
+    _excel_colocar_kpi(ws_dashboard, "A8", "Pendiente", general.total_pendiente, "Por cobrar a pacientes")
+    _excel_colocar_kpi(ws_dashboard, "D8", "Ecuasanitas", general.total_ecuasanitas, "Cubierto por convenio")
+    _excel_colocar_kpi(ws_dashboard, "G8", "Saldo a favor", general.saldo_a_favor, "Anticipos / excedentes")
+
+    ws_dashboard["A13"] = "Reglas del reporte"
+    ws_dashboard["A13"].font = Font(bold=True, color="12355B", size=12)
+    ws_dashboard["A14"] = "• Terapias: 35% fisioterapeuta y 65% clínica."
+    ws_dashboard["A15"] = "• Gimnasio mensual/diario: 50% fisioterapeuta y 50% clínica."
+    ws_dashboard["A16"] = "• Ecuasanitas aplica solo a terapias; no queda como deuda del paciente."
+    ws_dashboard["A17"] = "• Pago previo reduce saldos, pero no entra al cuadre de caja actual."
+    ws_dashboard["A18"] = "• Recuperación de cartera entra a caja, no reduce tratamientos ni genera comisión automática."
+    ws_dashboard["A19"] = "• Este Excel trae toda la semana; filtra Clínica/Consultorio, Fisioterapeuta y Día dentro de las tablas del archivo."
+
+    # Hoja de guía de filtros dentro de Excel.
+    _excel_escribir_titulo(
+        ws_filtros,
+        "CORPOFIT PRO — FILTROS DENTRO DEL EXCEL",
+        "La app solo define la semana. Clínica, fisioterapeuta y día se filtran desde Excel."
+    )
+    filtros_headers = ["Hoja", "Columna para filtrar", "Uso recomendado"]
+    filtros_rows = [
+        ["Base_Sesiones", "Clínica / Consultorio", "Ver sesiones atendidas por consultorio."],
+        ["Base_Sesiones", "Fisioterapeuta", "Ver sesiones de un terapeuta específico."],
+        ["Base_Sesiones", "Día", "Filtrar lunes, martes, miércoles, etc."],
+        ["Base_Pagos", "Clínica / Consultorio", "Ver pagos asociados a una clínica."],
+        ["Base_Pagos", "Fisioterapeuta / Responsable", "Ver pagos por responsable o terapeuta asociado."],
+        ["Base_Pagos", "Día", "Filtrar cobros por día de la semana."],
+        ["Análisis", "Terapeuta / Clínica / Día", "Usar las flechas de filtro en cada resumen."],
+    ]
+    _excel_agregar_tabla(ws_filtros, 5, 1, filtros_headers, filtros_rows, "tblGuiaFiltrosExcel")
+    ws_filtros["A14"] = "Cómo usarlo"
+    ws_filtros["A15"] = "1. Abre Base_Sesiones o Base_Pagos."
+    ws_filtros["A16"] = "2. En la fila de encabezados, toca la flecha de filtro."
+    ws_filtros["A17"] = "3. Elige Clínica / Consultorio, Fisioterapeuta y Día según necesites."
+    ws_filtros["A18"] = "4. Puedes combinar filtros, por ejemplo: Atahualpa + Camila + domingo."
+
+    # Hoja Análisis
+    _excel_escribir_titulo(ws_analisis, "CORPOFIT PRO — ANÁLISIS", subtitulo)
+    current_row = 4
+    ws_analisis.cell(row=current_row, column=1, value="▶ Resumen por día")
+    current_row += 1
+    daily_headers = [
+        "Fecha",
+        "Día",
+        "Sesiones",
+        "Generado terapias",
+        "Pagado caja",
+        "Ecuasanitas",
+        "Pendiente estimado",
+    ]
+    daily_rows = []
+    for item in general.sesiones_por_dia:
+        excel_row = len(daily_rows) + current_row + 1
+        daily_rows.append(
+            [
+                item.fecha,
+                item.dia,
+                item.sesiones,
+                item.total_generado,
+                item.pagos_verificados,
+                item.cubierto_ecuasanitas,
+                f"=MAX(D{excel_row}-E{excel_row}-F{excel_row},0)",
+            ]
+        )
+    daily_table_start = current_row
+    current_row = _excel_agregar_tabla(ws_analisis, current_row, 1, daily_headers, daily_rows, "tblAnalisisDias")
+
+    ws_analisis.cell(row=current_row, column=1, value="▶ Resumen por método de pago")
+    current_row += 1
+    metodo_headers = ["Método", "Total"]
+    metodo_rows = [[m.metodo, m.total] for m in general.por_metodo_pago]
+    metodo_table_start = current_row
+    current_row = _excel_agregar_tabla(ws_analisis, current_row, 1, metodo_headers, metodo_rows, "tblAnalisisMetodos")
+
+    ws_analisis.cell(row=current_row, column=1, value="▶ Resumen por fisioterapeuta")
+    current_row += 1
+    fisio_headers = [
+        "Terapeuta",
+        "Clínica",
+        "Sesiones",
+        "Generado terapias",
+        "Pagado pacientes",
+        "Pendiente pacientes",
+        "Ecuasanitas",
+        "Gimnasio pagado",
+        "Ganancia fisio total",
+        "Ganancia fisio cobrada",
+        "Ganancia fisio pendiente",
+    ]
+    fisio_rows = [
+        [
+            item.terapeuta,
+            item.consultorio,
+            item.sesiones_realizadas,
+            item.total_generado,
+            item.total_pagado_pacientes,
+            item.total_pendiente_pacientes,
+            item.total_ecuasanitas,
+            item.total_gimnasio_pagado,
+            item.ganancia_fisio_total,
+            item.ganancia_fisio_cobrada,
+            item.ganancia_fisio_pendiente,
+        ]
+        for item in fisios
+    ]
+    current_row = _excel_agregar_tabla(ws_analisis, current_row, 1, fisio_headers, fisio_rows, "tblAnalisisFisios")
+
+    ws_analisis.cell(row=current_row, column=1, value="▶ Resumen por clínica")
+    current_row += 1
+    clinica_headers = [
+        "Clínica",
+        "Sesiones",
+        "Generado terapias",
+        "Pagado pacientes",
+        "Pendiente pacientes",
+        "Ecuasanitas",
+        "Gimnasio pagado",
+        "Ganancia fisios total",
+        "Ganancia clínica total",
+        "Ganancia clínica cobrada",
+        "Ganancia clínica pendiente",
+    ]
+    clinica_rows = [
+        [
+            item.consultorio,
+            item.sesiones_realizadas,
+            item.total_generado,
+            item.total_pagado_pacientes,
+            item.total_pendiente_pacientes,
+            item.total_ecuasanitas,
+            item.total_gimnasio_pagado,
+            item.ganancia_fisios_total,
+            item.ganancia_clinica_total,
+            item.ganancia_clinica_cobrada,
+            item.ganancia_clinica_pendiente,
+        ]
+        for item in clinicas
+    ]
+    current_row = _excel_agregar_tabla(ws_analisis, current_row, 1, clinica_headers, clinica_rows, "tblAnalisisClinicas")
+
+    # Base de sesiones
+    sesiones_headers = [
+        "ID Sesión",
+        "Fecha",
+        "Día",
+        "Paciente",
+        "Cédula",
+        "Fisioterapeuta",
+        "Clínica / Consultorio",
+        "Clínica paciente",
+        "Tratamiento",
+        "Tratamiento ID",
+        "Hora ingreso",
+        "Hora salida",
+        "Duración min",
+        "Dolor entrada",
+        "Dolor salida",
+        "Precio sesión",
+        "Ecuasanitas",
+        "Ganancia fisio",
+        "Ganancia clínica",
+    ]
+    _excel_agregar_tabla(ws_sesiones, 1, 1, sesiones_headers, base_sesiones, "tblBaseSesiones")
+    ws_sesiones.freeze_panes = "A2"
+
+    # Base de pagos
+    pagos_headers = [
+        "ID Pago",
+        "Fecha Ecuador",
+        "Día",
+        "Paciente",
+        "Cédula",
+        "Fisioterapeuta / Responsable",
+        "Clínica / Consultorio",
+        "Tipo",
+        "Método",
+        "Estado",
+        "Monto",
+        "Pago previo",
+        "Recuperación cartera",
+        "Anulado",
+        "Referencia",
+        "Observación",
+        "Cobrador ID",
+        "Caja válida",
+    ]
+    _excel_agregar_tabla(ws_pagos, 1, 1, pagos_headers, base_pagos, "tblBasePagos")
+    ws_pagos.freeze_panes = "A2"
+
+    # Gráficos del Dashboard basados en Análisis.
+    if general.sesiones_por_dia:
+        chart = BarChart()
+        chart.title = "Generado vs pagado por día"
+        chart.y_axis.title = "USD"
+        chart.x_axis.title = "Día"
+        data = Reference(
+            ws_analisis,
+            min_col=4,
+            max_col=5,
+            min_row=daily_table_start,
+            max_row=daily_table_start + len(general.sesiones_por_dia),
+        )
+        cats = Reference(
+            ws_analisis,
+            min_col=2,
+            min_row=daily_table_start + 1,
+            max_row=daily_table_start + len(general.sesiones_por_dia),
+        )
+        chart.add_data(data, titles_from_data=True)
+        chart.set_categories(cats)
+        chart.height = 8
+        chart.width = 18
+        ws_dashboard.add_chart(chart, "A21")
+
+    if general.por_metodo_pago:
+        pie = PieChart()
+        pie.title = "Ingresos por método"
+        data = Reference(
+            ws_analisis,
+            min_col=2,
+            min_row=metodo_table_start,
+            max_row=metodo_table_start + len(general.por_metodo_pago),
+        )
+        labels = Reference(
+            ws_analisis,
+            min_col=1,
+            min_row=metodo_table_start + 1,
+            max_row=metodo_table_start + len(general.por_metodo_pago),
+        )
+        pie.add_data(data, titles_from_data=True)
+        pie.set_categories(labels)
+        pie.height = 8
+        pie.width = 11
+        ws_dashboard.add_chart(pie, "G21")
+
+    # Formatos y estilo visual.
+    for ws in [ws_dashboard, ws_filtros, ws_analisis, ws_sesiones, ws_pagos]:
+        ws.freeze_panes = ws.freeze_panes or "A4"
+        for row in ws.iter_rows():
+            for cell in row:
+                cell.alignment = Alignment(vertical="center", wrap_text=False)
+
+    _excel_aplicar_estilo_workbook(wb)
+
+    for ws in [ws_filtros, ws_analisis, ws_sesiones, ws_pagos]:
+        for row in ws.iter_rows(min_row=2):
+            for cell in row:
+                header = str(ws.cell(row=1, column=cell.column).value or "").lower()
+                # En Análisis los encabezados no siempre están en fila 1; reforzamos por tipo de valor.
+                if isinstance(cell.value, (int, float)) and any(
+                    word in str(cell.offset(row=-(cell.row - 1)).value or "").lower()
+                    for word in ["monto", "total", "generado", "pagado", "pendiente", "ganancia", "caja", "precio"]
+                ):
+                    cell.number_format = '$#,##0.00;[Red]-$#,##0.00'
+                if isinstance(cell.value, date):
+                    cell.number_format = "dd/mm/yyyy"
+
+    # Ajuste final de formatos por columnas conocidas.
+    for ws in [ws_dashboard, ws_filtros, ws_analisis, ws_sesiones, ws_pagos]:
+        for row in ws.iter_rows():
+            for cell in row:
+                if isinstance(cell.value, date):
+                    cell.number_format = "dd/mm/yyyy"
+                if isinstance(cell.value, (int, float)) and cell.column >= 4:
+                    # La mayoría de valores monetarios están a partir de la columna D.
+                    header_values = [str(ws.cell(row=r, column=cell.column).value or "").lower() for r in range(1, min(cell.row, 6) + 1)]
+                    if any(
+                        any(word in header for word in ["monto", "total", "generado", "pagado", "pendiente", "ganancia", "caja", "precio", "ecuasanitas"])
+                        for header in header_values
+                    ):
+                        cell.number_format = '$#,##0.00;[Red]-$#,##0.00'
+
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output.getvalue()
+
+
+@router.get("/exportar-excel")
+def exportar_excel_reportes(
+    desde: Optional[date] = Query(None),
+    hasta: Optional[date] = Query(None),
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(get_current_user),
+):
+    desde, hasta = _default_range(desde, hasta)
+
+    # El Excel siempre contiene toda la semana permitida para el rol.
+    # Clínica/Consultorio, Fisioterapeuta y Día se filtran dentro del archivo
+    # usando las flechas de las tablas de Excel, no desde la app.
+    contenido = _crear_excel_reporte_corpofit(
+        db=db,
+        current_user=current_user,
+        desde=desde,
+        hasta=hasta,
+        terapeutaid=None,
+        consultorioid=None,
+        dia_semana=None,
+    )
+
+    filename = f"corpofit_reporte_{desde.isoformat()}_{hasta.isoformat()}.xlsx"
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Cache-Control": "no-store",
+    }
+
+    return StreamingResponse(
+        BytesIO(contenido),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers=headers,
     )
