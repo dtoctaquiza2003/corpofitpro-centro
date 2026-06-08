@@ -2697,6 +2697,7 @@ def _excel_base_pagos(
 
 def _excel_aplicar_estilo_workbook(wb) -> None:
     from openpyxl.styles import Alignment, Font, PatternFill, Side, Border
+    from openpyxl.utils import get_column_letter
 
     azul = "1F4E78"
     azul_claro = "D9EAF7"
@@ -2733,15 +2734,16 @@ def _excel_aplicar_estilo_workbook(wb) -> None:
                         cell.font = Font(bold=True, color="12355B", size=12)
                         cell.fill = PatternFill("solid", fgColor=azul_claro)
 
-        for col in ws.columns:
+        for col_idx in range(1, ws.max_column + 1):
             max_len = 0
-            letter = col[0].column_letter
-            for cell in col:
-                value = cell.value
-                if value is None:
-                    continue
-                text = str(value)
-                max_len = max(max_len, len(text))
+            letter = get_column_letter(col_idx)
+            for cell in ws.iter_cols(min_col=col_idx, max_col=col_idx, min_row=1, max_row=ws.max_row):
+                for item in cell:
+                    value = item.value
+                    if value is None:
+                        continue
+                    text = str(value)
+                    max_len = max(max_len, len(text))
             width = min(max(max_len + 2, 10), 38)
             if letter in {"P"} and ws.title == "Base_Pagos":
                 width = 42
