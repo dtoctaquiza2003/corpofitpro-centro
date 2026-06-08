@@ -2814,7 +2814,6 @@ def _excel_agregar_tabla(ws, start_row: int, start_col: int, headers: List[str],
         showColumnStripes=False,
     )
     ws.add_table(tab)
-    ws.auto_filter.ref = ref
 
     currency_words = [
         "monto",
