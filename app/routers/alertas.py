@@ -11,10 +11,116 @@ from ..auth.permissions import (
 from ..dependencies.db import get_db
 from ..models.alerta import Alerta
 from ..models.paciente import Paciente
+from ..models.sesion_terapia import SesionTerapia
 from ..models.usuario import Usuario
 from ..schemas.alerta import AlertaOut
 
 router = APIRouter(prefix="/api/alertas", tags=["alertas"])
+
+
+def _nombre_completo_persona(obj) -> str:
+    nombres = (getattr(obj, "nombres", None) or "").strip()
+    apellidos = (getattr(obj, "apellidos", None) or "").strip()
+    nombre = f"{nombres} {apellidos}".strip()
+    return nombre or "No registrado"
+
+
+def _tipo_alerta_en_espanol(tipo: str | None) -> str:
+    tipo_normalizado = (tipo or "").strip().lower()
+
+    return {
+        "high_pain": "Dolor crítico",
+        "pain_no_reduction": "Dolor sin reducción",
+        "pain_increase": "Aumento de dolor",
+        "critical": "Crítica",
+        "critical_pain": "Dolor crítico",
+    }.get(tipo_normalizado, "Alerta clínica")
+
+
+def _buscar_sesion_relacionada_alerta(
+    db: Session,
+    alerta: Alerta,
+) -> SesionTerapia | None:
+    """
+    Las alertas antiguas no guardaban sesionid/terapeutaid.
+    Para mostrar quién atendió, buscamos primero una sesión del mismo paciente
+    en la fecha de la alerta y, si no existe, usamos la última sesión registrada
+    del paciente como respaldo.
+    """
+    if not alerta.paciente_id:
+        return None
+
+    base_query = db.query(SesionTerapia).filter(
+        SesionTerapia.pacienteid == alerta.paciente_id,
+    )
+
+    fecha_alerta = None
+    try:
+        fecha_alerta = alerta.fecha.date() if alerta.fecha else None
+    except Exception:
+        fecha_alerta = None
+
+    if fecha_alerta is not None:
+        sesion_misma_fecha = (
+            base_query
+            .filter(SesionTerapia.fecha == fecha_alerta)
+            .order_by(
+                SesionTerapia.horasalida.desc(),
+                SesionTerapia.horaingreso.desc(),
+                SesionTerapia.id.desc(),
+            )
+            .first()
+        )
+
+        if sesion_misma_fecha:
+            return sesion_misma_fecha
+
+    return (
+        base_query
+        .order_by(
+            SesionTerapia.fecha.desc(),
+            SesionTerapia.horasalida.desc(),
+            SesionTerapia.horaingreso.desc(),
+            SesionTerapia.id.desc(),
+        )
+        .first()
+    )
+
+
+def _alerta_a_response(
+    db: Session,
+    alerta: Alerta,
+    paciente: Paciente | None = None,
+) -> dict:
+    if paciente is None and alerta.paciente_id:
+        paciente = (
+            db.query(Paciente)
+            .filter(Paciente.id == alerta.paciente_id)
+            .first()
+        )
+
+    sesion = _buscar_sesion_relacionada_alerta(db, alerta)
+    terapeuta = None
+
+    if sesion and sesion.terapeutaid:
+        terapeuta = (
+            db.query(Usuario)
+            .filter(Usuario.id == sesion.terapeutaid)
+            .first()
+        )
+
+    return {
+        "id": alerta.id,
+        "paciente_id": alerta.paciente_id,
+        "tipo": alerta.tipo or "",
+        "tipo_label": _tipo_alerta_en_espanol(alerta.tipo),
+        "descripcion": alerta.descripcion or "Alerta clínica",
+        "fecha": alerta.fecha,
+        "leida": bool(alerta.leida),
+        "paciente_nombre": _nombre_completo_persona(paciente) if paciente else None,
+        "terapeuta_id": sesion.terapeutaid if sesion else None,
+        "terapeuta_nombre": _nombre_completo_persona(terapeuta) if terapeuta else None,
+    }
 
 
 def _validar_alerta_con_acceso(
@@ -85,7 +191,25 @@ def listar_alertas(
     if solo_no_leidas:
         query = query.filter(Alerta.leida == False)
 
-    return query.order_by(Alerta.fecha.desc()).all()
+    alertas = query.order_by(Alerta.fecha.desc()).all()
+
+    # Enriquecemos la respuesta para que el front no muestre solo IDs.
+    paciente_ids = {a.paciente_id for a in alertas if a.paciente_id}
+    pacientes = {}
+    if paciente_ids:
+        pacientes = {
+            p.id: p
+            for p in db.query(Paciente).filter(Paciente.id.in_(paciente_ids)).all()
+        }
+
+    return [
+        _alerta_a_response(
+            db=db,
+            alerta=alerta,
+            paciente=pacientes.get(alerta.paciente_id),
+        )
+        for alerta in alertas
+    ]
 
 
 @router.put("/{alerta_id}/leer")
