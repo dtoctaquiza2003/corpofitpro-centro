@@ -2286,6 +2286,7 @@ def reporte_clinicas_semanal(
         db.query(SesionTerapia)
         .options(
             joinedload(SesionTerapia.paciente),
+            joinedload(SesionTerapia.terapeuta),
             joinedload(SesionTerapia.tratamiento_paciente),
         )
         .filter(
@@ -2339,7 +2340,16 @@ def reporte_clinicas_semanal(
     sesiones_no_ecuasanitas: List[Tuple[Optional[int], int, float, date]] = []
 
     for sesion in sesiones:
-        consultorio_id = sesion.paciente.consultorioid if sesion.paciente else None
+        # En el reporte por clínica usamos el consultorio OPERATIVO:
+        # el consultorio del fisioterapeuta que atendió la sesión.
+        # Así, si un paciente de Centro Principal fue atendido por Atahualpa,
+        # esa sesión cuenta para Atahualpa y no aparece como otra clínica
+        # dentro del Excel del secretario de Atahualpa.
+        consultorio_id = (
+            sesion.terapeuta.consultorioid
+            if getattr(sesion, "terapeuta", None) is not None
+            else None
+        )
         tratamiento_id = sesion.tratamientopacienteid
         precio = _precio_aplicado(sesion.tratamiento_paciente)
 
@@ -2698,9 +2708,52 @@ def _excel_base_pagos(
     )
     pagos_terapia = pagos_terapia_query.order_by(Pago.fechapago, Pago.id).all()
 
+    tratamiento_ids_pagos = {
+        p.tratamientopacienteid
+        for p in pagos_terapia
+        if p.tratamientopacienteid is not None
+    }
+
+    # Para pagos de terapias, si el tratamiento tuvo sesiones dentro del
+    # rango y dentro del alcance del rol, mostramos la clínica/fisio OPERATIVOS
+    # de esas sesiones. Esto evita que un secretario de Atahualpa vea
+    # "Centro Principal" solo porque el paciente compartido fue creado allí.
+    pago_operativo_por_tratamiento: Dict[int, Tuple[str, str]] = {}
+    if tratamiento_ids_pagos:
+        sesiones_pago_query = (
+            db.query(SesionTerapia)
+            .options(joinedload(SesionTerapia.terapeuta))
+            .filter(
+                SesionTerapia.tratamientopacienteid.in_(tratamiento_ids_pagos),
+                SesionTerapia.fecha.between(desde, hasta),
+                SesionTerapia.horasalida != None,
+            )
+        )
+        sesiones_pago_query = _aplicar_filtros_sesiones(
+            sesiones_pago_query,
+            current_user,
+            terapeutaid=terapeutaid,
+            consultorioid=consultorioid,
+        )
+        for sesion_ref in sesiones_pago_query.order_by(
+            SesionTerapia.fecha,
+            SesionTerapia.horaingreso,
+            SesionTerapia.id,
+        ).all():
+            if sesion_ref.tratamientopacienteid in pago_operativo_por_tratamiento:
+                continue
+            terapeuta_ref = sesion_ref.terapeuta
+            pago_operativo_por_tratamiento[sesion_ref.tratamientopacienteid] = (
+                _nombre_usuario(terapeuta_ref),
+                consultorios_map.get(
+                    getattr(terapeuta_ref, "consultorioid", None),
+                    "Sin consultorio",
+                ),
+            )
+
     tratamiento_map = _excel_map_tratamientos(
         db,
-        {p.tratamientopacienteid for p in pagos_terapia},
+        tratamiento_ids_pagos,
     )
     pacientes_map = _excel_map_pacientes(
         db,
@@ -2723,7 +2776,11 @@ def _excel_base_pagos(
         observacion: str = "",
     ) -> None:
         fecha_pago = _excel_fecha_desde_datetime(pago.fechapago)
-        excel_row_number = len(rows) + 2
+        caja_valida = round(float(pago.monto or 0), 2) if (
+            pago.estadopago == 2
+            and not bool(pago.espagoprevio)
+            and not bool(pago.anulado)
+        ) else 0.0
         rows.append(
             [
                 pago.id,
@@ -2743,7 +2800,7 @@ def _excel_base_pagos(
                 referencia,
                 observacion,
                 pago.creado_por_id,
-                f'=IF(AND(J{excel_row_number}="Verificado",L{excel_row_number}="No",N{excel_row_number}="No"),K{excel_row_number},0)',
+                caja_valida,
             ]
         )
 
@@ -2751,13 +2808,20 @@ def _excel_base_pagos(
         tratamiento = tratamiento_map.get(pago.tratamientopacienteid)
         paciente = pacientes_map.get(pago.pacienteid) or pacientes_map.get(getattr(tratamiento, "pacienteid", None))
         terapeuta = usuarios_map.get(getattr(paciente, "terapeutaasignadoid", None))
+        responsable_pago = _nombre_usuario(terapeuta)
+        consultorio_pago = consultorios_map.get(getattr(paciente, "consultorioid", None), "Sin consultorio")
+
+        operativo = pago_operativo_por_tratamiento.get(pago.tratamientopacienteid)
+        if operativo is not None:
+            responsable_pago, consultorio_pago = operativo
+
         referencia = _excel_safe_text(getattr(tratamiento, "tipotratamiento", "Terapia"))
         observacion = _excel_safe_text(pago.observacionpagoprevio or pago.motivo_rechazo or pago.motivo_anulacion)
         add_pago_row(
             pago=pago,
             paciente=paciente,
-            responsable=_nombre_usuario(terapeuta),
-            consultorio_nombre=consultorios_map.get(getattr(paciente, "consultorioid", None), "Sin consultorio"),
+            responsable=responsable_pago,
+            consultorio_nombre=consultorio_pago,
             tipo="Terapia",
             referencia=referencia,
             observacion=observacion,
@@ -3124,7 +3188,7 @@ def _excel_configurar_panel_filtros_dashboard(ws, rangos: Dict[str, str], desde:
     ws["A9"] = "Periodo"
     ws["B9"] = f"{desde.strftime('%d/%m/%Y')} - {hasta.strftime('%d/%m/%Y')}"
     ws["A10"] = "Uso"
-    ws["B10"] = "Cambia los 3 desplegables y los valores se recalculan."
+    ws["B10"] = "Cambia los 3 desplegables: KPIs y gráficas se recalculan."
     ws["B10"].alignment = Alignment(wrap_text=True, vertical="center")
 
     for rng in ["A4:C10"]:
@@ -3168,11 +3232,173 @@ def _excel_configurar_panel_filtros_dashboard(ws, rangos: Dict[str, str], desde:
 
     ws["A16"] = "Importante"
     ws["A16"].font = Font(bold=True, color="12355B", size=12)
-    ws["A17"] = "• Esta hoja es el panel principal. No necesitas filtrar tabla por tabla."
-    ws["A18"] = "• Las hojas Sesiones_Filtradas y Pagos_Filtrados usan estos mismos filtros."
-    ws["A19"] = "• Las hojas Base_Sesiones y Base_Pagos quedan como respaldo completo de auditoría."
+    ws["A17"] = "• Esta hoja es el panel principal: KPIs y gráficas obedecen a la cajita de filtros."
+    ws["A18"] = "• Base_Sesiones y Base_Pagos conservan todos los datos de la semana para auditoría."
+    ws["A19"] = "• Si necesitas revisar registros exactos, usa los filtros nativos de esas tablas base."
     ws["A20"] = "• Fisioterapeutas: lunes a viernes 35%; sábado y domingo 40%."
     ws["A21"] = "• Si cambias un filtro y no se actualiza, presiona F9 o guarda y vuelve a abrir el archivo."
+
+
+
+def _excel_formula_cond_sesiones_grafica_dia(dia_cell: str) -> str:
+    """Condiciones SUMPRODUCT para gráficos por día en Dashboard."""
+    return (
+        f"--ISNUMBER(tblBaseSesiones[ID Sesión]),"
+        f"--(((Dashboard!$B$5=\"Todos\")+(tblBaseSesiones[Clínica / Consultorio]=Dashboard!$B$5))>0),"
+        f"--(((Dashboard!$B$6=\"Todos\")+(tblBaseSesiones[Fisioterapeuta]=Dashboard!$B$6))>0),"
+        f"--(tblBaseSesiones[Día]={dia_cell}),"
+        f"IF(Dashboard!$B$7=\"Todos\",1,--({dia_cell}=Dashboard!$B$7))"
+    )
+
+
+def _excel_formula_cond_pagos_grafica_dia(dia_cell: str) -> str:
+    """Condiciones SUMPRODUCT para pagos por día en Dashboard."""
+    return (
+        f"--ISNUMBER(tblBasePagos[ID Pago]),"
+        f"--(((Dashboard!$B$5=\"Todos\")+(tblBasePagos[Clínica / Consultorio]=Dashboard!$B$5))>0),"
+        f"--(((Dashboard!$B$6=\"Todos\")+(tblBasePagos[Fisioterapeuta / Responsable]=Dashboard!$B$6))>0),"
+        f"--(tblBasePagos[Día]={dia_cell}),"
+        f"IF(Dashboard!$B$7=\"Todos\",1,--({dia_cell}=Dashboard!$B$7))"
+    )
+
+
+def _excel_formula_cond_pagos_grafica_metodo(metodo_cell: str) -> str:
+    """Condiciones SUMPRODUCT para gráfico de métodos de pago filtrado por Dashboard."""
+    return (
+        f"--ISNUMBER(tblBasePagos[ID Pago]),"
+        f"--(((Dashboard!$B$5=\"Todos\")+(tblBasePagos[Clínica / Consultorio]=Dashboard!$B$5))>0),"
+        f"--(((Dashboard!$B$6=\"Todos\")+(tblBasePagos[Fisioterapeuta / Responsable]=Dashboard!$B$6))>0),"
+        f"--(((Dashboard!$B$7=\"Todos\")+(tblBasePagos[Día]=Dashboard!$B$7))>0),"
+        f"--(tblBasePagos[Método]={metodo_cell})"
+    )
+
+
+def _excel_crear_graficas_dashboard(ws, base_pagos: List[List]) -> None:
+    """
+    Crea gráficas vinculadas a la cajita de filtros del Dashboard.
+
+    No usa FILTER(), SORT() ni UNIQUE() para evitar archivos que Excel intente reparar.
+    Las gráficas leen tablas auxiliares con SUMPRODUCT, por eso cambian cuando se modifica
+    Clínica / Consultorio, Fisioterapeuta o Día de semana en B5:B7.
+    """
+    from openpyxl.chart import BarChart, Reference, PieChart
+    from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
+
+    azul = "1F4E78"
+    azul_claro = "D9EAF7"
+    blanco = "FFFFFF"
+    gris = "F4F6F8"
+    borde = Border(
+        left=Side(style="thin", color="D9E2EA"),
+        right=Side(style="thin", color="D9E2EA"),
+        top=Side(style="thin", color="D9E2EA"),
+        bottom=Side(style="thin", color="D9E2EA"),
+    )
+
+    # Tablas auxiliares visibles debajo de las gráficas. Son simples y compatibles.
+    start_day = 50
+    ws.cell(row=start_day - 1, column=1, value="Datos para gráficas vinculadas a filtros")
+    ws.cell(row=start_day - 1, column=1).font = Font(bold=True, color="12355B", size=12)
+
+    day_headers = ["Día", "Generado terapias", "Pagado caja", "Sesiones"]
+    for col_idx, header in enumerate(day_headers, start=1):
+        cell = ws.cell(row=start_day, column=col_idx, value=header)
+        cell.fill = PatternFill("solid", fgColor=azul)
+        cell.font = Font(bold=True, color=blanco)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = borde
+
+    dias = ["Domingo", "Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"]
+    for offset, dia in enumerate(dias, start=1):
+        row = start_day + offset
+        dia_ref = f"$A${row}"
+        cond_sesiones = _excel_formula_cond_sesiones_grafica_dia(dia_ref)
+        cond_pagos = _excel_formula_cond_pagos_grafica_dia(dia_ref)
+
+        ws.cell(row=row, column=1, value=dia)
+        ws.cell(row=row, column=2, value=f"=SUMPRODUCT(tblBaseSesiones[Precio sesión],{cond_sesiones})")
+        ws.cell(row=row, column=3, value=f"=SUMPRODUCT(tblBasePagos[Caja válida],{cond_pagos})")
+        ws.cell(row=row, column=4, value=f"=SUMPRODUCT({cond_sesiones})")
+        for col_idx in range(1, 5):
+            cell = ws.cell(row=row, column=col_idx)
+            cell.border = borde
+            if col_idx in {2, 3}:
+                cell.number_format = '$#,##0.00;[Red]-$#,##0.00'
+            elif col_idx == 4:
+                cell.number_format = "0"
+
+    # Métodos de pago reales encontrados en la semana. Si no hay, se deja una fila neutra.
+    metodos = sorted({str(row[8]).strip() for row in base_pagos if len(row) > 8 and str(row[8] or "").strip()})
+    if not metodos:
+        metodos = ["Sin pagos"]
+
+    start_method_col = 6  # F:G
+    method_headers = ["Método", "Caja válida"]
+    for col_offset, header in enumerate(method_headers):
+        cell = ws.cell(row=start_day, column=start_method_col + col_offset, value=header)
+        cell.fill = PatternFill("solid", fgColor=azul)
+        cell.font = Font(bold=True, color=blanco)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = borde
+
+    for offset, metodo in enumerate(metodos, start=1):
+        row = start_day + offset
+        metodo_ref = f"$F${row}"
+        ws.cell(row=row, column=start_method_col, value=metodo)
+        if metodo == "Sin pagos":
+            ws.cell(row=row, column=start_method_col + 1, value=0)
+        else:
+            cond_metodo = _excel_formula_cond_pagos_grafica_metodo(metodo_ref)
+            ws.cell(row=row, column=start_method_col + 1, value=f"=SUMPRODUCT(tblBasePagos[Caja válida],{cond_metodo})")
+        for col_idx in range(start_method_col, start_method_col + 2):
+            cell = ws.cell(row=row, column=col_idx)
+            cell.border = borde
+            if col_idx == start_method_col + 1:
+                cell.number_format = '$#,##0.00;[Red]-$#,##0.00'
+
+    # Estilo ligero para las tablas auxiliares.
+    for row in range(start_day + 1, start_day + max(len(dias), len(metodos)) + 1):
+        for col in range(1, 8):
+            cell = ws.cell(row=row, column=col)
+            if row % 2 == 0 and cell.value not in (None, ""):
+                cell.fill = PatternFill("solid", fgColor=gris)
+
+    for col_letter, width in {"A": 14, "B": 18, "C": 16, "D": 12, "F": 18, "G": 16}.items():
+        ws.column_dimensions[col_letter].width = max(ws.column_dimensions[col_letter].width or 0, width)
+
+    # Gráfico 1: usa la tabla auxiliar por día, por eso cambia con la cajita de filtros.
+    bar = BarChart()
+    bar.title = "Generado vs pagado por día"
+    bar.y_axis.title = "USD"
+    bar.x_axis.title = "Día"
+    data = Reference(ws, min_col=2, max_col=3, min_row=start_day, max_row=start_day + len(dias))
+    cats = Reference(ws, min_col=1, min_row=start_day + 1, max_row=start_day + len(dias))
+    bar.add_data(data, titles_from_data=True)
+    bar.set_categories(cats)
+    bar.height = 8
+    bar.width = 18
+    ws.add_chart(bar, "A23")
+
+    # Gráfico 2: método de pago, también vinculado a los filtros del Dashboard.
+    pie = PieChart()
+    pie.title = "Caja válida por método"
+    data = Reference(
+        ws,
+        min_col=start_method_col + 1,
+        min_row=start_day,
+        max_row=start_day + len(metodos),
+    )
+    labels = Reference(
+        ws,
+        min_col=start_method_col,
+        min_row=start_day + 1,
+        max_row=start_day + len(metodos),
+    )
+    pie.add_data(data, titles_from_data=True)
+    pie.set_categories(labels)
+    pie.height = 8
+    pie.width = 11
+    ws.add_chart(pie, "G23")
 
 
 
@@ -3410,8 +3636,6 @@ def _crear_excel_reporte_corpofit(
 
     ws_dashboard = wb.active
     ws_dashboard.title = "Dashboard"
-    ws_sesiones_filtradas = wb.create_sheet("Sesiones_Filtradas")
-    ws_pagos_filtrados = wb.create_sheet("Pagos_Filtrados")
     ws_analisis = wb.create_sheet("Análisis")
     ws_sesiones = wb.create_sheet("Base_Sesiones")
     ws_pagos = wb.create_sheet("Base_Pagos")
@@ -3576,75 +3800,18 @@ def _crear_excel_reporte_corpofit(
     _excel_agregar_tabla(ws_pagos, 1, 1, pagos_headers, base_pagos, "tblBasePagos")
     ws_pagos.freeze_panes = "A2"
 
-    # Columnas auxiliares ocultas para las vistas filtradas, compatibles con Excel móvil/WPS.
-    _excel_agregar_columnas_helper_filtros(
-        ws_sesiones,
-        ws_pagos,
-        sesiones_rows_count=len(base_sesiones),
-        pagos_rows_count=len(base_pagos),
-    )
-
-    # Panel central de filtros: una sola cajita controla los resúmenes y vistas.
+    # Panel central de filtros: una sola cajita controla KPIs y gráficas.
     rangos_filtros = _excel_crear_listas_filtros(wb, base_sesiones, base_pagos)
     _excel_escribir_titulo(ws_dashboard, "CORPOFIT PRO — REPORTE EXCEL", subtitulo)
     _excel_configurar_panel_filtros_dashboard(ws_dashboard, rangos_filtros, desde, hasta)
-    _excel_crear_vistas_filtradas(
-        ws_sesiones_filtradas,
-        ws_pagos_filtrados,
-        sesiones_headers,
-        pagos_headers,
-        len(base_sesiones),
-        len(base_pagos),
-    )
 
-    # Gráficos del Dashboard basados en Análisis.
-    if general.sesiones_por_dia:
-        chart = BarChart()
-        chart.title = "Generado vs pagado por día"
-        chart.y_axis.title = "USD"
-        chart.x_axis.title = "Día"
-        data = Reference(
-            ws_analisis,
-            min_col=4,
-            max_col=5,
-            min_row=daily_table_start,
-            max_row=daily_table_start + len(general.sesiones_por_dia),
-        )
-        cats = Reference(
-            ws_analisis,
-            min_col=2,
-            min_row=daily_table_start + 1,
-            max_row=daily_table_start + len(general.sesiones_por_dia),
-        )
-        chart.add_data(data, titles_from_data=True)
-        chart.set_categories(cats)
-        chart.height = 8
-        chart.width = 18
-        ws_dashboard.add_chart(chart, "A21")
-
-    if general.por_metodo_pago:
-        pie = PieChart()
-        pie.title = "Ingresos por método"
-        data = Reference(
-            ws_analisis,
-            min_col=2,
-            min_row=metodo_table_start,
-            max_row=metodo_table_start + len(general.por_metodo_pago),
-        )
-        labels = Reference(
-            ws_analisis,
-            min_col=1,
-            min_row=metodo_table_start + 1,
-            max_row=metodo_table_start + len(general.por_metodo_pago),
-        )
-        pie.add_data(data, titles_from_data=True)
-        pie.set_categories(labels)
-        pie.height = 8
-        pie.width = 11
-        ws_dashboard.add_chart(pie, "G21")
+    # Gráficas vinculadas a los filtros del Dashboard.
+    # Se usan tablas auxiliares con SUMPRODUCT; no se usa FILTER() para evitar
+    # archivos que Excel/WPS intenten reparar al abrir.
+    _excel_crear_graficas_dashboard(ws_dashboard, base_pagos)
 
     # Formatos y estilo visual.
-    for ws in [ws_dashboard, ws_sesiones_filtradas, ws_pagos_filtrados, ws_analisis, ws_sesiones, ws_pagos]:
+    for ws in [ws_dashboard, ws_analisis, ws_sesiones, ws_pagos]:
         ws.freeze_panes = ws.freeze_panes or "A4"
         for row in ws.iter_rows():
             for cell in row:
@@ -3652,7 +3819,7 @@ def _crear_excel_reporte_corpofit(
 
     _excel_aplicar_estilo_workbook(wb)
 
-    for ws in [ws_sesiones_filtradas, ws_pagos_filtrados, ws_analisis, ws_sesiones, ws_pagos]:
+    for ws in [ws_analisis, ws_sesiones, ws_pagos]:
         for row in ws.iter_rows(min_row=2):
             for cell in row:
                 header = str(ws.cell(row=1, column=cell.column).value or "").lower()
@@ -3666,7 +3833,7 @@ def _crear_excel_reporte_corpofit(
                     cell.number_format = "dd/mm/yyyy"
 
     # Ajuste final de formatos por columnas conocidas.
-    for ws in [ws_dashboard, ws_sesiones_filtradas, ws_pagos_filtrados, ws_analisis, ws_sesiones, ws_pagos]:
+    for ws in [ws_dashboard, ws_analisis, ws_sesiones, ws_pagos]:
         for row in ws.iter_rows():
             for cell in row:
                 if isinstance(cell.value, date):
