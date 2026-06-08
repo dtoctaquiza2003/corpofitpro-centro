@@ -56,8 +56,13 @@ DIAS_SEMANA = [
     "Domingo",
 ]
 
+# Terapias CORPOFIT:
+# - Lunes a viernes: 35% fisioterapeuta / 65% clínica.
+# - Sábado y domingo: 40% fisioterapeuta / 60% clínica.
 PORCENTAJE_FISIO_TERAPIA = 0.35
 PORCENTAJE_CLINICA_TERAPIA = 0.65
+PORCENTAJE_FISIO_TERAPIA_FIN_SEMANA = 0.40
+PORCENTAJE_CLINICA_TERAPIA_FIN_SEMANA = 0.60
 PORCENTAJE_FISIO_GIMNASIO = 0.50
 PORCENTAJE_CLINICA_GIMNASIO = 0.50
 
@@ -74,6 +79,35 @@ def now_ecuador() -> datetime:
 
 def fecha_ecuador() -> date:
     return now_ecuador().date()
+
+
+def _es_fin_semana(fecha: Optional[date]) -> bool:
+    """True si la fecha cae sábado o domingo."""
+    return bool(fecha and fecha.weekday() in {5, 6})
+
+
+def porcentaje_fisio_terapia_por_fecha(fecha: Optional[date]) -> float:
+    return (
+        PORCENTAJE_FISIO_TERAPIA_FIN_SEMANA
+        if _es_fin_semana(fecha)
+        else PORCENTAJE_FISIO_TERAPIA
+    )
+
+
+def porcentaje_clinica_terapia_por_fecha(fecha: Optional[date]) -> float:
+    return (
+        PORCENTAJE_CLINICA_TERAPIA_FIN_SEMANA
+        if _es_fin_semana(fecha)
+        else PORCENTAJE_CLINICA_TERAPIA
+    )
+
+
+def ganancia_fisio_terapia(monto: float, fecha: Optional[date]) -> float:
+    return float(monto or 0) * porcentaje_fisio_terapia_por_fecha(fecha)
+
+
+def ganancia_clinica_terapia(monto: float, fecha: Optional[date]) -> float:
+    return float(monto or 0) * porcentaje_clinica_terapia_por_fecha(fecha)
 
 def rango_fechas_ecuador(desde: date, hasta: date) -> tuple[datetime, datetime]:
     """Devuelve [inicio, fin) del rango usando día calendario de Ecuador.
@@ -564,7 +598,7 @@ def _pagos_gimnasio_por_terapeuta(
     Ecuasanitas, gimnasio mensual y gimnasio diario se cobran normal.
 
     Regla de negocio:
-    - Terapia: 35% para fisioterapeuta.
+    - Terapia: 35% para fisioterapeuta de lunes a viernes; 40% sábado y domingo.
     - Gimnasio mensual y diario: 50% para fisioterapeuta.
 
     La asignación se hace por el terapeuta principal del paciente
@@ -819,8 +853,8 @@ def _calcular_cuentas_tratamientos(
 
         # Ecuasanitas SOLO aplica a tratamientos/sesiones de terapia.
         # La deuda de terapia no se marca como pendiente del paciente.
-        # La sesión sí genera comisión del 35% para el terapeuta y 65%
-        # para la clínica. Gimnasio mensual/diario se cobra normal y
+        # La sesión sí genera comisión para el terapeuta:
+        # 35% de lunes a viernes y 40% sábado/domingo. Gimnasio mensual/diario se cobra normal y
         # no entra en esta cuenta.
         if es_ecuasanitas:
             saldo = 0.0
@@ -1881,7 +1915,11 @@ def reporte_fisioterapeutas_semanal(
         consultorioid=consultorioid,
     )
 
-    sesiones = sesiones_query.all()
+    sesiones = sesiones_query.order_by(
+        SesionTerapia.fecha,
+        SesionTerapia.horaingreso,
+        SesionTerapia.id,
+    ).all()
 
     consultorios_map = _obtener_consultorios_map(db)
 
@@ -1909,7 +1947,7 @@ def reporte_fisioterapeutas_semanal(
     )
 
     data: Dict[int, Dict[str, float | int | str | None]] = {}
-    generado_por_tratamiento_en_rango: Dict[Tuple[int, int], float] = {}
+    sesiones_no_ecuasanitas: List[Tuple[int, int, float, date]] = []
 
     for sesion in sesiones:
         terapeuta_id = sesion.terapeutaid
@@ -1930,20 +1968,26 @@ def reporte_fisioterapeutas_semanal(
                 "total_generado": 0.0,
                 "total_ecuasanitas": 0.0,
                 "total_gimnasio_pagado": 0.0,
+                "ganancia_terapia_total": 0.0,
+                "ganancia_terapia_ecuasanitas": 0.0,
             },
         )
 
+        ganancia_fisio = ganancia_fisio_terapia(precio, sesion.fecha)
         item["sesiones"] = int(item["sesiones"]) + 1
         item["total_generado"] = float(item["total_generado"]) + precio
+        item["ganancia_terapia_total"] = float(item["ganancia_terapia_total"]) + ganancia_fisio
 
         if _es_paciente_ecuasanitas(sesion.paciente):
             item["total_ecuasanitas"] = (
                 float(item.get("total_ecuasanitas", 0.0)) + precio
             )
+            item["ganancia_terapia_ecuasanitas"] = (
+                float(item.get("ganancia_terapia_ecuasanitas", 0.0)) + ganancia_fisio
+            )
         else:
-            key = (terapeuta_id, tratamiento_id)
-            generado_por_tratamiento_en_rango[key] = (
-                generado_por_tratamiento_en_rango.get(key, 0.0) + precio
+            sesiones_no_ecuasanitas.append(
+                (terapeuta_id, tratamiento_id, precio, sesion.fecha)
             )
 
     for row in pagos_gimnasio_rows:
@@ -1964,6 +2008,8 @@ def reporte_fisioterapeutas_semanal(
                 "total_generado": 0.0,
                 "total_ecuasanitas": 0.0,
                 "total_gimnasio_pagado": 0.0,
+                "ganancia_terapia_total": 0.0,
+                "ganancia_terapia_ecuasanitas": 0.0,
             },
         )
 
@@ -1971,17 +2017,28 @@ def reporte_fisioterapeutas_semanal(
             float(item.get("total_gimnasio_pagado", 0.0)) + total_gimnasio_pagado
         )
 
-    pagado_por_terapeuta: Dict[int, float] = {
-        tid: 0.0
-        for tid in data.keys()
-    }
+    pagado_por_terapeuta: Dict[int, float] = {tid: 0.0 for tid in data.keys()}
+    ganancia_cobrada_no_ecuasanitas_por_terapeuta: Dict[int, float] = {tid: 0.0 for tid in data.keys()}
+    ganancia_pendiente_por_terapeuta: Dict[int, float] = {tid: 0.0 for tid in data.keys()}
 
-    for (terapeuta_id, tratamiento_id), generado in generado_por_tratamiento_en_rango.items():
+    # Se distribuye el pago por sesión para respetar el porcentaje de cada fecha:
+    # lunes-viernes 35%, sábado-domingo 40%.
+    for terapeuta_id, tratamiento_id, precio, fecha_sesion in sesiones_no_ecuasanitas:
         disponible = disponible_pagado.get(tratamiento_id, 0.0)
-        aplicado = min(generado, disponible)
+        aplicado = min(precio, disponible)
+        pendiente = max(precio - aplicado, 0.0)
+        porcentaje_fisio = porcentaje_fisio_terapia_por_fecha(fecha_sesion)
 
         pagado_por_terapeuta[terapeuta_id] = (
             pagado_por_terapeuta.get(terapeuta_id, 0.0) + aplicado
+        )
+        ganancia_cobrada_no_ecuasanitas_por_terapeuta[terapeuta_id] = (
+            ganancia_cobrada_no_ecuasanitas_por_terapeuta.get(terapeuta_id, 0.0)
+            + aplicado * porcentaje_fisio
+        )
+        ganancia_pendiente_por_terapeuta[terapeuta_id] = (
+            ganancia_pendiente_por_terapeuta.get(terapeuta_id, 0.0)
+            + pendiente * porcentaje_fisio
         )
 
         disponible_pagado[tratamiento_id] = max(disponible - aplicado, 0.0)
@@ -1996,10 +2053,13 @@ def reporte_fisioterapeutas_semanal(
         pendiente_terapia = max(total_no_ecuasanitas - total_terapia_pagado, 0.0)
         total_gimnasio_pagado = float(item.get("total_gimnasio_pagado", 0.0))
 
-        ganancia_terapia_total = total_terapia_generado * PORCENTAJE_FISIO_TERAPIA
-        ganancia_terapia_ecuasanitas = total_ecuasanitas * PORCENTAJE_FISIO_TERAPIA
-        ganancia_terapia_cobrada = (total_terapia_pagado + total_ecuasanitas) * PORCENTAJE_FISIO_TERAPIA
-        ganancia_terapia_pendiente = pendiente_terapia * PORCENTAJE_FISIO_TERAPIA
+        ganancia_terapia_total = float(item.get("ganancia_terapia_total", 0.0))
+        ganancia_terapia_ecuasanitas = float(item.get("ganancia_terapia_ecuasanitas", 0.0))
+        ganancia_terapia_cobrada = (
+            ganancia_cobrada_no_ecuasanitas_por_terapeuta.get(tid, 0.0)
+            + ganancia_terapia_ecuasanitas
+        )
+        ganancia_terapia_pendiente = ganancia_pendiente_por_terapeuta.get(tid, 0.0)
         ganancia_gimnasio_cobrada = total_gimnasio_pagado * PORCENTAJE_FISIO_GIMNASIO
 
         resultado.append(
@@ -2080,7 +2140,11 @@ def reporte_fisioterapeuta_detalle(
         consultorioid=consultorioid,
     )
 
-    sesiones = sesiones_query.all()
+    sesiones = sesiones_query.order_by(
+        SesionTerapia.fecha,
+        SesionTerapia.horaingreso,
+        SesionTerapia.id,
+    ).all()
 
     consultorios_map = _obtener_consultorios_map(db)
 
@@ -2119,13 +2183,18 @@ def reporte_fisioterapeuta_detalle(
                 "sesiones": 0,
                 "precio_sesion": _precio_aplicado(tratamiento),
                 "total_generado": 0.0,
+                "ganancia_total": 0.0,
                 "es_ecuasanitas": _es_paciente_ecuasanitas(sesion.paciente),
+                "sesiones_detalle": [],
             },
         )
 
         precio = _precio_aplicado(tratamiento)
         item["sesiones"] += 1
         item["total_generado"] += precio
+        item["ganancia_total"] += ganancia_fisio_terapia(precio, sesion.fecha)
+        item["sesiones_detalle"].append((precio, sesion.fecha))
+
         if _es_paciente_ecuasanitas(sesion.paciente):
             item["es_ecuasanitas"] = True
 
@@ -2133,22 +2202,35 @@ def reporte_fisioterapeuta_detalle(
 
     for (_, tratamiento_id), item in agrupado.items():
         generado = float(item["total_generado"])
+        ganancia_total = float(item.get("ganancia_total", 0.0))
         es_ecuasanitas = bool(item.get("es_ecuasanitas", False))
 
         if es_ecuasanitas:
             pagado = 0.0
             pendiente = 0.0
             cubierto_ecuasanitas = generado
-            ganancia_cobrada = generado * PORCENTAJE_FISIO_TERAPIA
+            ganancia_cobrada = ganancia_total
             ganancia_pendiente = 0.0
         else:
             disponible = disponible_pagado.get(tratamiento_id, 0.0)
-            pagado = min(generado, disponible)
-            pendiente = max(generado - pagado, 0.0)
+            pagado = 0.0
+            pendiente = 0.0
+            ganancia_cobrada = 0.0
+            ganancia_pendiente = 0.0
+
+            for precio, fecha_sesion in item.get("sesiones_detalle", []):
+                aplicado = min(float(precio or 0), disponible)
+                saldo = max(float(precio or 0) - aplicado, 0.0)
+                porcentaje_fisio = porcentaje_fisio_terapia_por_fecha(fecha_sesion)
+
+                pagado += aplicado
+                pendiente += saldo
+                ganancia_cobrada += aplicado * porcentaje_fisio
+                ganancia_pendiente += saldo * porcentaje_fisio
+                disponible = max(disponible - aplicado, 0.0)
+
             cubierto_ecuasanitas = 0.0
-            ganancia_cobrada = pagado * PORCENTAJE_FISIO_TERAPIA
-            ganancia_pendiente = pendiente * PORCENTAJE_FISIO_TERAPIA
-            disponible_pagado[tratamiento_id] = max(disponible - pagado, 0.0)
+            disponible_pagado[tratamiento_id] = disponible
 
         pacientes.append(
             FisioDetallePacienteOut(
@@ -2165,7 +2247,7 @@ def reporte_fisioterapeuta_detalle(
                 pendiente_paciente=round(pendiente, 2),
                 es_ecuasanitas=es_ecuasanitas,
                 cubierto_ecuasanitas=round(cubierto_ecuasanitas, 2),
-                ganancia_fisio=round(generado * PORCENTAJE_FISIO_TERAPIA, 2),
+                ganancia_fisio=round(ganancia_total, 2),
                 ganancia_cobrada=round(ganancia_cobrada, 2),
                 ganancia_pendiente=round(ganancia_pendiente, 2),
             )
@@ -2222,7 +2304,11 @@ def reporte_clinicas_semanal(
         consultorioid=consultorioid,
     )
 
-    sesiones = sesiones_query.all()
+    sesiones = sesiones_query.order_by(
+        SesionTerapia.fecha,
+        SesionTerapia.horaingreso,
+        SesionTerapia.id,
+    ).all()
 
     consultorios_map = _obtener_consultorios_map(db)
 
@@ -2250,7 +2336,7 @@ def reporte_clinicas_semanal(
     )
 
     data: Dict[Optional[int], Dict[str, float | int | str | None]] = {}
-    generado_por_clinica_tratamiento: Dict[Tuple[Optional[int], int], float] = {}
+    sesiones_no_ecuasanitas: List[Tuple[Optional[int], int, float, date]] = []
 
     for sesion in sesiones:
         consultorio_id = sesion.paciente.consultorioid if sesion.paciente else None
@@ -2269,20 +2355,38 @@ def reporte_clinicas_semanal(
                 "total_generado": 0.0,
                 "total_ecuasanitas": 0.0,
                 "total_gimnasio_pagado": 0.0,
+                "ganancia_fisios_terapia_total": 0.0,
+                "ganancia_fisios_terapia_ecuasanitas": 0.0,
+                "ganancia_clinica_terapia_total": 0.0,
+                "ganancia_clinica_terapia_ecuasanitas": 0.0,
             },
         )
 
+        ganancia_fisio = ganancia_fisio_terapia(precio, sesion.fecha)
+        ganancia_clinica = ganancia_clinica_terapia(precio, sesion.fecha)
+
         item["sesiones"] = int(item["sesiones"]) + 1
         item["total_generado"] = float(item["total_generado"]) + precio
+        item["ganancia_fisios_terapia_total"] = (
+            float(item.get("ganancia_fisios_terapia_total", 0.0)) + ganancia_fisio
+        )
+        item["ganancia_clinica_terapia_total"] = (
+            float(item.get("ganancia_clinica_terapia_total", 0.0)) + ganancia_clinica
+        )
 
         if _es_paciente_ecuasanitas(sesion.paciente):
             item["total_ecuasanitas"] = (
                 float(item.get("total_ecuasanitas", 0.0)) + precio
             )
+            item["ganancia_fisios_terapia_ecuasanitas"] = (
+                float(item.get("ganancia_fisios_terapia_ecuasanitas", 0.0)) + ganancia_fisio
+            )
+            item["ganancia_clinica_terapia_ecuasanitas"] = (
+                float(item.get("ganancia_clinica_terapia_ecuasanitas", 0.0)) + ganancia_clinica
+            )
         else:
-            key = (consultorio_id, tratamiento_id)
-            generado_por_clinica_tratamiento[key] = (
-                generado_por_clinica_tratamiento.get(key, 0.0) + precio
+            sesiones_no_ecuasanitas.append(
+                (consultorio_id, tratamiento_id, precio, sesion.fecha)
             )
 
     for row in pagos_gimnasio_rows:
@@ -2301,6 +2405,10 @@ def reporte_clinicas_semanal(
                 "total_generado": 0.0,
                 "total_ecuasanitas": 0.0,
                 "total_gimnasio_pagado": 0.0,
+                "ganancia_fisios_terapia_total": 0.0,
+                "ganancia_fisios_terapia_ecuasanitas": 0.0,
+                "ganancia_clinica_terapia_total": 0.0,
+                "ganancia_clinica_terapia_ecuasanitas": 0.0,
             },
         )
 
@@ -2308,17 +2416,39 @@ def reporte_clinicas_semanal(
             float(item.get("total_gimnasio_pagado", 0.0)) + total_gimnasio_pagado
         )
 
-    pagado_por_clinica: Dict[Optional[int], float] = {
-        cid: 0.0
-        for cid in data.keys()
-    }
+    pagado_por_clinica: Dict[Optional[int], float] = {cid: 0.0 for cid in data.keys()}
+    ganancia_fisios_cobrada_no_ecuasanitas: Dict[Optional[int], float] = {cid: 0.0 for cid in data.keys()}
+    ganancia_fisios_pendiente: Dict[Optional[int], float] = {cid: 0.0 for cid in data.keys()}
+    ganancia_clinica_cobrada_no_ecuasanitas: Dict[Optional[int], float] = {cid: 0.0 for cid in data.keys()}
+    ganancia_clinica_pendiente: Dict[Optional[int], float] = {cid: 0.0 for cid in data.keys()}
 
-    for (consultorio_id, tratamiento_id), generado in generado_por_clinica_tratamiento.items():
+    # Se distribuye el pago por sesión para respetar el porcentaje de cada fecha:
+    # lunes-viernes 35%/65%, sábado-domingo 40%/60%.
+    for consultorio_id, tratamiento_id, precio, fecha_sesion in sesiones_no_ecuasanitas:
         disponible = disponible_pagado.get(tratamiento_id, 0.0)
-        aplicado = min(generado, disponible)
+        aplicado = min(precio, disponible)
+        pendiente = max(precio - aplicado, 0.0)
+        porcentaje_fisio = porcentaje_fisio_terapia_por_fecha(fecha_sesion)
+        porcentaje_clinica = porcentaje_clinica_terapia_por_fecha(fecha_sesion)
 
         pagado_por_clinica[consultorio_id] = (
             pagado_por_clinica.get(consultorio_id, 0.0) + aplicado
+        )
+        ganancia_fisios_cobrada_no_ecuasanitas[consultorio_id] = (
+            ganancia_fisios_cobrada_no_ecuasanitas.get(consultorio_id, 0.0)
+            + aplicado * porcentaje_fisio
+        )
+        ganancia_fisios_pendiente[consultorio_id] = (
+            ganancia_fisios_pendiente.get(consultorio_id, 0.0)
+            + pendiente * porcentaje_fisio
+        )
+        ganancia_clinica_cobrada_no_ecuasanitas[consultorio_id] = (
+            ganancia_clinica_cobrada_no_ecuasanitas.get(consultorio_id, 0.0)
+            + aplicado * porcentaje_clinica
+        )
+        ganancia_clinica_pendiente[consultorio_id] = (
+            ganancia_clinica_pendiente.get(consultorio_id, 0.0)
+            + pendiente * porcentaje_clinica
         )
 
         disponible_pagado[tratamiento_id] = max(disponible - aplicado, 0.0)
@@ -2331,17 +2461,24 @@ def reporte_clinicas_semanal(
         total_terapia_pagado = float(pagado_por_clinica.get(consultorio_id, 0.0))
         total_no_ecuasanitas = max(total_terapia_generado - total_ecuasanitas, 0.0)
         pendiente_terapia = max(total_no_ecuasanitas - total_terapia_pagado, 0.0)
-        total_cobrado_o_cubierto = total_terapia_pagado + total_ecuasanitas
         total_gimnasio_pagado = float(item.get("total_gimnasio_pagado", 0.0))
 
-        ganancia_fisios_terapia_total = total_terapia_generado * PORCENTAJE_FISIO_TERAPIA
-        ganancia_fisios_terapia_cobrada = total_cobrado_o_cubierto * PORCENTAJE_FISIO_TERAPIA
-        ganancia_fisios_terapia_pendiente = pendiente_terapia * PORCENTAJE_FISIO_TERAPIA
-        ganancia_fisios_terapia_ecuasanitas = total_ecuasanitas * PORCENTAJE_FISIO_TERAPIA
-        ganancia_clinica_terapia_total = total_terapia_generado * PORCENTAJE_CLINICA_TERAPIA
-        ganancia_clinica_terapia_cobrada = total_cobrado_o_cubierto * PORCENTAJE_CLINICA_TERAPIA
-        ganancia_clinica_terapia_pendiente = pendiente_terapia * PORCENTAJE_CLINICA_TERAPIA
-        ganancia_clinica_terapia_ecuasanitas = total_ecuasanitas * PORCENTAJE_CLINICA_TERAPIA
+        ganancia_fisios_terapia_total = float(item.get("ganancia_fisios_terapia_total", 0.0))
+        ganancia_fisios_terapia_ecuasanitas = float(item.get("ganancia_fisios_terapia_ecuasanitas", 0.0))
+        ganancia_fisios_terapia_cobrada = (
+            ganancia_fisios_cobrada_no_ecuasanitas.get(consultorio_id, 0.0)
+            + ganancia_fisios_terapia_ecuasanitas
+        )
+        ganancia_fisios_terapia_pendiente = ganancia_fisios_pendiente.get(consultorio_id, 0.0)
+
+        ganancia_clinica_terapia_total = float(item.get("ganancia_clinica_terapia_total", 0.0))
+        ganancia_clinica_terapia_ecuasanitas = float(item.get("ganancia_clinica_terapia_ecuasanitas", 0.0))
+        ganancia_clinica_terapia_cobrada = (
+            ganancia_clinica_cobrada_no_ecuasanitas.get(consultorio_id, 0.0)
+            + ganancia_clinica_terapia_ecuasanitas
+        )
+        ganancia_clinica_terapia_pendiente = ganancia_clinica_pendiente.get(consultorio_id, 0.0)
+
         ganancia_fisios_gimnasio_cobrada = total_gimnasio_pagado * PORCENTAJE_FISIO_GIMNASIO
         ganancia_clinica_gimnasio_cobrada = total_gimnasio_pagado * PORCENTAJE_CLINICA_GIMNASIO
 
@@ -2379,6 +2516,7 @@ def reporte_clinicas_semanal(
         key=lambda item: item.total_generado,
         reverse=True,
     )
+
 
 # -----------------------------------------------------------------------------
 # Exportación profesional a Excel
@@ -2500,6 +2638,8 @@ def _excel_base_sesiones(
         terapeuta = sesion.terapeuta
         tratamiento = sesion.tratamiento_paciente
         precio = round(_precio_aplicado(tratamiento), 2)
+        porcentaje_fisio = porcentaje_fisio_terapia_por_fecha(sesion.fecha)
+        porcentaje_clinica = porcentaje_clinica_terapia_por_fecha(sesion.fecha)
         excel_row_number = len(rows) + 2
 
         rows.append(
@@ -2521,8 +2661,10 @@ def _excel_base_sesiones(
                 sesion.escaladolorsalida,
                 precio,
                 _excel_bool(_es_paciente_ecuasanitas(paciente)),
-                f"=ROUND(P{excel_row_number}*{PORCENTAJE_FISIO_TERAPIA},2)",
-                f"=ROUND(P{excel_row_number}*{PORCENTAJE_CLINICA_TERAPIA},2)",
+                porcentaje_fisio,
+                porcentaje_clinica,
+                f"=ROUND(P{excel_row_number}*R{excel_row_number},2)",
+                f"=ROUND(P{excel_row_number}*S{excel_row_number},2)",
             ]
         )
 
@@ -2754,6 +2896,8 @@ def _excel_aplicar_estilo_workbook(wb) -> None:
                 header = str(ws.cell(row=1, column=cell.column).value or "").lower()
                 if any(word in header for word in ["monto", "total", "generado", "pagado", "pendiente", "ganancia", "caja", "ecuasanitas", "precio", "saldo"]):
                     cell.number_format = '$#,##0.00;[Red]-$#,##0.00'
+                if "porcentaje" in header:
+                    cell.number_format = "0%"
                 if "fecha" in header:
                     cell.number_format = "dd/mm/yyyy"
 
@@ -2771,7 +2915,7 @@ def _excel_aplicar_estilo_workbook(wb) -> None:
     for col in range(1, 11):
         ws.column_dimensions[chr(64 + col)].width = 18
 
-    for rng in ["A1:J2", "A4:C6", "D4:F6", "G4:I6", "A8:C10", "D8:F10", "G8:I10"]:
+    for rng in ["A1:J2", "A4:C10", "A13:C13", "D4:F6", "G4:I6", "D8:F10", "G8:I10", "D12:F14", "G12:I14"]:
         for row in ws[rng]:
             for cell in row:
                 cell.fill = PatternFill("solid", fgColor=gris)
@@ -2782,14 +2926,16 @@ def _excel_aplicar_estilo_workbook(wb) -> None:
     ws["A1"].font = Font(bold=True, color=blanco, size=16)
     ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
 
-    for cell_ref in ["A4", "D4", "G4", "A8", "D8", "G8"]:
+    for cell_ref in ["A4", "D4", "G4", "D8", "G8", "D12", "G12", "A13"]:
         ws[cell_ref].font = Font(bold=True, color="12355B", size=11)
-    for cell_ref in ["A5", "D5", "G5", "A9", "D9", "G9"]:
-        ws[cell_ref].font = Font(bold=True, color="12355B", size=18)
+    for cell_ref in ["B5", "B6", "B7", "D5", "G5", "D9", "G9", "D13", "G13", "B13"]:
+        ws[cell_ref].font = Font(bold=True, color="12355B", size=18 if cell_ref not in {"B5", "B6", "B7"} else 12)
         ws[cell_ref].fill = PatternFill("solid", fgColor=verde)
+    ws["A4"].fill = PatternFill("solid", fgColor=azul)
+    ws["A4"].font = Font(bold=True, color=blanco, size=12)
 
 
-def _excel_agregar_tabla(ws, start_row: int, start_col: int, headers: List[str], rows: List[List], table_name: str) -> int:
+def _excel_agregar_tabla(ws, start_row: int, start_col: int, headers: List[str], rows: List[List], table_name: str, crear_tabla: bool = True) -> int:
     from openpyxl.worksheet.table import Table, TableStyleInfo
     from openpyxl.utils import get_column_letter
 
@@ -2805,15 +2951,21 @@ def _excel_agregar_tabla(ws, start_row: int, start_col: int, headers: List[str],
     end_row = header_row + len(data_rows)
     end_col = start_col + len(headers) - 1
     ref = f"{get_column_letter(start_col)}{header_row}:{get_column_letter(end_col)}{end_row}"
-    tab = Table(displayName=table_name, ref=ref)
-    tab.tableStyleInfo = TableStyleInfo(
-        name="TableStyleMedium2",
-        showFirstColumn=False,
-        showLastColumn=False,
-        showRowStripes=True,
-        showColumnStripes=False,
-    )
-    ws.add_table(tab)
+    if crear_tabla:
+        tab = Table(displayName=table_name, ref=ref)
+        tab.tableStyleInfo = TableStyleInfo(
+            name="TableStyleMedium2",
+            showFirstColumn=False,
+            showLastColumn=False,
+            showRowStripes=True,
+            showColumnStripes=False,
+        )
+        ws.add_table(tab)
+        # IMPORTANTE:
+        # No usar ws.auto_filter.ref cuando la hoja tiene tablas de Excel.
+        # Cada Table ya incluye su propio autofiltro. En Microsoft Excel, combinar
+        # filtros de hoja con tablas puede generar archivos .xlsx que se abren con
+        # el mensaje: "Hemos encontrado un problema con contenido...".
 
     currency_words = [
         "monto",
@@ -2860,6 +3012,221 @@ def _excel_colocar_kpi(ws, cell: str, titulo: str, valor, detalle: str) -> None:
     ws.merge_cells(start_row=row, start_column=col, end_row=row, end_column=col + 2)
     ws.merge_cells(start_row=row + 1, start_column=col, end_row=row + 1, end_column=col + 2)
     ws.merge_cells(start_row=row + 2, start_column=col, end_row=row + 2, end_column=col + 2)
+
+
+def _excel_unicos_con_todos(valores: List[str]) -> List[str]:
+    limpios = sorted({str(v).strip() for v in valores if str(v or "").strip()})
+    return ["Todos"] + limpios
+
+
+def _excel_crear_listas_filtros(wb, base_sesiones: List[List], base_pagos: List[List]) -> Dict[str, str]:
+    """Crea listas ocultas para los desplegables del panel central de filtros."""
+    ws = wb.create_sheet("Listas")
+
+    clinicas = _excel_unicos_con_todos(
+        [row[6] for row in base_sesiones if len(row) > 6]
+        + [row[6] for row in base_pagos if len(row) > 6]
+    )
+    fisios = _excel_unicos_con_todos(
+        [row[5] for row in base_sesiones if len(row) > 5]
+        + [row[5] for row in base_pagos if len(row) > 5]
+    )
+    # Semana CORPOFIT: domingo a sábado.
+    dias = ["Todos", "Domingo", "Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"]
+
+    listas = {
+        "clinicas": clinicas,
+        "fisios": fisios,
+        "dias": dias,
+    }
+    columnas = {
+        "clinicas": 1,
+        "fisios": 2,
+        "dias": 3,
+    }
+    titulos = {
+        "clinicas": "Clínicas",
+        "fisios": "Fisioterapeutas",
+        "dias": "Días",
+    }
+
+    rangos: Dict[str, str] = {}
+    for nombre, valores in listas.items():
+        col = columnas[nombre]
+        ws.cell(row=1, column=col, value=titulos[nombre])
+        for row_idx, value in enumerate(valores, start=2):
+            ws.cell(row=row_idx, column=col, value=value)
+        col_letter = chr(64 + col)
+        rangos[nombre] = f"=Listas!${col_letter}$2:${col_letter}${len(valores) + 1}"
+
+    ws.sheet_state = "hidden"
+    return rangos
+
+
+def _excel_formula_cond_sesiones(clinica_ref: str = "$B$5", fisio_ref: str = "$B$6", dia_ref: str = "$B$7") -> str:
+    return (
+        f"--ISNUMBER(tblBaseSesiones[ID Sesión]),"
+        f"--((({clinica_ref}=\"Todos\")+(tblBaseSesiones[Clínica / Consultorio]={clinica_ref}))>0),"
+        f"--((({fisio_ref}=\"Todos\")+(tblBaseSesiones[Fisioterapeuta]={fisio_ref}))>0),"
+        f"--((({dia_ref}=\"Todos\")+(tblBaseSesiones[Día]={dia_ref}))>0)"
+    )
+
+
+def _excel_formula_cond_pagos(clinica_ref: str = "$B$5", fisio_ref: str = "$B$6", dia_ref: str = "$B$7") -> str:
+    return (
+        f"--ISNUMBER(tblBasePagos[ID Pago]),"
+        f"--((({clinica_ref}=\"Todos\")+(tblBasePagos[Clínica / Consultorio]={clinica_ref}))>0),"
+        f"--((({fisio_ref}=\"Todos\")+(tblBasePagos[Fisioterapeuta / Responsable]={fisio_ref}))>0),"
+        f"--((({dia_ref}=\"Todos\")+(tblBasePagos[Día]={dia_ref}))>0)"
+    )
+
+
+def _excel_configurar_panel_filtros_dashboard(ws, rangos: Dict[str, str], desde: date, hasta: date) -> None:
+    from openpyxl.styles import Alignment, Font, PatternFill, Side, Border
+    from openpyxl.worksheet.datavalidation import DataValidation
+
+    azul = "1F4E78"
+    azul_claro = "D9EAF7"
+    verde = "E2F0D9"
+    gris = "F4F6F8"
+    blanco = "FFFFFF"
+    borde = Border(
+        left=Side(style="thin", color="B7C9D6"),
+        right=Side(style="thin", color="B7C9D6"),
+        top=Side(style="thin", color="B7C9D6"),
+        bottom=Side(style="thin", color="B7C9D6"),
+    )
+
+    ws.merge_cells("A4:C4")
+    ws["A4"] = "CAJITA DE FILTROS"
+    ws["A4"].font = Font(bold=True, color=blanco, size=12)
+    ws["A4"].fill = PatternFill("solid", fgColor=azul)
+    ws["A4"].alignment = Alignment(horizontal="center", vertical="center")
+
+    labels = [
+        ("A5", "Clínica / Consultorio", "B5", "Todos", "clinicas"),
+        ("A6", "Fisioterapeuta", "B6", "Todos", "fisios"),
+        ("A7", "Día de semana", "B7", "Todos", "dias"),
+    ]
+    for label_cell, label, value_cell, default, rango_key in labels:
+        ws[label_cell] = label
+        ws[value_cell] = default
+        ws[label_cell].font = Font(bold=True, color="12355B")
+        ws[value_cell].fill = PatternFill("solid", fgColor=verde)
+        ws[value_cell].font = Font(bold=True, color="12355B")
+        ws[value_cell].alignment = Alignment(horizontal="center", vertical="center")
+        dv = DataValidation(type="list", formula1=rangos[rango_key], allow_blank=False)
+        dv.error = "Selecciona una opción válida de la lista."
+        dv.errorTitle = "Filtro no válido"
+        ws.add_data_validation(dv)
+        dv.add(ws[value_cell])
+
+    ws["A9"] = "Periodo"
+    ws["B9"] = f"{desde.strftime('%d/%m/%Y')} - {hasta.strftime('%d/%m/%Y')}"
+    ws["A10"] = "Uso"
+    ws["B10"] = "Cambia los 3 desplegables y los valores se recalculan."
+    ws["B10"].alignment = Alignment(wrap_text=True, vertical="center")
+
+    for rng in ["A4:C10"]:
+        for row in ws[rng]:
+            for cell in row:
+                cell.border = borde
+                if cell.row >= 5 and cell.column != 2:
+                    cell.fill = PatternFill("solid", fgColor=gris)
+
+    filtros_sesiones = _excel_formula_cond_sesiones()
+    filtros_pagos = _excel_formula_cond_pagos()
+
+    formulas = {
+        "sesiones": f"=SUMPRODUCT({filtros_sesiones})",
+        "generado": f"=SUMPRODUCT(tblBaseSesiones[Precio sesión],{filtros_sesiones})",
+        "pagado": f"=SUMPRODUCT(tblBasePagos[Caja válida],{filtros_pagos})",
+        "ecuasanitas": f"=SUMPRODUCT(tblBaseSesiones[Precio sesión],--(tblBaseSesiones[Ecuasanitas]=\"Sí\"),{filtros_sesiones})",
+        "ganancia_fisio": f"=SUMPRODUCT(tblBaseSesiones[Ganancia fisio],{filtros_sesiones})",
+        "ganancia_clinica": f"=SUMPRODUCT(tblBaseSesiones[Ganancia clínica],{filtros_sesiones})",
+    }
+    formulas["pendiente"] = "=MAX(G5-D9-G9,0)"
+
+    _excel_colocar_kpi(ws, "D4", "Sesiones filtradas", formulas["sesiones"], "Según clínica, fisio y día")
+    _excel_colocar_kpi(ws, "G4", "Generado terapias", formulas["generado"], "Valor producido")
+    _excel_colocar_kpi(ws, "D8", "Pagado caja", formulas["pagado"], "Cobros verificados")
+    _excel_colocar_kpi(ws, "G8", "Ecuasanitas", formulas["ecuasanitas"], "Convenio terapias")
+    _excel_colocar_kpi(ws, "D12", "Ganancia fisio", formulas["ganancia_fisio"], "35% Lun-Vie / 40% Sáb-Dom")
+    _excel_colocar_kpi(ws, "G12", "Ganancia clínica", formulas["ganancia_clinica"], "65% Lun-Vie / 60% Sáb-Dom")
+
+    ws["A13"] = "Pendiente estimado"
+    ws["B13"] = formulas["pendiente"]
+    ws["C13"] = "Generado - Pagado - Ecuasanitas"
+    ws["A13"].font = Font(bold=True, color="12355B")
+    ws["B13"].font = Font(bold=True, color="12355B", size=14)
+    ws["B13"].fill = PatternFill("solid", fgColor=verde)
+    ws["C13"].alignment = Alignment(wrap_text=True)
+
+    for cell_ref in ["G5", "D9", "G9", "D13", "G13", "B13"]:
+        ws[cell_ref].number_format = '$#,##0.00;[Red]-$#,##0.00'
+    ws["D5"].number_format = "0"
+
+    ws["A16"] = "Importante"
+    ws["A16"].font = Font(bold=True, color="12355B", size=12)
+    ws["A17"] = "• Esta hoja es el panel principal. No necesitas filtrar tabla por tabla."
+    ws["A18"] = "• Las hojas Sesiones_Filtradas y Pagos_Filtrados usan estos mismos filtros."
+    ws["A19"] = "• Las hojas Base_Sesiones y Base_Pagos quedan como respaldo completo de auditoría."
+    ws["A20"] = "• Fisioterapeutas: lunes a viernes 35%; sábado y domingo 40%."
+    ws["A21"] = "• Si cambias un filtro y no se actualiza, presiona F9 o guarda y vuelve a abrir el archivo."
+
+
+def _excel_crear_vistas_filtradas(ws_sesiones, ws_pagos, sesiones_headers: List[str], pagos_headers: List[str]) -> None:
+    from openpyxl.styles import Alignment, Font, PatternFill
+
+    azul = "1F4E78"
+    blanco = "FFFFFF"
+    azul_claro = "D9EAF7"
+
+    # Vista de sesiones filtrada por la cajita del Dashboard.
+    _excel_escribir_titulo(
+        ws_sesiones,
+        "CORPOFIT PRO — SESIONES FILTRADAS",
+        "Esta hoja se actualiza con la cajita de filtros del Dashboard."
+    )
+    ws_sesiones["A4"] = "Cambia Clínica, Fisioterapeuta o Día en Dashboard. Aquí se mostrará el detalle filtrado."
+    ws_sesiones["A4"].fill = PatternFill("solid", fgColor=azul_claro)
+    ws_sesiones["A4"].font = Font(bold=True, color="12355B")
+    for idx, header in enumerate(sesiones_headers, start=1):
+        cell = ws_sesiones.cell(row=6, column=idx, value=header)
+        cell.fill = PatternFill("solid", fgColor=azul)
+        cell.font = Font(bold=True, color=blanco)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    include_sesiones = (
+        "ISNUMBER(tblBaseSesiones[ID Sesión])"
+        "*(((Dashboard!$B$5=\"Todos\")+(tblBaseSesiones[Clínica / Consultorio]=Dashboard!$B$5))>0)"
+        "*(((Dashboard!$B$6=\"Todos\")+(tblBaseSesiones[Fisioterapeuta]=Dashboard!$B$6))>0)"
+        "*(((Dashboard!$B$7=\"Todos\")+(tblBaseSesiones[Día]=Dashboard!$B$7))>0)"
+    )
+    ws_sesiones["A7"] = f'=FILTER(tblBaseSesiones,{include_sesiones},"Sin resultados")'
+    ws_sesiones.freeze_panes = "A7"
+
+    # Vista de pagos filtrada por la cajita del Dashboard.
+    _excel_escribir_titulo(
+        ws_pagos,
+        "CORPOFIT PRO — PAGOS FILTRADOS",
+        "Esta hoja se actualiza con la cajita de filtros del Dashboard."
+    )
+    ws_pagos["A4"] = "Cambia Clínica, Fisioterapeuta o Día en Dashboard. Aquí se mostrará el detalle filtrado."
+    ws_pagos["A4"].fill = PatternFill("solid", fgColor=azul_claro)
+    ws_pagos["A4"].font = Font(bold=True, color="12355B")
+    for idx, header in enumerate(pagos_headers, start=1):
+        cell = ws_pagos.cell(row=6, column=idx, value=header)
+        cell.fill = PatternFill("solid", fgColor=azul)
+        cell.font = Font(bold=True, color=blanco)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    include_pagos = (
+        "ISNUMBER(tblBasePagos[ID Pago])"
+        "*(((Dashboard!$B$5=\"Todos\")+(tblBasePagos[Clínica / Consultorio]=Dashboard!$B$5))>0)"
+        "*(((Dashboard!$B$6=\"Todos\")+(tblBasePagos[Fisioterapeuta / Responsable]=Dashboard!$B$6))>0)"
+        "*(((Dashboard!$B$7=\"Todos\")+(tblBasePagos[Día]=Dashboard!$B$7))>0)"
+    )
+    ws_pagos["A7"] = f'=FILTER(tblBasePagos,{include_pagos},"Sin resultados")'
+    ws_pagos.freeze_panes = "A7"
 
 
 def _crear_excel_reporte_corpofit(
@@ -2923,9 +3290,18 @@ def _crear_excel_reporte_corpofit(
     )
 
     wb = Workbook()
+    # Forzar recálculo al abrir, porque el panel usa fórmulas vinculadas a tablas.
+    try:
+        wb.calculation.fullCalcOnLoad = True
+        wb.calculation.forceFullCalc = True
+        wb.calculation.calcMode = "auto"
+    except Exception:
+        pass
+
     ws_dashboard = wb.active
     ws_dashboard.title = "Dashboard"
-    ws_filtros = wb.create_sheet("Filtros_Excel")
+    ws_sesiones_filtradas = wb.create_sheet("Sesiones_Filtradas")
+    ws_pagos_filtrados = wb.create_sheet("Pagos_Filtrados")
     ws_analisis = wb.create_sheet("Análisis")
     ws_sesiones = wb.create_sheet("Base_Sesiones")
     ws_pagos = wb.create_sheet("Base_Pagos")
@@ -2934,46 +3310,6 @@ def _crear_excel_reporte_corpofit(
         f"Periodo semanal completo: {desde.strftime('%d/%m/%Y')} - {hasta.strftime('%d/%m/%Y')} | "
         f"Generado: {now_ecuador().strftime('%d/%m/%Y %H:%M')}"
     )
-
-    _excel_escribir_titulo(ws_dashboard, "CORPOFIT PRO — REPORTE EXCEL", subtitulo)
-    _excel_colocar_kpi(ws_dashboard, "A4", "Sesiones finalizadas", general.total_sesiones, "Terapias del periodo")
-    _excel_colocar_kpi(ws_dashboard, "D4", "Generado terapias", general.total_generado, "Valor producido")
-    _excel_colocar_kpi(ws_dashboard, "G4", "Pagado caja", general.total_pagado_verificado, "Cobros verificados")
-    _excel_colocar_kpi(ws_dashboard, "A8", "Pendiente", general.total_pendiente, "Por cobrar a pacientes")
-    _excel_colocar_kpi(ws_dashboard, "D8", "Ecuasanitas", general.total_ecuasanitas, "Cubierto por convenio")
-    _excel_colocar_kpi(ws_dashboard, "G8", "Saldo a favor", general.saldo_a_favor, "Anticipos / excedentes")
-
-    ws_dashboard["A13"] = "Reglas del reporte"
-    ws_dashboard["A13"].font = Font(bold=True, color="12355B", size=12)
-    ws_dashboard["A14"] = "• Terapias: 35% fisioterapeuta y 65% clínica."
-    ws_dashboard["A15"] = "• Gimnasio mensual/diario: 50% fisioterapeuta y 50% clínica."
-    ws_dashboard["A16"] = "• Ecuasanitas aplica solo a terapias; no queda como deuda del paciente."
-    ws_dashboard["A17"] = "• Pago previo reduce saldos, pero no entra al cuadre de caja actual."
-    ws_dashboard["A18"] = "• Recuperación de cartera entra a caja, no reduce tratamientos ni genera comisión automática."
-    ws_dashboard["A19"] = "• Este Excel trae toda la semana; filtra Clínica/Consultorio, Fisioterapeuta y Día dentro de las tablas del archivo."
-
-    # Hoja de guía de filtros dentro de Excel.
-    _excel_escribir_titulo(
-        ws_filtros,
-        "CORPOFIT PRO — FILTROS DENTRO DEL EXCEL",
-        "La app solo define la semana. Clínica, fisioterapeuta y día se filtran desde Excel."
-    )
-    filtros_headers = ["Hoja", "Columna para filtrar", "Uso recomendado"]
-    filtros_rows = [
-        ["Base_Sesiones", "Clínica / Consultorio", "Ver sesiones atendidas por consultorio."],
-        ["Base_Sesiones", "Fisioterapeuta", "Ver sesiones de un terapeuta específico."],
-        ["Base_Sesiones", "Día", "Filtrar lunes, martes, miércoles, etc."],
-        ["Base_Pagos", "Clínica / Consultorio", "Ver pagos asociados a una clínica."],
-        ["Base_Pagos", "Fisioterapeuta / Responsable", "Ver pagos por responsable o terapeuta asociado."],
-        ["Base_Pagos", "Día", "Filtrar cobros por día de la semana."],
-        ["Análisis", "Terapeuta / Clínica / Día", "Usar las flechas de filtro en cada resumen."],
-    ]
-    _excel_agregar_tabla(ws_filtros, 5, 1, filtros_headers, filtros_rows, "tblGuiaFiltrosExcel")
-    ws_filtros["A14"] = "Cómo usarlo"
-    ws_filtros["A15"] = "1. Abre Base_Sesiones o Base_Pagos."
-    ws_filtros["A16"] = "2. En la fila de encabezados, toca la flecha de filtro."
-    ws_filtros["A17"] = "3. Elige Clínica / Consultorio, Fisioterapeuta y Día según necesites."
-    ws_filtros["A18"] = "4. Puedes combinar filtros, por ejemplo: Atahualpa + Camila + domingo."
 
     # Hoja Análisis
     _excel_escribir_titulo(ws_analisis, "CORPOFIT PRO — ANÁLISIS", subtitulo)
@@ -3004,14 +3340,14 @@ def _crear_excel_reporte_corpofit(
             ]
         )
     daily_table_start = current_row
-    current_row = _excel_agregar_tabla(ws_analisis, current_row, 1, daily_headers, daily_rows, "tblAnalisisDias")
+    current_row = _excel_agregar_tabla(ws_analisis, current_row, 1, daily_headers, daily_rows, "tblAnalisisDias", crear_tabla=False)
 
     ws_analisis.cell(row=current_row, column=1, value="▶ Resumen por método de pago")
     current_row += 1
     metodo_headers = ["Método", "Total"]
     metodo_rows = [[m.metodo, m.total] for m in general.por_metodo_pago]
     metodo_table_start = current_row
-    current_row = _excel_agregar_tabla(ws_analisis, current_row, 1, metodo_headers, metodo_rows, "tblAnalisisMetodos")
+    current_row = _excel_agregar_tabla(ws_analisis, current_row, 1, metodo_headers, metodo_rows, "tblAnalisisMetodos", crear_tabla=False)
 
     ws_analisis.cell(row=current_row, column=1, value="▶ Resumen por fisioterapeuta")
     current_row += 1
@@ -3044,7 +3380,7 @@ def _crear_excel_reporte_corpofit(
         ]
         for item in fisios
     ]
-    current_row = _excel_agregar_tabla(ws_analisis, current_row, 1, fisio_headers, fisio_rows, "tblAnalisisFisios")
+    current_row = _excel_agregar_tabla(ws_analisis, current_row, 1, fisio_headers, fisio_rows, "tblAnalisisFisios", crear_tabla=False)
 
     ws_analisis.cell(row=current_row, column=1, value="▶ Resumen por clínica")
     current_row += 1
@@ -3077,7 +3413,7 @@ def _crear_excel_reporte_corpofit(
         ]
         for item in clinicas
     ]
-    current_row = _excel_agregar_tabla(ws_analisis, current_row, 1, clinica_headers, clinica_rows, "tblAnalisisClinicas")
+    current_row = _excel_agregar_tabla(ws_analisis, current_row, 1, clinica_headers, clinica_rows, "tblAnalisisClinicas", crear_tabla=False)
 
     # Base de sesiones
     sesiones_headers = [
@@ -3098,6 +3434,8 @@ def _crear_excel_reporte_corpofit(
         "Dolor salida",
         "Precio sesión",
         "Ecuasanitas",
+        "Porcentaje fisio",
+        "Porcentaje clínica",
         "Ganancia fisio",
         "Ganancia clínica",
     ]
@@ -3127,6 +3465,12 @@ def _crear_excel_reporte_corpofit(
     ]
     _excel_agregar_tabla(ws_pagos, 1, 1, pagos_headers, base_pagos, "tblBasePagos")
     ws_pagos.freeze_panes = "A2"
+
+    # Panel central de filtros: una sola cajita controla los resúmenes y vistas.
+    rangos_filtros = _excel_crear_listas_filtros(wb, base_sesiones, base_pagos)
+    _excel_escribir_titulo(ws_dashboard, "CORPOFIT PRO — REPORTE EXCEL", subtitulo)
+    _excel_configurar_panel_filtros_dashboard(ws_dashboard, rangos_filtros, desde, hasta)
+    _excel_crear_vistas_filtradas(ws_sesiones_filtradas, ws_pagos_filtrados, sesiones_headers, pagos_headers)
 
     # Gráficos del Dashboard basados en Análisis.
     if general.sesiones_por_dia:
@@ -3175,7 +3519,7 @@ def _crear_excel_reporte_corpofit(
         ws_dashboard.add_chart(pie, "G21")
 
     # Formatos y estilo visual.
-    for ws in [ws_dashboard, ws_filtros, ws_analisis, ws_sesiones, ws_pagos]:
+    for ws in [ws_dashboard, ws_sesiones_filtradas, ws_pagos_filtrados, ws_analisis, ws_sesiones, ws_pagos]:
         ws.freeze_panes = ws.freeze_panes or "A4"
         for row in ws.iter_rows():
             for cell in row:
@@ -3183,7 +3527,7 @@ def _crear_excel_reporte_corpofit(
 
     _excel_aplicar_estilo_workbook(wb)
 
-    for ws in [ws_filtros, ws_analisis, ws_sesiones, ws_pagos]:
+    for ws in [ws_sesiones_filtradas, ws_pagos_filtrados, ws_analisis, ws_sesiones, ws_pagos]:
         for row in ws.iter_rows(min_row=2):
             for cell in row:
                 header = str(ws.cell(row=1, column=cell.column).value or "").lower()
@@ -3197,7 +3541,7 @@ def _crear_excel_reporte_corpofit(
                     cell.number_format = "dd/mm/yyyy"
 
     # Ajuste final de formatos por columnas conocidas.
-    for ws in [ws_dashboard, ws_filtros, ws_analisis, ws_sesiones, ws_pagos]:
+    for ws in [ws_dashboard, ws_sesiones_filtradas, ws_pagos_filtrados, ws_analisis, ws_sesiones, ws_pagos]:
         for row in ws.iter_rows():
             for cell in row:
                 if isinstance(cell.value, date):
@@ -3227,8 +3571,8 @@ def exportar_excel_reportes(
     desde, hasta = _default_range(desde, hasta)
 
     # El Excel siempre contiene toda la semana permitida para el rol.
-    # Clínica/Consultorio, Fisioterapeuta y Día se filtran dentro del archivo
-    # usando las flechas de las tablas de Excel, no desde la app.
+    # Clínica/Consultorio, Fisioterapeuta y Día se controlan desde una sola
+    # cajita de filtros en la hoja Dashboard.
     contenido = _crear_excel_reporte_corpofit(
         db=db,
         current_user=current_user,
