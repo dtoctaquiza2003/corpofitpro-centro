@@ -3127,21 +3127,69 @@ def _excel_crear_listas_filtros(wb, base_sesiones: List[List], base_pagos: List[
     return rangos
 
 
-def _excel_formula_cond_sesiones(clinica_ref: str = "$B$5", fisio_ref: str = "$B$6", dia_ref: str = "$B$7") -> str:
+
+def _excel_dashboard_helper_criterios(ws) -> None:
+    """
+    Crea criterios auxiliares simples para los filtros del Dashboard.
+
+    IMPORTANTE:
+    Antes se usaba SUMPRODUCT con condiciones booleanas. En algunas versiones de
+    Excel/WPS esos arreglos daban #VALOR! al combinar tablas, textos y filtros.
+    Con SUMIFS/COUNTIFS + criterios auxiliares el archivo es mucho más estable.
+    """
+    ws["K4"] = "Criterios internos"
+    ws["K5"] = '=IF($B$5="Todos","*",$B$5)'
+    ws["K6"] = '=IF($B$6="Todos","*",$B$6)'
+    ws["K7"] = '=IF($B$7="Todos","*",$B$7)'
+    ws.column_dimensions["K"].hidden = True
+
+
+def _excel_formula_count_sesiones(clinica_criteria: str = "$K$5", fisio_criteria: str = "$K$6", dia_criteria: str = "$K$7") -> str:
     return (
-        f"--ISNUMBER(tblBaseSesiones[ID Sesión]),"
-        f"--((({clinica_ref}=\"Todos\")+(tblBaseSesiones[Clínica / Consultorio]={clinica_ref}))>0),"
-        f"--((({fisio_ref}=\"Todos\")+(tblBaseSesiones[Fisioterapeuta]={fisio_ref}))>0),"
-        f"--((({dia_ref}=\"Todos\")+(tblBaseSesiones[Día]={dia_ref}))>0)"
+        f'=COUNTIFS('
+        f'tblBaseSesiones[ID Sesión],">=0",'
+        f'tblBaseSesiones[Clínica / Consultorio],{clinica_criteria},'
+        f'tblBaseSesiones[Fisioterapeuta],{fisio_criteria},'
+        f'tblBaseSesiones[Día],{dia_criteria}'
+        f')'
     )
 
 
-def _excel_formula_cond_pagos(clinica_ref: str = "$B$5", fisio_ref: str = "$B$6", dia_ref: str = "$B$7") -> str:
+def _excel_formula_sum_sesiones(
+    columna_sumar: str,
+    clinica_criteria: str = "$K$5",
+    fisio_criteria: str = "$K$6",
+    dia_criteria: str = "$K$7",
+    extra_criteria: str = "",
+) -> str:
+    extra = f",{extra_criteria}" if extra_criteria else ""
     return (
-        f"--ISNUMBER(tblBasePagos[ID Pago]),"
-        f"--((({clinica_ref}=\"Todos\")+(tblBasePagos[Clínica / Consultorio]={clinica_ref}))>0),"
-        f"--((({fisio_ref}=\"Todos\")+(tblBasePagos[Fisioterapeuta / Responsable]={fisio_ref}))>0),"
-        f"--((({dia_ref}=\"Todos\")+(tblBasePagos[Día]={dia_ref}))>0)"
+        f'=SUMIFS('
+        f'tblBaseSesiones[{columna_sumar}],'
+        f'tblBaseSesiones[Clínica / Consultorio],{clinica_criteria},'
+        f'tblBaseSesiones[Fisioterapeuta],{fisio_criteria},'
+        f'tblBaseSesiones[Día],{dia_criteria}'
+        f'{extra}'
+        f')'
+    )
+
+
+def _excel_formula_sum_pagos(
+    columna_sumar: str,
+    clinica_criteria: str = "$K$5",
+    fisio_criteria: str = "$K$6",
+    dia_criteria: str = "$K$7",
+    extra_criteria: str = "",
+) -> str:
+    extra = f",{extra_criteria}" if extra_criteria else ""
+    return (
+        f'=SUMIFS('
+        f'tblBasePagos[{columna_sumar}],'
+        f'tblBasePagos[Clínica / Consultorio],{clinica_criteria},'
+        f'tblBasePagos[Fisioterapeuta / Responsable],{fisio_criteria},'
+        f'tblBasePagos[Día],{dia_criteria}'
+        f'{extra}'
+        f')'
     )
 
 
@@ -3198,16 +3246,18 @@ def _excel_configurar_panel_filtros_dashboard(ws, rangos: Dict[str, str], desde:
                 if cell.row >= 5 and cell.column != 2:
                     cell.fill = PatternFill("solid", fgColor=gris)
 
-    filtros_sesiones = _excel_formula_cond_sesiones()
-    filtros_pagos = _excel_formula_cond_pagos()
+    _excel_dashboard_helper_criterios(ws)
 
     formulas = {
-        "sesiones": f"=SUMPRODUCT({filtros_sesiones})",
-        "generado": f"=SUMPRODUCT(tblBaseSesiones[Precio sesión],{filtros_sesiones})",
-        "pagado": f"=SUMPRODUCT(tblBasePagos[Caja válida],{filtros_pagos})",
-        "ecuasanitas": f"=SUMPRODUCT(tblBaseSesiones[Precio sesión],--(tblBaseSesiones[Ecuasanitas]=\"Sí\"),{filtros_sesiones})",
-        "ganancia_fisio": f"=SUMPRODUCT(tblBaseSesiones[Ganancia fisio],{filtros_sesiones})",
-        "ganancia_clinica": f"=SUMPRODUCT(tblBaseSesiones[Ganancia clínica],{filtros_sesiones})",
+        "sesiones": _excel_formula_count_sesiones(),
+        "generado": _excel_formula_sum_sesiones("Precio sesión"),
+        "pagado": _excel_formula_sum_pagos("Caja válida"),
+        "ecuasanitas": _excel_formula_sum_sesiones(
+            "Precio sesión",
+            extra_criteria='tblBaseSesiones[Ecuasanitas],"Sí"',
+        ),
+        "ganancia_fisio": _excel_formula_sum_sesiones("Ganancia fisio"),
+        "ganancia_clinica": _excel_formula_sum_sesiones("Ganancia clínica"),
     }
     formulas["pendiente"] = "=MAX(G5-D9-G9,0)"
 
@@ -3239,37 +3289,51 @@ def _excel_configurar_panel_filtros_dashboard(ws, rangos: Dict[str, str], desde:
     ws["A21"] = "• Si cambias un filtro y no se actualiza, presiona F9 o guarda y vuelve a abrir el archivo."
 
 
-
-def _excel_formula_cond_sesiones_grafica_dia(dia_cell: str) -> str:
-    """Condiciones SUMPRODUCT para gráficos por día en Dashboard."""
+def _excel_formula_sesiones_dia(dia_cell: str, columna_sumar: str) -> str:
     return (
-        f"--ISNUMBER(tblBaseSesiones[ID Sesión]),"
-        f"--(((Dashboard!$B$5=\"Todos\")+(tblBaseSesiones[Clínica / Consultorio]=Dashboard!$B$5))>0),"
-        f"--(((Dashboard!$B$6=\"Todos\")+(tblBaseSesiones[Fisioterapeuta]=Dashboard!$B$6))>0),"
-        f"--(tblBaseSesiones[Día]={dia_cell}),"
-        f"IF(Dashboard!$B$7=\"Todos\",1,--({dia_cell}=Dashboard!$B$7))"
+        f'=IF(AND($B$7<>"Todos",{dia_cell}<>$B$7),0,'
+        f'SUMIFS('
+        f'tblBaseSesiones[{columna_sumar}],'
+        f'tblBaseSesiones[Clínica / Consultorio],$K$5,'
+        f'tblBaseSesiones[Fisioterapeuta],$K$6,'
+        f'tblBaseSesiones[Día],{dia_cell}'
+        f'))'
     )
 
 
-def _excel_formula_cond_pagos_grafica_dia(dia_cell: str) -> str:
-    """Condiciones SUMPRODUCT para pagos por día en Dashboard."""
+def _excel_formula_count_sesiones_dia(dia_cell: str) -> str:
     return (
-        f"--ISNUMBER(tblBasePagos[ID Pago]),"
-        f"--(((Dashboard!$B$5=\"Todos\")+(tblBasePagos[Clínica / Consultorio]=Dashboard!$B$5))>0),"
-        f"--(((Dashboard!$B$6=\"Todos\")+(tblBasePagos[Fisioterapeuta / Responsable]=Dashboard!$B$6))>0),"
-        f"--(tblBasePagos[Día]={dia_cell}),"
-        f"IF(Dashboard!$B$7=\"Todos\",1,--({dia_cell}=Dashboard!$B$7))"
+        f'=IF(AND($B$7<>"Todos",{dia_cell}<>$B$7),0,'
+        f'COUNTIFS('
+        f'tblBaseSesiones[ID Sesión],">=0",'
+        f'tblBaseSesiones[Clínica / Consultorio],$K$5,'
+        f'tblBaseSesiones[Fisioterapeuta],$K$6,'
+        f'tblBaseSesiones[Día],{dia_cell}'
+        f'))'
     )
 
 
-def _excel_formula_cond_pagos_grafica_metodo(metodo_cell: str) -> str:
-    """Condiciones SUMPRODUCT para gráfico de métodos de pago filtrado por Dashboard."""
+def _excel_formula_pagos_dia(dia_cell: str, columna_sumar: str) -> str:
     return (
-        f"--ISNUMBER(tblBasePagos[ID Pago]),"
-        f"--(((Dashboard!$B$5=\"Todos\")+(tblBasePagos[Clínica / Consultorio]=Dashboard!$B$5))>0),"
-        f"--(((Dashboard!$B$6=\"Todos\")+(tblBasePagos[Fisioterapeuta / Responsable]=Dashboard!$B$6))>0),"
-        f"--(((Dashboard!$B$7=\"Todos\")+(tblBasePagos[Día]=Dashboard!$B$7))>0),"
-        f"--(tblBasePagos[Método]={metodo_cell})"
+        f'=IF(AND($B$7<>"Todos",{dia_cell}<>$B$7),0,'
+        f'SUMIFS('
+        f'tblBasePagos[{columna_sumar}],'
+        f'tblBasePagos[Clínica / Consultorio],$K$5,'
+        f'tblBasePagos[Fisioterapeuta / Responsable],$K$6,'
+        f'tblBasePagos[Día],{dia_cell}'
+        f'))'
+    )
+
+
+def _excel_formula_pagos_metodo(metodo_cell: str) -> str:
+    return (
+        f'=SUMIFS('
+        f'tblBasePagos[Caja válida],'
+        f'tblBasePagos[Clínica / Consultorio],$K$5,'
+        f'tblBasePagos[Fisioterapeuta / Responsable],$K$6,'
+        f'tblBasePagos[Día],$K$7,'
+        f'tblBasePagos[Método],{metodo_cell}'
+        f')'
     )
 
 
@@ -3277,9 +3341,8 @@ def _excel_crear_graficas_dashboard(ws, base_pagos: List[List]) -> None:
     """
     Crea gráficas vinculadas a la cajita de filtros del Dashboard.
 
-    No usa FILTER(), SORT() ni UNIQUE() para evitar archivos que Excel intente reparar.
-    Las gráficas leen tablas auxiliares con SUMPRODUCT, por eso cambian cuando se modifica
-    Clínica / Consultorio, Fisioterapeuta o Día de semana en B5:B7.
+    No usa FILTER(), SORT(), UNIQUE() ni SUMPRODUCT. Las gráficas leen tablas
+    auxiliares con SUMIFS/COUNTIFS para evitar #VALOR! en Excel/WPS.
     """
     from openpyxl.chart import BarChart, Reference, PieChart
     from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
@@ -3312,13 +3375,11 @@ def _excel_crear_graficas_dashboard(ws, base_pagos: List[List]) -> None:
     for offset, dia in enumerate(dias, start=1):
         row = start_day + offset
         dia_ref = f"$A${row}"
-        cond_sesiones = _excel_formula_cond_sesiones_grafica_dia(dia_ref)
-        cond_pagos = _excel_formula_cond_pagos_grafica_dia(dia_ref)
 
         ws.cell(row=row, column=1, value=dia)
-        ws.cell(row=row, column=2, value=f"=SUMPRODUCT(tblBaseSesiones[Precio sesión],{cond_sesiones})")
-        ws.cell(row=row, column=3, value=f"=SUMPRODUCT(tblBasePagos[Caja válida],{cond_pagos})")
-        ws.cell(row=row, column=4, value=f"=SUMPRODUCT({cond_sesiones})")
+        ws.cell(row=row, column=2, value=_excel_formula_sesiones_dia(dia_ref, "Precio sesión"))
+        ws.cell(row=row, column=3, value=_excel_formula_pagos_dia(dia_ref, "Caja válida"))
+        ws.cell(row=row, column=4, value=_excel_formula_count_sesiones_dia(dia_ref))
         for col_idx in range(1, 5):
             cell = ws.cell(row=row, column=col_idx)
             cell.border = borde
@@ -3348,8 +3409,7 @@ def _excel_crear_graficas_dashboard(ws, base_pagos: List[List]) -> None:
         if metodo == "Sin pagos":
             ws.cell(row=row, column=start_method_col + 1, value=0)
         else:
-            cond_metodo = _excel_formula_cond_pagos_grafica_metodo(metodo_ref)
-            ws.cell(row=row, column=start_method_col + 1, value=f"=SUMPRODUCT(tblBasePagos[Caja válida],{cond_metodo})")
+            ws.cell(row=row, column=start_method_col + 1, value=_excel_formula_pagos_metodo(metodo_ref))
         for col_idx in range(start_method_col, start_method_col + 2):
             cell = ws.cell(row=row, column=col_idx)
             cell.border = borde
@@ -3400,80 +3460,6 @@ def _excel_crear_graficas_dashboard(ws, base_pagos: List[List]) -> None:
     pie.width = 11
     ws.add_chart(pie, "G23")
 
-
-
-def _excel_agregar_columnas_helper_filtros(ws_sesiones, ws_pagos, sesiones_rows_count: int, pagos_rows_count: int) -> None:
-    """
-    Agrega columnas auxiliares ocultas para que las hojas filtradas funcionen sin FILTER().
-
-    Motivo: FILTER() es una fórmula moderna de Excel 365 y en algunas instalaciones
-    de Excel/WPS/móvil puede provocar aviso de reparación del archivo. Con estas
-    columnas se usa INDEX + MATCH + COUNTIF, que es mucho más compatible.
-    """
-    from openpyxl.styles import Font, PatternFill
-
-    azul = "1F4E78"
-    blanco = "FFFFFF"
-
-    # Base_Sesiones: A:U son datos reales; V:W son auxiliares ocultos.
-    ses_match_col = 22  # V
-    ses_num_col = 23    # W
-    ws_sesiones.cell(row=1, column=ses_match_col, value="Filtro dashboard")
-    ws_sesiones.cell(row=1, column=ses_num_col, value="N° filtro")
-    for col in [ses_match_col, ses_num_col]:
-        cell = ws_sesiones.cell(row=1, column=col)
-        cell.fill = PatternFill("solid", fgColor=azul)
-        cell.font = Font(bold=True, color=blanco)
-
-    total_ses_rows = max(sesiones_rows_count, 1)
-    for row in range(2, total_ses_rows + 2):
-        ws_sesiones.cell(
-            row=row,
-            column=ses_match_col,
-            value=(
-                f'=AND(ISNUMBER(A{row}),'
-                f'OR(Dashboard!$B$5="Todos",G{row}=Dashboard!$B$5),'
-                f'OR(Dashboard!$B$6="Todos",F{row}=Dashboard!$B$6),'
-                f'OR(Dashboard!$B$7="Todos",C{row}=Dashboard!$B$7))'
-            ),
-        )
-        ws_sesiones.cell(
-            row=row,
-            column=ses_num_col,
-            value=f'=IF(V{row},COUNTIF($V$2:V{row},TRUE),"")',
-        )
-    ws_sesiones.column_dimensions["V"].hidden = True
-    ws_sesiones.column_dimensions["W"].hidden = True
-
-    # Base_Pagos: A:R son datos reales; S:T son auxiliares ocultos.
-    pag_match_col = 19  # S
-    pag_num_col = 20    # T
-    ws_pagos.cell(row=1, column=pag_match_col, value="Filtro dashboard")
-    ws_pagos.cell(row=1, column=pag_num_col, value="N° filtro")
-    for col in [pag_match_col, pag_num_col]:
-        cell = ws_pagos.cell(row=1, column=col)
-        cell.fill = PatternFill("solid", fgColor=azul)
-        cell.font = Font(bold=True, color=blanco)
-
-    total_pag_rows = max(pagos_rows_count, 1)
-    for row in range(2, total_pag_rows + 2):
-        ws_pagos.cell(
-            row=row,
-            column=pag_match_col,
-            value=(
-                f'=AND(ISNUMBER(A{row}),'
-                f'OR(Dashboard!$B$5="Todos",G{row}=Dashboard!$B$5),'
-                f'OR(Dashboard!$B$6="Todos",F{row}=Dashboard!$B$6),'
-                f'OR(Dashboard!$B$7="Todos",C{row}=Dashboard!$B$7))'
-            ),
-        )
-        ws_pagos.cell(
-            row=row,
-            column=pag_num_col,
-            value=f'=IF(S{row},COUNTIF($S$2:S{row},TRUE),"")',
-        )
-    ws_pagos.column_dimensions["S"].hidden = True
-    ws_pagos.column_dimensions["T"].hidden = True
 
 def _excel_crear_vistas_filtradas(
     ws_sesiones,
