@@ -3057,7 +3057,7 @@ def _excel_crear_listas_filtros(wb, base_sesiones: List[List], base_pagos: List[
         for row_idx, value in enumerate(valores, start=2):
             ws.cell(row=row_idx, column=col, value=value)
         col_letter = chr(64 + col)
-        rangos[nombre] = f"=Listas!${col_letter}$2:${col_letter}${len(valores) + 1}"
+        rangos[nombre] = f"Listas!${col_letter}$2:${col_letter}${len(valores) + 1}"
 
     ws.sheet_state = "hidden"
     return rangos
@@ -3175,59 +3175,169 @@ def _excel_configurar_panel_filtros_dashboard(ws, rangos: Dict[str, str], desde:
     ws["A21"] = "• Si cambias un filtro y no se actualiza, presiona F9 o guarda y vuelve a abrir el archivo."
 
 
-def _excel_crear_vistas_filtradas(ws_sesiones, ws_pagos, sesiones_headers: List[str], pagos_headers: List[str]) -> None:
+
+def _excel_agregar_columnas_helper_filtros(ws_sesiones, ws_pagos, sesiones_rows_count: int, pagos_rows_count: int) -> None:
+    """
+    Agrega columnas auxiliares ocultas para que las hojas filtradas funcionen sin FILTER().
+
+    Motivo: FILTER() es una fórmula moderna de Excel 365 y en algunas instalaciones
+    de Excel/WPS/móvil puede provocar aviso de reparación del archivo. Con estas
+    columnas se usa INDEX + MATCH + COUNTIF, que es mucho más compatible.
+    """
+    from openpyxl.styles import Font, PatternFill
+
+    azul = "1F4E78"
+    blanco = "FFFFFF"
+
+    # Base_Sesiones: A:U son datos reales; V:W son auxiliares ocultos.
+    ses_match_col = 22  # V
+    ses_num_col = 23    # W
+    ws_sesiones.cell(row=1, column=ses_match_col, value="Filtro dashboard")
+    ws_sesiones.cell(row=1, column=ses_num_col, value="N° filtro")
+    for col in [ses_match_col, ses_num_col]:
+        cell = ws_sesiones.cell(row=1, column=col)
+        cell.fill = PatternFill("solid", fgColor=azul)
+        cell.font = Font(bold=True, color=blanco)
+
+    total_ses_rows = max(sesiones_rows_count, 1)
+    for row in range(2, total_ses_rows + 2):
+        ws_sesiones.cell(
+            row=row,
+            column=ses_match_col,
+            value=(
+                f'=AND(ISNUMBER(A{row}),'
+                f'OR(Dashboard!$B$5="Todos",G{row}=Dashboard!$B$5),'
+                f'OR(Dashboard!$B$6="Todos",F{row}=Dashboard!$B$6),'
+                f'OR(Dashboard!$B$7="Todos",C{row}=Dashboard!$B$7))'
+            ),
+        )
+        ws_sesiones.cell(
+            row=row,
+            column=ses_num_col,
+            value=f'=IF(V{row},COUNTIF($V$2:V{row},TRUE),"")',
+        )
+    ws_sesiones.column_dimensions["V"].hidden = True
+    ws_sesiones.column_dimensions["W"].hidden = True
+
+    # Base_Pagos: A:R son datos reales; S:T son auxiliares ocultos.
+    pag_match_col = 19  # S
+    pag_num_col = 20    # T
+    ws_pagos.cell(row=1, column=pag_match_col, value="Filtro dashboard")
+    ws_pagos.cell(row=1, column=pag_num_col, value="N° filtro")
+    for col in [pag_match_col, pag_num_col]:
+        cell = ws_pagos.cell(row=1, column=col)
+        cell.fill = PatternFill("solid", fgColor=azul)
+        cell.font = Font(bold=True, color=blanco)
+
+    total_pag_rows = max(pagos_rows_count, 1)
+    for row in range(2, total_pag_rows + 2):
+        ws_pagos.cell(
+            row=row,
+            column=pag_match_col,
+            value=(
+                f'=AND(ISNUMBER(A{row}),'
+                f'OR(Dashboard!$B$5="Todos",G{row}=Dashboard!$B$5),'
+                f'OR(Dashboard!$B$6="Todos",F{row}=Dashboard!$B$6),'
+                f'OR(Dashboard!$B$7="Todos",C{row}=Dashboard!$B$7))'
+            ),
+        )
+        ws_pagos.cell(
+            row=row,
+            column=pag_num_col,
+            value=f'=IF(S{row},COUNTIF($S$2:S{row},TRUE),"")',
+        )
+    ws_pagos.column_dimensions["S"].hidden = True
+    ws_pagos.column_dimensions["T"].hidden = True
+
+def _excel_crear_vistas_filtradas(
+    ws_sesiones,
+    ws_pagos,
+    sesiones_headers: List[str],
+    pagos_headers: List[str],
+    sesiones_rows_count: int,
+    pagos_rows_count: int,
+) -> None:
     from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
 
     azul = "1F4E78"
     blanco = "FFFFFF"
     azul_claro = "D9EAF7"
 
+    def escribir_encabezados(ws, headers: List[str]) -> None:
+        for idx, header in enumerate(headers, start=1):
+            cell = ws.cell(row=6, column=idx, value=header)
+            cell.fill = PatternFill("solid", fgColor=azul)
+            cell.font = Font(bold=True, color=blanco)
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    def aplicar_formatos(ws, headers: List[str], start_row: int, end_row: int) -> None:
+        currency_words = ["monto", "total", "generado", "pagado", "pendiente", "ganancia", "caja", "ecuasanitas", "precio", "saldo"]
+        integer_words = ["sesiones", "duración", "dolor"]
+        for idx, header in enumerate(headers, start=1):
+            lower = header.lower()
+            for row_idx in range(start_row, end_row + 1):
+                cell = ws.cell(row=row_idx, column=idx)
+                if "fecha" in lower:
+                    cell.number_format = "dd/mm/yyyy"
+                elif "porcentaje" in lower:
+                    cell.number_format = "0%"
+                elif any(word in lower for word in currency_words):
+                    cell.number_format = '$#,##0.00;[Red]-$#,##0.00'
+                elif any(word in lower for word in integer_words):
+                    cell.number_format = "0"
+
     # Vista de sesiones filtrada por la cajita del Dashboard.
     _excel_escribir_titulo(
         ws_sesiones,
         "CORPOFIT PRO — SESIONES FILTRADAS",
-        "Esta hoja se actualiza con la cajita de filtros del Dashboard."
+        "Esta hoja se actualiza con la cajita de filtros del Dashboard. Compatible sin FILTER()."
     )
-    ws_sesiones["A4"] = "Cambia Clínica, Fisioterapeuta o Día en Dashboard. Aquí se mostrará el detalle filtrado."
+    ws_sesiones["A4"] = "Cambia Clínica, Fisioterapeuta o Día en Dashboard. El detalle aparece aquí."
     ws_sesiones["A4"].fill = PatternFill("solid", fgColor=azul_claro)
     ws_sesiones["A4"].font = Font(bold=True, color="12355B")
-    for idx, header in enumerate(sesiones_headers, start=1):
-        cell = ws_sesiones.cell(row=6, column=idx, value=header)
-        cell.fill = PatternFill("solid", fgColor=azul)
-        cell.font = Font(bold=True, color=blanco)
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-    include_sesiones = (
-        "ISNUMBER(tblBaseSesiones[ID Sesión])"
-        "*(((Dashboard!$B$5=\"Todos\")+(tblBaseSesiones[Clínica / Consultorio]=Dashboard!$B$5))>0)"
-        "*(((Dashboard!$B$6=\"Todos\")+(tblBaseSesiones[Fisioterapeuta]=Dashboard!$B$6))>0)"
-        "*(((Dashboard!$B$7=\"Todos\")+(tblBaseSesiones[Día]=Dashboard!$B$7))>0)"
-    )
-    ws_sesiones["A7"] = f'=FILTER(tblBaseSesiones,{include_sesiones},"Sin resultados")'
+    escribir_encabezados(ws_sesiones, sesiones_headers)
+
+    total_ses_rows = max(sesiones_rows_count, 1)
+    end_ses_row = total_ses_rows + 6
+    for out_row in range(7, end_ses_row + 1):
+        n_formula = f"ROWS($A$7:A{out_row})"
+        for col_idx in range(1, len(sesiones_headers) + 1):
+            col_letter = get_column_letter(col_idx)
+            fallback = '"Sin resultados"' if out_row == 7 and col_idx == 1 else '""'
+            ws_sesiones.cell(
+                row=out_row,
+                column=col_idx,
+                value=f'=IFERROR(INDEX(Base_Sesiones!{col_letter}:{col_letter},MATCH({n_formula},Base_Sesiones!$W:$W,0)),{fallback})',
+            )
+    aplicar_formatos(ws_sesiones, sesiones_headers, 7, end_ses_row)
     ws_sesiones.freeze_panes = "A7"
 
     # Vista de pagos filtrada por la cajita del Dashboard.
     _excel_escribir_titulo(
         ws_pagos,
         "CORPOFIT PRO — PAGOS FILTRADOS",
-        "Esta hoja se actualiza con la cajita de filtros del Dashboard."
+        "Esta hoja se actualiza con la cajita de filtros del Dashboard. Compatible sin FILTER()."
     )
-    ws_pagos["A4"] = "Cambia Clínica, Fisioterapeuta o Día en Dashboard. Aquí se mostrará el detalle filtrado."
+    ws_pagos["A4"] = "Cambia Clínica, Fisioterapeuta o Día en Dashboard. El detalle aparece aquí."
     ws_pagos["A4"].fill = PatternFill("solid", fgColor=azul_claro)
     ws_pagos["A4"].font = Font(bold=True, color="12355B")
-    for idx, header in enumerate(pagos_headers, start=1):
-        cell = ws_pagos.cell(row=6, column=idx, value=header)
-        cell.fill = PatternFill("solid", fgColor=azul)
-        cell.font = Font(bold=True, color=blanco)
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-    include_pagos = (
-        "ISNUMBER(tblBasePagos[ID Pago])"
-        "*(((Dashboard!$B$5=\"Todos\")+(tblBasePagos[Clínica / Consultorio]=Dashboard!$B$5))>0)"
-        "*(((Dashboard!$B$6=\"Todos\")+(tblBasePagos[Fisioterapeuta / Responsable]=Dashboard!$B$6))>0)"
-        "*(((Dashboard!$B$7=\"Todos\")+(tblBasePagos[Día]=Dashboard!$B$7))>0)"
-    )
-    ws_pagos["A7"] = f'=FILTER(tblBasePagos,{include_pagos},"Sin resultados")'
-    ws_pagos.freeze_panes = "A7"
+    escribir_encabezados(ws_pagos, pagos_headers)
 
+    total_pag_rows = max(pagos_rows_count, 1)
+    end_pag_row = total_pag_rows + 6
+    for out_row in range(7, end_pag_row + 1):
+        n_formula = f"ROWS($A$7:A{out_row})"
+        for col_idx in range(1, len(pagos_headers) + 1):
+            col_letter = get_column_letter(col_idx)
+            fallback = '"Sin resultados"' if out_row == 7 and col_idx == 1 else '""'
+            ws_pagos.cell(
+                row=out_row,
+                column=col_idx,
+                value=f'=IFERROR(INDEX(Base_Pagos!{col_letter}:{col_letter},MATCH({n_formula},Base_Pagos!$T:$T,0)),{fallback})',
+            )
+    aplicar_formatos(ws_pagos, pagos_headers, 7, end_pag_row)
+    ws_pagos.freeze_panes = "A7"
 
 def _crear_excel_reporte_corpofit(
     db: Session,
@@ -3466,11 +3576,26 @@ def _crear_excel_reporte_corpofit(
     _excel_agregar_tabla(ws_pagos, 1, 1, pagos_headers, base_pagos, "tblBasePagos")
     ws_pagos.freeze_panes = "A2"
 
+    # Columnas auxiliares ocultas para las vistas filtradas, compatibles con Excel móvil/WPS.
+    _excel_agregar_columnas_helper_filtros(
+        ws_sesiones,
+        ws_pagos,
+        sesiones_rows_count=len(base_sesiones),
+        pagos_rows_count=len(base_pagos),
+    )
+
     # Panel central de filtros: una sola cajita controla los resúmenes y vistas.
     rangos_filtros = _excel_crear_listas_filtros(wb, base_sesiones, base_pagos)
     _excel_escribir_titulo(ws_dashboard, "CORPOFIT PRO — REPORTE EXCEL", subtitulo)
     _excel_configurar_panel_filtros_dashboard(ws_dashboard, rangos_filtros, desde, hasta)
-    _excel_crear_vistas_filtradas(ws_sesiones_filtradas, ws_pagos_filtrados, sesiones_headers, pagos_headers)
+    _excel_crear_vistas_filtradas(
+        ws_sesiones_filtradas,
+        ws_pagos_filtrados,
+        sesiones_headers,
+        pagos_headers,
+        len(base_sesiones),
+        len(base_pagos),
+    )
 
     # Gráficos del Dashboard basados en Análisis.
     if general.sesiones_por_dia:
