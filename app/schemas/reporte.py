@@ -119,6 +119,100 @@ class ResumenEstadoPagosOut(BaseModel):
     cubierto_ecuasanitas: float = 0
 
 
+class DeudaAcumuladaPacienteOut(BaseModel):
+    pacienteid: int
+    paciente: str
+    terapeutaid: Optional[int] = None
+    terapeuta: str = "Sin fisioterapeuta"
+    consultorioid: Optional[int] = None
+    consultorio: str = "Sin consultorio"
+    tratamientopacienteid: int
+    tratamiento: str
+    sesiones_debe: int = 0
+    valor_sesion: float = 0
+    total_deuda: float = 0
+    fechas_pendientes: List[date] = Field(default_factory=list)
+
+
+class DeudaAcumuladaOut(BaseModel):
+    desde: date
+    hasta: date
+    total_deuda: float = 0
+    total_sesiones_pendientes: int = 0
+    pacientes: List[DeudaAcumuladaPacienteOut] = Field(default_factory=list)
+
+
+
+
+class CajaSemanalPagoOut(BaseModel):
+    pagoid: int
+    fecha: date
+    pacienteid: int
+    paciente: str
+    terapeuta: str = "Sin fisioterapeuta"
+    tratamientopacienteid: int
+    tratamiento: str
+    metodo: str = "Sin método"
+    monto: float = 0
+    valor_sesion: float = 0
+    sesiones_pagadas: float = 0
+    sesiones_realizadas_semana: int = 0
+
+
+class CajaSemanalDetalleOut(BaseModel):
+    desde: date
+    hasta: date
+    total_caja: float = 0
+    total_pagos: int = 0
+    total_sesiones_pagadas: float = 0
+    pagos: List[CajaSemanalPagoOut] = Field(default_factory=list)
+
+
+class PendienteSemanaPacienteOut(BaseModel):
+    pacienteid: int
+    paciente: str
+    terapeutaid: Optional[int] = None
+    terapeuta: str = "Sin fisioterapeuta"
+    consultorioid: Optional[int] = None
+    consultorio: str = "Sin consultorio"
+    tratamientopacienteid: int
+    tratamiento: str
+    sesiones_pendientes: int = 0
+    valor_sesion: float = 0
+    total_pendiente: float = 0
+    fechas_pendientes: List[date] = Field(default_factory=list)
+
+
+class PendienteSemanaDetalleOut(BaseModel):
+    desde: date
+    hasta: date
+    total_pendiente: float = 0
+    total_sesiones_pendientes: int = 0
+    pacientes: List[PendienteSemanaPacienteOut] = Field(default_factory=list)
+
+
+class SaldoFavorPacienteOut(BaseModel):
+    pacienteid: int
+    paciente: str
+    terapeutaid: Optional[int] = None
+    terapeuta: str = "Sin fisioterapeuta"
+    consultorioid: Optional[int] = None
+    consultorio: str = "Sin consultorio"
+    tratamientopacienteid: int
+    tratamiento: str
+    valor_sesion: float = 0
+    saldo_favor: float = 0
+    sesiones_disponibles: float = 0
+
+
+class SaldoFavorDetalleOut(BaseModel):
+    desde: date
+    hasta: date
+    total_saldo_favor: float = 0
+    total_sesiones_disponibles: float = 0
+    pacientes: List[SaldoFavorPacienteOut] = Field(default_factory=list)
+
+
 class ReporteDiaOut(BaseModel):
     fecha: date
     dia: str
@@ -139,6 +233,10 @@ class TerapiasReporteOut(BaseModel):
     total_ecuasanitas: float = 0
     sesiones_ecuasanitas: int = 0
     total_pendiente: float = 0
+    # Deuda histórica real de sesiones pendientes de pago.
+    # Se muestra aparte para no mezclar producción/caja semanal con cartera acumulada.
+    deuda_acumulada_total: float = 0
+    deuda_acumulada_sesiones: int = 0
     saldo_a_favor: float = 0
     transferencias_pendientes: int = 0
     pendiente_verificacion_total: float = 0

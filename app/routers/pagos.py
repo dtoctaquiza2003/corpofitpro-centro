@@ -1,5 +1,5 @@
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+import json
 from types import SimpleNamespace
 from typing import List, Optional
 
@@ -36,6 +36,7 @@ from ..models.sesion_terapia import SesionTerapia
 from ..models.tratamiento_paciente import TratamientoPaciente
 from ..models.usuario import Usuario
 from ..services.notificacion_service import crear_notificacion_usuario
+from ..utils.fechas import now_utc
 from ..services.supabase_storage import (
     crear_url_firmada_comprobante,
     subir_comprobante_pago,
@@ -128,6 +129,177 @@ def _tratamiento_visible_para_terapeuta_filter(terapeutaid: int):
             )
         ),
     )
+
+
+
+def _tratamiento_con_sesion_de_terapeuta_exists(terapeutaid: int):
+    return exists().where(
+        and_(
+            SesionTerapia.tratamientopacienteid == TratamientoPaciente.id,
+            SesionTerapia.terapeutaid == terapeutaid,
+            SesionTerapia.horasalida != None,
+        )
+    )
+
+
+def _obtener_terapeuta_para_filtro(
+    db: Session,
+    terapeuta_sesion_id: Optional[int],
+    current_user: Usuario,
+    consultorio_operativo_id: Optional[int],
+) -> Optional[Usuario]:
+    # Valida el filtro por fisioterapeuta que PRACTICO la sesion.
+    # No usa el terapeuta asignado del paciente; usa SesionTerapia.terapeutaid.
+    if terapeuta_sesion_id is None:
+        return None
+
+    terapeuta = (
+        db.query(Usuario)
+        .filter(
+            Usuario.id == terapeuta_sesion_id,
+            Usuario.rol == 2,
+            Usuario.activo == True,
+        )
+        .first()
+    )
+
+    if not terapeuta:
+        raise HTTPException(
+            status_code=404,
+            detail="Fisioterapeuta no encontrado o inactivo.",
+        )
+
+    if current_user.rol == 2 and terapeuta.id != current_user.id:
+        raise HTTPException(
+            status_code=403,
+            detail="Solo puedes filtrar tus propias sesiones.",
+        )
+
+    if consultorio_operativo_id is not None and terapeuta.consultorioid != consultorio_operativo_id:
+        raise HTTPException(
+            status_code=403,
+            detail="El fisioterapeuta no pertenece a la clínica seleccionada.",
+        )
+
+    return terapeuta
+
+
+def _calcular_cobertura_fifo_por_terapeuta(
+    db: Session,
+    tratamiento_ids: List[int],
+    terapeutaid: int,
+):
+    # Calcula generado/cubierto/pendiente para sesiones realizadas por un fisio.
+    # Los pagos solo cubren el mismo tratamientopacienteid y se consumen FIFO.
+    if not tratamiento_ids:
+        return {}
+
+    sesiones = (
+        db.query(
+            SesionTerapia.id,
+            SesionTerapia.tratamientopacienteid,
+            SesionTerapia.terapeutaid,
+            SesionTerapia.fecha,
+            SesionTerapia.horaingreso,
+            TratamientoPaciente.precio_sesion_aplicado,
+        )
+        .join(
+            TratamientoPaciente,
+            TratamientoPaciente.id == SesionTerapia.tratamientopacienteid,
+        )
+        .filter(
+            SesionTerapia.tratamientopacienteid.in_(tratamiento_ids),
+            SesionTerapia.horasalida != None,
+        )
+        .order_by(
+            SesionTerapia.tratamientopacienteid.asc(),
+            SesionTerapia.fecha.asc(),
+            SesionTerapia.horaingreso.asc(),
+            SesionTerapia.id.asc(),
+        )
+        .all()
+    )
+
+    pagos_rows = (
+        db.query(Pago)
+        .filter(
+            Pago.tratamientopacienteid.in_(tratamiento_ids),
+            Pago.estadopago == 2,
+            or_(Pago.anulado == False, Pago.anulado.is_(None)),
+            or_(
+                Pago.esrecuperacioncartera == False,
+                Pago.esrecuperacioncartera.is_(None),
+            ),
+        )
+        .order_by(
+            Pago.tratamientopacienteid.asc(),
+            Pago.fechapago.asc(),
+            Pago.id.asc(),
+        )
+        .all()
+    )
+
+    pagos_por_tratamiento = defaultdict(list)
+    for pago in pagos_rows:
+        pagos_por_tratamiento[pago.tratamientopacienteid].append(
+            {
+                "restante": float(pago.monto or 0),
+                "es_previo": bool(getattr(pago, "espagoprevio", False)),
+            }
+        )
+
+    resultado = defaultdict(
+        lambda: {
+            "sesiones_realizadas": 0,
+            "total_generado": 0.0,
+            "pagado_caja_verificado": 0.0,
+            "pago_previo_verificado": 0.0,
+            "pagado_verificado": 0.0,
+            "saldo": 0.0,
+            "saldo_favor": 0.0,
+        }
+    )
+
+    for sesion in sesiones:
+        tratamiento_id = sesion.tratamientopacienteid
+        precio = float(sesion.precio_sesion_aplicado or 0)
+        restante_sesion = precio
+        cubierto_caja = 0.0
+        cubierto_previo = 0.0
+
+        for pago in pagos_por_tratamiento.get(tratamiento_id, []):
+            if restante_sesion <= 0:
+                break
+            if pago["restante"] <= 0:
+                continue
+
+            aplicado = min(restante_sesion, pago["restante"])
+            pago["restante"] -= aplicado
+            restante_sesion -= aplicado
+
+            if pago["es_previo"]:
+                cubierto_previo += aplicado
+            else:
+                cubierto_caja += aplicado
+
+        if sesion.terapeutaid != terapeutaid:
+            continue
+
+        item = resultado[tratamiento_id]
+        item["sesiones_realizadas"] += 1
+        item["total_generado"] += precio
+        item["pagado_caja_verificado"] += cubierto_caja
+        item["pago_previo_verificado"] += cubierto_previo
+        item["pagado_verificado"] += cubierto_caja + cubierto_previo
+        item["saldo"] += max(restante_sesion, 0)
+
+    return {
+        tratamiento_id: {
+            key: round(value, 2) if isinstance(value, float) else value
+            for key, value in data.items()
+        }
+        for tratamiento_id, data in resultado.items()
+    }
 
 
 def _pago_visible_para_consultorio_filter(consultorioid: int):
@@ -440,12 +612,6 @@ def _validar_saldo_membresia_gimnasio(
             detail="El abono supera el saldo pendiente de la membresía de gimnasio.",
         )
 
-
-def now_ecuador() -> datetime:
-    return datetime.now(timezone(timedelta(hours=-5)))
-
-def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
 
 
 def _nombre_paciente(paciente) -> str:
@@ -790,6 +956,8 @@ def listar_cuentas_ecuasanitas(
     limit: int = Query(default=40, ge=1, le=50),
     offset: int = Query(default=0, ge=0),
     buscar: Optional[str] = Query(default=None),
+    consultorioid: Optional[int] = Query(default=None),
+    terapeuta_sesion_id: Optional[int] = Query(default=None),
     db: Session = Depends(get_db),
     current_user: Usuario = Depends(get_current_user),
 ):
@@ -813,6 +981,8 @@ def listar_cuentas_ecuasanitas(
         )
     )
 
+    consultorio_operativo_id: Optional[int] = None
+
     if current_user.rol == 2:
         query = query.filter(
             _tratamiento_visible_para_terapeuta_filter(current_user.id)
@@ -823,15 +993,40 @@ def listar_cuentas_ecuasanitas(
             current_user,
             current_user.consultorioid,
         )
+        consultorio_operativo_id = current_user.consultorioid
         query = query.filter(
             _tratamiento_visible_para_consultorio_filter(current_user.consultorioid)
         )
 
     elif current_user.rol == 3:
-        pass
+        if consultorioid is not None:
+            consultorio_operativo_id = consultorioid
+            query = query.filter(
+                _tratamiento_visible_para_consultorio_filter(consultorioid)
+            )
 
     else:
         raise HTTPException(status_code=403, detail="No autorizado")
+
+    terapeuta_sesion_filtro = _obtener_terapeuta_para_filtro(
+        db=db,
+        terapeuta_sesion_id=terapeuta_sesion_id,
+        current_user=current_user,
+        consultorio_operativo_id=consultorio_operativo_id,
+    )
+
+    # Para rol terapeuta, la pantalla siempre debe calcular sobre las sesiones
+    # que el propio terapeuta practicó, aunque no venga el query param.
+    if current_user.rol == 2 and terapeuta_sesion_filtro is None:
+        terapeuta_sesion_filtro = current_user
+
+    if terapeuta_sesion_filtro is not None:
+        terapeuta_operativo_id = terapeuta_sesion_filtro.id
+        query = query.filter(
+            _tratamiento_con_sesion_de_terapeuta_exists(
+                terapeuta_sesion_filtro.id
+            )
+        )
 
     if buscar and buscar.strip():
         texto = f"%{buscar.strip()}%"
@@ -953,6 +1148,7 @@ def listar_cuentas_tratamientos(
     buscar: Optional[str] = Query(default=None),
     solo_transferencias_pendientes: bool = Query(default=False),
     consultorioid: Optional[int] = Query(default=None),
+    terapeuta_sesion_id: Optional[int] = Query(default=None),
     db: Session = Depends(get_db),
     current_user: Usuario = Depends(get_current_user),
 ):
@@ -998,6 +1194,26 @@ def listar_cuentas_tratamientos(
 
     else:
         raise HTTPException(status_code=403, detail="No autorizado")
+
+    terapeuta_sesion_filtro = _obtener_terapeuta_para_filtro(
+        db=db,
+        terapeuta_sesion_id=terapeuta_sesion_id,
+        current_user=current_user,
+        consultorio_operativo_id=consultorio_operativo_id,
+    )
+
+    # Para rol terapeuta, la pantalla siempre debe calcular sobre sus propias sesiones
+    # aunque no venga el query param desde el front.
+    if current_user.rol == 2 and terapeuta_sesion_filtro is None:
+        terapeuta_sesion_filtro = current_user
+
+    if terapeuta_sesion_filtro is not None:
+        terapeuta_operativo_id = terapeuta_sesion_filtro.id
+        query = query.filter(
+            _tratamiento_con_sesion_de_terapeuta_exists(
+                terapeuta_sesion_filtro.id
+            )
+        )
 
     if buscar and buscar.strip():
         texto = f"%{buscar.strip()}%"
@@ -1058,6 +1274,14 @@ def listar_cuentas_tratamientos(
         tratamiento.id
         for tratamiento, _ in tratamientos
     ]
+
+    cobertura_por_fisio = {}
+    if terapeuta_sesion_filtro is not None:
+        cobertura_por_fisio = _calcular_cobertura_fifo_por_terapeuta(
+            db=db,
+            tratamiento_ids=tratamiento_ids,
+            terapeutaid=terapeuta_sesion_filtro.id,
+        )
 
     # ============================================================
     # SESIONES
@@ -1283,6 +1507,23 @@ def listar_cuentas_tratamientos(
         saldo = max(total_generado - pagado_verificado, 0)
         saldo_favor = max(pagado_verificado - total_generado, 0)
 
+        if terapeuta_sesion_filtro is not None:
+            cobertura = cobertura_por_fisio.get(tratamiento.id)
+            if not cobertura:
+                continue
+
+            sesiones_realizadas = int(cobertura["sesiones_realizadas"] or 0)
+            total_generado = float(cobertura["total_generado"] or 0)
+            pagado_caja_verificado = float(
+                cobertura["pagado_caja_verificado"] or 0
+            )
+            pago_previo_verificado = float(
+                cobertura["pago_previo_verificado"] or 0
+            )
+            pagado_verificado = float(cobertura["pagado_verificado"] or 0)
+            saldo = float(cobertura["saldo"] or 0)
+            saldo_favor = 0.0
+
         nombre_tipo_terapia = None
         if tratamiento.tipo_terapia:
             nombre_tipo_terapia = tratamiento.tipo_terapia.nombre
@@ -1294,6 +1535,16 @@ def listar_cuentas_tratamientos(
                 tratamientopacienteid=tratamiento.id,
                 pacienteid=paciente.id,
                 paciente=f"{paciente.nombres} {paciente.apellidos}",
+                terapeuta_sesionid=(
+                    terapeuta_sesion_filtro.id
+                    if terapeuta_sesion_filtro is not None
+                    else None
+                ),
+                terapeuta_sesion=(
+                    f"{terapeuta_sesion_filtro.nombres} {terapeuta_sesion_filtro.apellidos}"
+                    if terapeuta_sesion_filtro is not None
+                    else None
+                ),
                 tratamiento=tratamiento.tipotratamiento,
                 tipoterapiaid=tratamiento.tipoterapiaid,
                 tipo_terapia=nombre_tipo_terapia,
@@ -1888,6 +2139,259 @@ def registrar_pago(
     db.commit()
 
     return respuesta
+
+
+
+# ============================================================
+# REGISTRAR TRANSFERENCIA GRUPAL / COMPARTIDA
+# Un solo comprobante físico, varios pagos internos.
+# ============================================================
+
+@router.post(
+    "/registrar-transferencia-grupal",
+    response_model=List[PagoOut],
+    status_code=status.HTTP_201_CREATED,
+)
+async def registrar_transferencia_grupal(
+    total_transferencia: float = Form(...),
+    numerocomprobante: str = Form(...),
+    items_json: str = Form(...),
+    comprobante: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(get_current_secretary),
+):
+    """
+    Registra una transferencia compartida.
+
+    Caso real:
+    - Una sola transferencia bancaria por $30.
+    - El comprobante pertenece a 3 pacientes.
+    - En la base se crean 3 pagos separados para que reportes, saldos,
+      fisios y pacientes cuadren correctamente.
+
+    No requiere columnas nuevas en la tabla pagos: todos los pagos quedan
+    unidos por el mismo número de comprobante y la misma URL de comprobante.
+    """
+    numero = (numerocomprobante or "").strip()
+
+    if not numero or len(numero) < 3:
+        raise HTTPException(
+            status_code=400,
+            detail="Ingrese un número de comprobante válido.",
+        )
+
+    if total_transferencia <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="El total de la transferencia debe ser mayor a 0.",
+        )
+
+    if comprobante is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Debe subir la foto del comprobante.",
+        )
+
+    try:
+        raw_items = json.loads(items_json or "[]")
+    except json.JSONDecodeError:
+        raise HTTPException(
+            status_code=400,
+            detail="La distribución del pago grupal no tiene un formato válido.",
+        )
+
+    if not isinstance(raw_items, list) or len(raw_items) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail="Agregue al menos 2 pacientes para registrar un pago grupal.",
+        )
+
+    items: list[dict] = []
+    total_distribuido = 0.0
+
+    for index, item in enumerate(raw_items, start=1):
+        if not isinstance(item, dict):
+            raise HTTPException(
+                status_code=400,
+                detail=f"El detalle #{index} del pago grupal no es válido.",
+            )
+
+        try:
+            pacienteid = int(item.get("pacienteid"))
+            monto = float(item.get("monto"))
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Revise paciente y monto del detalle #{index}.",
+            )
+
+        tratamientopacienteid = item.get("tratamientopacienteid")
+        pacientepaqueteid = item.get("pacientepaqueteid")
+        membresiagimnasioid = item.get("membresiagimnasioid")
+
+        tratamientopacienteid = int(tratamientopacienteid) if tratamientopacienteid else None
+        pacientepaqueteid = int(pacientepaqueteid) if pacientepaqueteid else None
+        membresiagimnasioid = int(membresiagimnasioid) if membresiagimnasioid else None
+
+        if monto <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"El monto del detalle #{index} debe ser mayor a 0.",
+            )
+
+        _validar_destino_pago(
+            pacientepaqueteid=pacientepaqueteid,
+            tratamientopacienteid=tratamientopacienteid,
+            membresiagimnasioid=membresiagimnasioid,
+        )
+
+        paciente = _validar_paciente(
+            db=db,
+            pacienteid=pacienteid,
+            current_user=current_user,
+            tratamientopacienteid=tratamientopacienteid,
+            permitir_atencion_compartida=True,
+        )
+
+        paciente_paquete = _validar_paciente_paquete(
+            db=db,
+            pacienteid=pacienteid,
+            pacientepaqueteid=pacientepaqueteid,
+        )
+
+        _validar_tratamiento_paciente(
+            db=db,
+            pacienteid=pacienteid,
+            tratamientopacienteid=tratamientopacienteid,
+        )
+
+        membresia_gimnasio = _validar_membresia_gimnasio(
+            db=db,
+            pacienteid=pacienteid,
+            membresiagimnasioid=membresiagimnasioid,
+        )
+
+        _validar_saldo_paquete(
+            db=db,
+            paciente_paquete=paciente_paquete,
+            monto=monto,
+        )
+
+        _validar_saldo_membresia_gimnasio(
+            db=db,
+            membresia=membresia_gimnasio,
+            monto=monto,
+        )
+
+        items.append(
+            {
+                "pacienteid": pacienteid,
+                "pacientepaqueteid": pacientepaqueteid,
+                "tratamientopacienteid": tratamientopacienteid,
+                "membresiagimnasioid": membresiagimnasioid,
+                "monto": round(monto, 2),
+                "paciente_ref": SimpleNamespace(
+                    id=paciente.id,
+                    consultorioid=paciente.consultorioid,
+                    nombres=paciente.nombres,
+                    apellidos=paciente.apellidos,
+                ),
+            }
+        )
+        total_distribuido += monto
+
+    if abs(round(total_distribuido, 2) - round(float(total_transferencia), 2)) > 0.01:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "El total distribuido no coincide con el total de la transferencia. "
+                f"Transferencia: ${float(total_transferencia):.2f}. "
+                f"Distribuido: ${total_distribuido:.2f}."
+            ),
+        )
+
+    current_user_id = current_user.id
+    primer_paciente_id = items[0]["pacienteid"]
+
+    # Liberar la transacción antes de subir la imagen.
+    db.rollback()
+    db.close()
+
+    comprobante_path = await subir_comprobante_pago(
+        comprobante,
+        primer_paciente_id,
+    )
+
+    try:
+        current_user_db = (
+            db.query(Usuario)
+            .filter(
+                Usuario.id == current_user_id,
+                Usuario.activo == True,
+            )
+            .first()
+        )
+
+        if not current_user_db:
+            raise HTTPException(
+                status_code=401,
+                detail="Usuario no encontrado o inactivo.",
+            )
+
+        pagos_creados: list[Pago] = []
+
+        for item in items:
+            # Revalidar acceso después del upload.
+            _validar_paciente(
+                db=db,
+                pacienteid=item["pacienteid"],
+                current_user=current_user_db,
+                tratamientopacienteid=item["tratamientopacienteid"],
+                permitir_atencion_compartida=True,
+            )
+
+            _validar_tratamiento_paciente(
+                db=db,
+                pacienteid=item["pacienteid"],
+                tratamientopacienteid=item["tratamientopacienteid"],
+            )
+
+            pago = Pago(
+                pacienteid=item["pacienteid"],
+                pacientepaqueteid=item["pacientepaqueteid"],
+                tratamientopacienteid=item["tratamientopacienteid"],
+                membresiagimnasioid=item["membresiagimnasioid"],
+                monto=item["monto"],
+                metodopago="Transferencia",
+                numerocomprobante=numero,
+                comprobanteurl=comprobante_path,
+                estadopago=1,
+                creado_por_id=current_user_db.id,
+                verificado_por_id=None,
+                fechapago=now_utc(),
+                fecha_verificacion=None,
+                motivo_rechazo=None,
+            )
+
+            db.add(pago)
+            db.flush()
+            pagos_creados.append(pago)
+
+            _notificar_pago_transferencia_pendiente(
+                db=db,
+                pago=pago,
+                paciente=item["paciente_ref"],
+                current_user=current_user_db,
+            )
+
+        respuesta = [PagoOut.model_validate(pago) for pago in pagos_creados]
+
+        db.commit()
+        return respuesta
+
+    except Exception:
+        db.rollback()
+        raise
 
 
 # ============================================================

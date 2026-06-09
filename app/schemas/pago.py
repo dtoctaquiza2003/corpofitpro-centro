@@ -1,7 +1,9 @@
 from datetime import date, datetime
 from typing import List, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_serializer
+
+from app.utils.fechas import to_ecuador
 
 
 class PagoCreate(BaseModel):
@@ -117,6 +119,10 @@ class PagoOut(BaseModel):
     fecha_anulacion: Optional[datetime] = None
     motivo_anulacion: Optional[str] = None
 
+    @field_serializer("fechapago", "fecha_verificacion", "fecha_anulacion")
+    def serializar_fecha_ecuador(self, value: Optional[datetime], _info):
+        return to_ecuador(value) if value is not None else None
+
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -155,6 +161,10 @@ class PagoSimpleOut(BaseModel):
     anulado_por_id: Optional[int] = None
     fecha_anulacion: Optional[datetime] = None
     motivo_anulacion: Optional[str] = None
+
+    @field_serializer("fechapago", "fecha_verificacion", "fecha_anulacion")
+    def serializar_fecha_ecuador(self, value: Optional[datetime], _info):
+        return to_ecuador(value) if value is not None else None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -219,6 +229,11 @@ class CuentaTratamientoOut(BaseModel):
     tratamientopacienteid: int
     pacienteid: int
     paciente: str
+
+    # Opcional: cuando se filtra por el fisioterapeuta que realizó
+    # la sesión, estos campos indican el fisio operativo usado.
+    terapeuta_sesionid: Optional[int] = None
+    terapeuta_sesion: Optional[str] = None
 
     tratamiento: str
     tipoterapiaid: Optional[int] = None

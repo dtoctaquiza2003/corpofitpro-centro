@@ -20,8 +20,12 @@ from ..models.sesion_terapia import SesionTerapia
 from ..models.tratamiento_paciente import TratamientoPaciente
 from ..models.usuario import Usuario
 from ..schemas.reporte import (
+    CajaSemanalDetalleOut,
+    CajaSemanalPagoOut,
     ClinicaSemanalOut,
     DashboardAccionesOut,
+    DeudaAcumuladaOut,
+    DeudaAcumuladaPacienteOut,
     DashboardLiteOut,
     DashboardResumenOut,
     FisioDetalleOut,
@@ -32,8 +36,12 @@ from ..schemas.reporte import (
     ReporteFiltroConsultorioOut,
     ReporteFiltroTerapeutaOut,
     ReporteFiltrosOut,
+    PendienteSemanaDetalleOut,
+    PendienteSemanaPacienteOut,
     ReporteSemanalResponse,
     ResumenEstadoPagosOut,
+    SaldoFavorDetalleOut,
+    SaldoFavorPacienteOut,
     SesionPorDia,
     TerapiasReporteOut,
     TratamientoRealizadoOut,
@@ -945,6 +953,231 @@ def _pagos_aplicados_a_rango_por_tratamiento(
     return disponible_para_rango
 
 
+def _deuda_acumulada_reporte(
+    db: Session,
+    current_user: Usuario,
+    desde: date,
+    hasta: date,
+    terapeutaid: Optional[int] = None,
+    consultorioid: Optional[int] = None,
+    dia_semana: Optional[int] = None,
+) -> DeudaAcumuladaOut:
+    """Calcula cartera acumulada sin mezclarla con caja semanal.
+
+    Regla importante:
+    - Primero se busca qué tratamientos aparecen en las sesiones del rango/filtros.
+    - Para esos tratamientos se revisan todas las sesiones finalizadas hasta `hasta`.
+    - Los pagos verificados del MISMO paciente + tratamiento cubren las sesiones
+      desde la más antigua hasta la más nueva.
+    - Las sesiones que siguen sin cubrir son deuda acumulada.
+
+    Esto evita que el pago de otro paciente o de otro tratamiento cubra una deuda.
+    """
+    dia_semana = _validar_dia_semana(dia_semana)
+    consultorio_resuelto = _resolver_consultorioid_para_rol(
+        current_user,
+        consultorioid,
+    )
+
+    sesiones_rango_query = (
+        db.query(SesionTerapia)
+        .filter(
+            SesionTerapia.fecha.between(desde, hasta),
+            SesionTerapia.horasalida != None,
+            SesionTerapia.tratamientopacienteid != None,
+        )
+    )
+
+    sesiones_rango_query = _aplicar_filtro_dia_sesion(
+        sesiones_rango_query,
+        dia_semana,
+    )
+
+    sesiones_rango_query = _aplicar_filtros_sesiones(
+        sesiones_rango_query,
+        current_user,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+    )
+
+    tratamiento_ids = {
+        row[0]
+        for row in sesiones_rango_query.with_entities(
+            SesionTerapia.tratamientopacienteid
+        ).distinct().all()
+        if row[0] is not None
+    }
+
+    if not tratamiento_ids:
+        return DeudaAcumuladaOut(
+            desde=desde,
+            hasta=hasta,
+            total_deuda=0,
+            total_sesiones_pendientes=0,
+            pacientes=[],
+        )
+
+    pagos_rows = (
+        db.query(
+            Pago.pacienteid,
+            Pago.tratamientopacienteid,
+            func.coalesce(func.sum(Pago.monto), 0),
+        )
+        .filter(
+            Pago.tratamientopacienteid.in_(tratamiento_ids),
+            Pago.estadopago == 2,
+            _pago_no_anulado_filter(),
+            or_(Pago.esrecuperacioncartera == False, Pago.esrecuperacioncartera.is_(None)),
+            or_(
+                Pago.espagoprevio == True,
+                Pago.fechapago < fin_dia_ecuador(hasta),
+            ),
+        )
+        .group_by(Pago.pacienteid, Pago.tratamientopacienteid)
+        .all()
+    )
+
+    disponible_por_tratamiento: Dict[Tuple[int, int], float] = {
+        (int(paciente_id), int(tratamiento_id)): float(total or 0)
+        for paciente_id, tratamiento_id, total in pagos_rows
+        if paciente_id is not None and tratamiento_id is not None
+    }
+
+    sesiones_historicas = (
+        db.query(SesionTerapia)
+        .options(
+            joinedload(SesionTerapia.paciente),
+            joinedload(SesionTerapia.terapeuta),
+            joinedload(SesionTerapia.tratamiento_paciente),
+        )
+        .filter(
+            SesionTerapia.tratamientopacienteid.in_(tratamiento_ids),
+            SesionTerapia.horasalida != None,
+            SesionTerapia.fecha <= hasta,
+        )
+        .order_by(
+            SesionTerapia.tratamientopacienteid,
+            SesionTerapia.pacienteid,
+            SesionTerapia.fecha,
+            SesionTerapia.horaingreso,
+            SesionTerapia.id,
+        )
+        .all()
+    )
+
+    consultorios_map = _obtener_consultorios_map(db)
+    agrupado: Dict[Tuple[int, Optional[int], int, float], Dict] = {}
+
+    def incluir_en_detalle(sesion: SesionTerapia) -> bool:
+        if current_user.rol == 2 and sesion.terapeutaid != current_user.id:
+            return False
+
+        if terapeutaid is not None and sesion.terapeutaid != terapeutaid:
+            return False
+
+        if consultorio_resuelto is not None:
+            terapeuta = getattr(sesion, "terapeuta", None)
+            if terapeuta is None or terapeuta.consultorioid != consultorio_resuelto:
+                return False
+
+        if dia_semana is not None and sesion.fecha.weekday() != dia_semana:
+            return False
+
+        return True
+
+    for sesion in sesiones_historicas:
+        tratamiento = sesion.tratamiento_paciente
+
+        if tratamiento is None or sesion.paciente is None:
+            continue
+
+        if _es_paciente_ecuasanitas(sesion.paciente):
+            continue
+
+        precio = _precio_aplicado(tratamiento)
+        clave_pago = (int(sesion.pacienteid), int(sesion.tratamientopacienteid))
+        disponible = disponible_por_tratamiento.get(clave_pago, 0.0)
+        aplicado = min(precio, disponible)
+        pendiente = round(max(precio - aplicado, 0.0), 2)
+        disponible_por_tratamiento[clave_pago] = max(disponible - aplicado, 0.0)
+
+        if pendiente <= 0:
+            continue
+
+        if not incluir_en_detalle(sesion):
+            continue
+
+        terapeuta = getattr(sesion, "terapeuta", None)
+        terapeuta_id = sesion.terapeutaid
+        consultorio_operativo = terapeuta.consultorioid if terapeuta is not None else None
+
+        key = (
+            int(sesion.pacienteid),
+            terapeuta_id,
+            int(sesion.tratamientopacienteid),
+            round(precio, 2),
+        )
+
+        item = agrupado.setdefault(
+            key,
+            {
+                "pacienteid": int(sesion.pacienteid),
+                "paciente": _nombre_paciente(sesion.paciente),
+                "terapeutaid": terapeuta_id,
+                "terapeuta": _nombre_usuario(terapeuta),
+                "consultorioid": consultorio_operativo,
+                "consultorio": consultorios_map.get(
+                    consultorio_operativo,
+                    "Sin consultorio",
+                ),
+                "tratamientopacienteid": int(sesion.tratamientopacienteid),
+                "tratamiento": tratamiento.tipotratamiento or "Tratamiento",
+                "sesiones_debe": 0,
+                "valor_sesion": round(precio, 2),
+                "total_deuda": 0.0,
+                "fechas_pendientes": [],
+            },
+        )
+
+        item["sesiones_debe"] = int(item["sesiones_debe"]) + 1
+        item["total_deuda"] = float(item["total_deuda"]) + pendiente
+        item["fechas_pendientes"].append(sesion.fecha)
+
+    pacientes = [
+        DeudaAcumuladaPacienteOut(
+            pacienteid=int(item["pacienteid"]),
+            paciente=str(item["paciente"]),
+            terapeutaid=item["terapeutaid"],
+            terapeuta=str(item["terapeuta"]),
+            consultorioid=item["consultorioid"],
+            consultorio=str(item["consultorio"]),
+            tratamientopacienteid=int(item["tratamientopacienteid"]),
+            tratamiento=str(item["tratamiento"]),
+            sesiones_debe=int(item["sesiones_debe"]),
+            valor_sesion=round(float(item["valor_sesion"]), 2),
+            total_deuda=round(float(item["total_deuda"]), 2),
+            fechas_pendientes=sorted(item["fechas_pendientes"]),
+        )
+        for item in agrupado.values()
+    ]
+
+    pacientes.sort(
+        key=lambda item: (
+            item.paciente.lower(),
+            item.terapeuta.lower(),
+            item.tratamientopacienteid,
+        )
+    )
+
+    return DeudaAcumuladaOut(
+        desde=desde,
+        hasta=hasta,
+        total_deuda=round(sum(item.total_deuda for item in pacientes), 2),
+        total_sesiones_pendientes=sum(item.sesiones_debe for item in pacientes),
+        pacientes=pacientes,
+    )
+
+
 # -----------------------------------------------------------------------------
 # Filtros para el frontend
 # -----------------------------------------------------------------------------
@@ -1671,28 +1904,31 @@ def reporte_terapias(
         1 for s in sesiones if _es_paciente_ecuasanitas(s.paciente)
     )
 
-    # Para no dañar el cuadre de caja, el total pagado del reporte general
-    # solo suma dinero cobrado dentro del sistema. Los pagos previos se
-    # muestran separado y solo reducen saldos.
-    total_pagado_verificado = sum(
-        item.get("pagado_caja_verificado", item["pagado_verificado"])
-        for item in cuentas.values()
-    )
-
-    total_pago_previo_verificado = sum(
-        item.get("pago_previo_verificado", 0.0)
-        for item in cuentas.values()
-    )
-
-    total_pendiente = sum(
-        item["saldo"]
-        for item in cuentas.values()
-    )
-
+    # IMPORTANTE:
+    # El resumen semanal NO debe usar la deuda acumulada del tratamiento completo.
+    # Si se mezcla producción semanal con saldos históricos, aparecen pendientes
+    # exagerados. Aquí dejamos:
+    # - Pagado: dinero cobrado dentro del rango filtrado.
+    # - Pendiente: producción del rango que no se cobró en el rango.
+    # - Deuda acumulada: se calcula aparte y se consulta en su propio detalle.
     saldo_a_favor = sum(
         item["saldo_favor"]
         for item in cuentas.values()
     )
+
+    total_pagado_verificado = 0.0
+    total_pago_previo_verificado = 0.0
+
+    pendiente_semana_detalle = _pendiente_semana_detalle(
+        db=db,
+        current_user=current_user,
+        desde=desde,
+        hasta=hasta,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+        dia_semana=dia_semana,
+    )
+    total_pendiente = float(pendiente_semana_detalle.total_pendiente or 0.0)
 
     pendiente_verificacion_total = sum(
         item["pendiente_verificacion"]
@@ -1719,6 +1955,51 @@ def reporte_terapias(
         current_user,
         terapeutaid=terapeutaid,
         consultorioid=consultorioid,
+    )
+
+    total_pagado_verificado = float(
+        pagos_query
+        .with_entities(func.coalesce(func.sum(Pago.monto), 0))
+        .scalar()
+        or 0
+    )
+
+    pago_previo_query = db.query(Pago).filter(
+        filtro_fechapago_ecuador(desde, hasta),
+        filtro_dia_pago_ecuador(dia_semana),
+        Pago.estadopago == 2,
+        _pago_no_anulado_filter(),
+        Pago.espagoprevio == True,
+        Pago.tratamientopacienteid != None,
+    )
+
+    pago_previo_query = _aplicar_filtros_pagos(
+        pago_previo_query,
+        current_user,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+    )
+
+    total_pago_previo_verificado = float(
+        pago_previo_query
+        .with_entities(func.coalesce(func.sum(Pago.monto), 0))
+        .scalar()
+        or 0
+    )
+
+    # No calcular Pend. semana como: generado - caja.
+    # Eso permite que un pago adelantado de un paciente reduzca pendientes de otro.
+    # El pendiente correcto ya fue calculado por paciente + tratamiento, consumiendo
+    # pagos acumulados en orden FIFO hasta el fin del rango.
+
+    deuda_acumulada = _deuda_acumulada_reporte(
+        db=db,
+        current_user=current_user,
+        desde=desde,
+        hasta=hasta,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+        dia_semana=dia_semana,
     )
 
     pagos_metodo_rows = (
@@ -1858,6 +2139,8 @@ def reporte_terapias(
         total_ecuasanitas=round(total_ecuasanitas, 2),
         sesiones_ecuasanitas=sesiones_ecuasanitas,
         total_pendiente=round(total_pendiente, 2),
+        deuda_acumulada_total=round(deuda_acumulada.total_deuda, 2),
+        deuda_acumulada_sesiones=deuda_acumulada.total_sesiones_pendientes,
         saldo_a_favor=round(saldo_a_favor, 2),
         transferencias_pendientes=transferencias_pendientes,
         pendiente_verificacion_total=round(pendiente_verificacion_total, 2),
@@ -1872,6 +2155,579 @@ def reporte_terapias(
             pendiente_verificacion=round(pendiente_verificacion_total, 2),
             cubierto_ecuasanitas=round(total_ecuasanitas, 2),
         ),
+    )
+
+
+def _fecha_pago_local_ecuador(pago: Pago) -> date:
+    value = pago.fechapago
+    if value is None:
+        return fecha_ecuador()
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(ECUADOR_TZ).date()
+
+
+def _sesiones_reporte_filtradas(
+    db: Session,
+    current_user: Usuario,
+    desde: date,
+    hasta: date,
+    terapeutaid: Optional[int] = None,
+    consultorioid: Optional[int] = None,
+    dia_semana: Optional[int] = None,
+) -> List[SesionTerapia]:
+    dia_semana = _validar_dia_semana(dia_semana)
+
+    query = (
+        db.query(SesionTerapia)
+        .options(
+            joinedload(SesionTerapia.paciente),
+            joinedload(SesionTerapia.terapeuta),
+            joinedload(SesionTerapia.tratamiento_paciente),
+        )
+        .filter(
+            SesionTerapia.fecha.between(desde, hasta),
+            SesionTerapia.horasalida != None,
+            SesionTerapia.tratamientopacienteid != None,
+        )
+    )
+
+    query = _aplicar_filtro_dia_sesion(query, dia_semana)
+    query = _aplicar_filtros_sesiones(
+        query,
+        current_user,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+    )
+
+    return (
+        query.order_by(
+            SesionTerapia.fecha,
+            SesionTerapia.horaingreso,
+            SesionTerapia.id,
+        )
+        .all()
+    )
+
+
+def _pagos_detalle_base_query(
+    db: Session,
+    current_user: Usuario,
+    desde: date,
+    hasta: date,
+    terapeutaid: Optional[int] = None,
+    consultorioid: Optional[int] = None,
+    dia_semana: Optional[int] = None,
+    incluir_pago_previo: bool = False,
+    solo_caja: bool = True,
+):
+    """Query base de pagos con los mismos filtros visuales de reportes.
+
+    Se hace manualmente en vez de usar _aplicar_filtros_pagos para poder traer
+    Pago + Tratamiento + Paciente en el mismo resultado sin duplicar joins.
+    """
+    _validar_filtros_para_rol(current_user, terapeutaid)
+    dia_semana = _validar_dia_semana(dia_semana)
+    consultorio_resuelto = _resolver_consultorioid_para_rol(
+        current_user,
+        consultorioid,
+    )
+
+    query = (
+        db.query(Pago, TratamientoPaciente, Paciente)
+        .join(TratamientoPaciente, TratamientoPaciente.id == Pago.tratamientopacienteid)
+        .join(Paciente, Paciente.id == TratamientoPaciente.pacienteid)
+        .filter(
+            filtro_fechapago_ecuador(desde, hasta),
+            filtro_dia_pago_ecuador(dia_semana),
+            Pago.estadopago == 2,
+            _pago_no_anulado_filter(),
+            Pago.tratamientopacienteid != None,
+        )
+    )
+
+    if solo_caja:
+        query = query.filter(_pago_de_caja_filter())
+    elif not incluir_pago_previo:
+        query = query.filter(or_(Pago.espagoprevio == False, Pago.espagoprevio.is_(None)))
+
+    query = query.filter(
+        or_(Pago.esrecuperacioncartera == False, Pago.esrecuperacioncartera.is_(None))
+    )
+
+    if current_user.rol == 2:
+        query = query.filter(_tratamiento_visible_para_terapeuta_filter(current_user.id))
+    elif terapeutaid is not None:
+        query = query.filter(_tratamiento_visible_para_terapeuta_filter(terapeutaid))
+
+    if consultorio_resuelto is not None:
+        query = query.filter(_tratamiento_visible_para_consultorio_filter(consultorio_resuelto))
+
+    return query
+
+
+def _terapeutas_por_tratamiento_en_sesiones(sesiones: List[SesionTerapia]) -> Dict[Tuple[int, int], str]:
+    nombres: Dict[Tuple[int, int], Set[str]] = {}
+    for sesion in sesiones:
+        if sesion.pacienteid is None or sesion.tratamientopacienteid is None:
+            continue
+        key = (int(sesion.pacienteid), int(sesion.tratamientopacienteid))
+        nombres.setdefault(key, set()).add(_nombre_usuario(getattr(sesion, "terapeuta", None)))
+    return {key: ", ".join(sorted(value)) for key, value in nombres.items() if value}
+
+
+def _pagos_por_clave_para_pendiente(
+    db: Session,
+    current_user: Usuario,
+    desde: date,
+    hasta: date,
+    tratamiento_ids: Set[int],
+    terapeutaid: Optional[int] = None,
+    consultorioid: Optional[int] = None,
+    dia_semana: Optional[int] = None,
+) -> Dict[Tuple[int, int], float]:
+    if not tratamiento_ids:
+        return {}
+
+    rows = (
+        _pagos_detalle_base_query(
+            db=db,
+            current_user=current_user,
+            desde=desde,
+            hasta=hasta,
+            terapeutaid=terapeutaid,
+            consultorioid=consultorioid,
+            dia_semana=dia_semana,
+            incluir_pago_previo=True,
+            solo_caja=False,
+        )
+        .filter(Pago.tratamientopacienteid.in_(tratamiento_ids))
+        .with_entities(
+            Pago.pacienteid,
+            Pago.tratamientopacienteid,
+            func.coalesce(func.sum(Pago.monto), 0),
+        )
+        .group_by(Pago.pacienteid, Pago.tratamientopacienteid)
+        .all()
+    )
+
+    return {
+        (int(paciente_id), int(tratamiento_id)): float(total or 0)
+        for paciente_id, tratamiento_id, total in rows
+        if paciente_id is not None and tratamiento_id is not None
+    }
+
+
+
+def _pendiente_semana_detalle(
+    db: Session,
+    current_user: Usuario,
+    desde: date,
+    hasta: date,
+    terapeutaid: Optional[int] = None,
+    consultorioid: Optional[int] = None,
+    dia_semana: Optional[int] = None,
+) -> PendienteSemanaDetalleOut:
+    """Pendiente real de las sesiones filtradas.
+
+    Regla clave para que el reporte cuadre:
+    - Caja semanal es dinero cobrado en la semana/día.
+    - Pendiente semana NO es generado - caja global.
+    - Cada pago solo puede cubrir sesiones del mismo paciente y mismo tratamiento.
+    - Se consumen pagos acumulados en orden FIFO, desde la sesión más antigua.
+
+    Ejemplo: si un paciente pagó $50 y esta semana solo usó una sesión de $10,
+    los $40 sobrantes quedan como saldo a favor de ese mismo paciente; no reducen
+    la deuda de otros pacientes.
+    """
+    sesiones_filtradas = _sesiones_reporte_filtradas(
+        db=db,
+        current_user=current_user,
+        desde=desde,
+        hasta=hasta,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+        dia_semana=dia_semana,
+    )
+
+    sesiones_filtradas = [
+        s for s in sesiones_filtradas
+        if s.pacienteid is not None and s.tratamientopacienteid is not None
+    ]
+
+    if not sesiones_filtradas:
+        return PendienteSemanaDetalleOut(desde=desde, hasta=hasta)
+
+    sesiones_filtradas_ids = {int(s.id) for s in sesiones_filtradas if s.id is not None}
+    paciente_ids = {int(s.pacienteid) for s in sesiones_filtradas}
+    tratamiento_ids = {int(s.tratamientopacienteid) for s in sesiones_filtradas}
+    claves_visibles = {
+        (int(s.pacienteid), int(s.tratamientopacienteid))
+        for s in sesiones_filtradas
+    }
+
+    pagos_rows = (
+        db.query(
+            Pago.pacienteid,
+            Pago.tratamientopacienteid,
+            func.coalesce(func.sum(Pago.monto), 0),
+        )
+        .filter(
+            Pago.pacienteid.in_(paciente_ids),
+            Pago.tratamientopacienteid.in_(tratamiento_ids),
+            Pago.estadopago == 2,
+            _pago_no_anulado_filter(),
+            or_(Pago.esrecuperacioncartera == False, Pago.esrecuperacioncartera.is_(None)),
+            or_(
+                Pago.espagoprevio == True,
+                Pago.fechapago < fin_dia_ecuador(hasta),
+            ),
+        )
+        .group_by(Pago.pacienteid, Pago.tratamientopacienteid)
+        .all()
+    )
+
+    disponible_por_clave: Dict[Tuple[int, int], float] = {}
+    for paciente_id, tratamiento_id, total in pagos_rows:
+        if paciente_id is None or tratamiento_id is None:
+            continue
+        key = (int(paciente_id), int(tratamiento_id))
+        if key not in claves_visibles:
+            continue
+        disponible_por_clave[key] = float(total or 0)
+
+    sesiones_historicas = (
+        db.query(SesionTerapia)
+        .options(
+            joinedload(SesionTerapia.paciente),
+            joinedload(SesionTerapia.terapeuta),
+            joinedload(SesionTerapia.tratamiento_paciente),
+        )
+        .filter(
+            SesionTerapia.pacienteid.in_(paciente_ids),
+            SesionTerapia.tratamientopacienteid.in_(tratamiento_ids),
+            SesionTerapia.horasalida != None,
+            SesionTerapia.fecha <= hasta,
+        )
+        .order_by(
+            SesionTerapia.pacienteid,
+            SesionTerapia.tratamientopacienteid,
+            SesionTerapia.fecha,
+            SesionTerapia.horaingreso,
+            SesionTerapia.id,
+        )
+        .all()
+    )
+
+    consultorios_map = _obtener_consultorios_map(db)
+    agrupado: Dict[Tuple[int, Optional[int], int, float], Dict] = {}
+
+    for sesion in sesiones_historicas:
+        if sesion.pacienteid is None or sesion.tratamientopacienteid is None:
+            continue
+
+        key_pago = (int(sesion.pacienteid), int(sesion.tratamientopacienteid))
+        if key_pago not in claves_visibles:
+            continue
+
+        tratamiento = sesion.tratamiento_paciente
+        paciente = sesion.paciente
+        if tratamiento is None or paciente is None:
+            continue
+
+        precio = _precio_aplicado(tratamiento)
+
+        # Ecuasanitas no queda como deuda del paciente. Tampoco debe consumir pagos
+        # de ese tratamiento para inflar o reducir deudas de forma extraña.
+        if _es_paciente_ecuasanitas(paciente):
+            continue
+
+        disponible = disponible_por_clave.get(key_pago, 0.0)
+        aplicado = min(precio, disponible)
+        pendiente = round(max(precio - aplicado, 0.0), 2)
+        disponible_por_clave[key_pago] = max(disponible - aplicado, 0.0)
+
+        # Solo se reporta el pendiente de las sesiones que pertenecen al filtro
+        # actual. Las sesiones anteriores solo sirven para consumir saldo en FIFO.
+        if int(sesion.id) not in sesiones_filtradas_ids:
+            continue
+
+        if pendiente <= 0:
+            continue
+
+        terapeuta = getattr(sesion, "terapeuta", None)
+        consultorio_operativo = terapeuta.consultorioid if terapeuta is not None else None
+        key = (
+            int(sesion.pacienteid),
+            sesion.terapeutaid,
+            int(sesion.tratamientopacienteid),
+            round(precio, 2),
+        )
+        item = agrupado.setdefault(
+            key,
+            {
+                "pacienteid": int(sesion.pacienteid),
+                "paciente": _nombre_paciente(paciente),
+                "terapeutaid": sesion.terapeutaid,
+                "terapeuta": _nombre_usuario(terapeuta),
+                "consultorioid": consultorio_operativo,
+                "consultorio": consultorios_map.get(consultorio_operativo, "Sin consultorio"),
+                "tratamientopacienteid": int(sesion.tratamientopacienteid),
+                "tratamiento": tratamiento.tipotratamiento or "Tratamiento",
+                "sesiones_pendientes": 0,
+                "valor_sesion": round(precio, 2),
+                "total_pendiente": 0.0,
+                "fechas_pendientes": [],
+            },
+        )
+        item["sesiones_pendientes"] = int(item["sesiones_pendientes"]) + 1
+        item["total_pendiente"] = float(item["total_pendiente"]) + pendiente
+        item["fechas_pendientes"].append(sesion.fecha)
+
+    pacientes = [
+        PendienteSemanaPacienteOut(
+            pacienteid=int(item["pacienteid"]),
+            paciente=str(item["paciente"]),
+            terapeutaid=item["terapeutaid"],
+            terapeuta=str(item["terapeuta"]),
+            consultorioid=item["consultorioid"],
+            consultorio=str(item["consultorio"]),
+            tratamientopacienteid=int(item["tratamientopacienteid"]),
+            tratamiento=str(item["tratamiento"]),
+            sesiones_pendientes=int(item["sesiones_pendientes"]),
+            valor_sesion=round(float(item["valor_sesion"]), 2),
+            total_pendiente=round(float(item["total_pendiente"]), 2),
+            fechas_pendientes=sorted(item["fechas_pendientes"]),
+        )
+        for item in agrupado.values()
+    ]
+    pacientes.sort(key=lambda item: (item.paciente.lower(), item.terapeuta.lower()))
+
+    return PendienteSemanaDetalleOut(
+        desde=desde,
+        hasta=hasta,
+        total_pendiente=round(sum(item.total_pendiente for item in pacientes), 2),
+        total_sesiones_pendientes=sum(item.sesiones_pendientes for item in pacientes),
+        pacientes=pacientes,
+    )
+
+
+@router.get("/caja-semanal-detalle", response_model=CajaSemanalDetalleOut)
+def reporte_caja_semanal_detalle(
+    desde: date,
+    hasta: date,
+    terapeutaid: Optional[int] = Query(None),
+    consultorioid: Optional[int] = Query(None),
+    dia_semana: Optional[int] = Query(None, ge=0, le=6),
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(get_current_user),
+):
+    desde, hasta = _default_range(desde, hasta)
+    dia_semana = _validar_dia_semana(dia_semana)
+
+    sesiones = _sesiones_reporte_filtradas(
+        db=db,
+        current_user=current_user,
+        desde=desde,
+        hasta=hasta,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+        dia_semana=dia_semana,
+    )
+    sesiones_por_clave: Dict[Tuple[int, int], int] = {}
+    for sesion in sesiones:
+        if sesion.pacienteid is None or sesion.tratamientopacienteid is None:
+            continue
+        key = (int(sesion.pacienteid), int(sesion.tratamientopacienteid))
+        sesiones_por_clave[key] = sesiones_por_clave.get(key, 0) + 1
+    terapeutas_por_clave = _terapeutas_por_tratamiento_en_sesiones(sesiones)
+
+    rows = (
+        _pagos_detalle_base_query(
+            db=db,
+            current_user=current_user,
+            desde=desde,
+            hasta=hasta,
+            terapeutaid=terapeutaid,
+            consultorioid=consultorioid,
+            dia_semana=dia_semana,
+            solo_caja=True,
+        )
+        .order_by(Pago.fechapago, Pago.id)
+        .all()
+    )
+
+    pagos: List[CajaSemanalPagoOut] = []
+    for pago, tratamiento, paciente in rows:
+        precio = _precio_aplicado(tratamiento)
+        key = (int(pago.pacienteid), int(pago.tratamientopacienteid))
+        sesiones_pagadas = round(float(pago.monto or 0) / precio, 2) if precio > 0 else 0.0
+        pagos.append(
+            CajaSemanalPagoOut(
+                pagoid=int(pago.id),
+                fecha=_fecha_pago_local_ecuador(pago),
+                pacienteid=int(paciente.id),
+                paciente=_nombre_paciente(paciente),
+                terapeuta=terapeutas_por_clave.get(key, "Fisio no asociado a sesión de la semana"),
+                tratamientopacienteid=int(tratamiento.id),
+                tratamiento=tratamiento.tipotratamiento or "Tratamiento",
+                metodo=pago.metodopago or "Sin método",
+                monto=round(float(pago.monto or 0), 2),
+                valor_sesion=round(precio, 2),
+                sesiones_pagadas=sesiones_pagadas,
+                sesiones_realizadas_semana=int(sesiones_por_clave.get(key, 0)),
+            )
+        )
+
+    return CajaSemanalDetalleOut(
+        desde=desde,
+        hasta=hasta,
+        total_caja=round(sum(item.monto for item in pagos), 2),
+        total_pagos=len(pagos),
+        total_sesiones_pagadas=round(sum(item.sesiones_pagadas for item in pagos), 2),
+        pagos=pagos,
+    )
+
+
+@router.get("/pendiente-semana-detalle", response_model=PendienteSemanaDetalleOut)
+def reporte_pendiente_semana_detalle(
+    desde: date,
+    hasta: date,
+    terapeutaid: Optional[int] = Query(None),
+    consultorioid: Optional[int] = Query(None),
+    dia_semana: Optional[int] = Query(None, ge=0, le=6),
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(get_current_user),
+):
+    desde, hasta = _default_range(desde, hasta)
+    dia_semana = _validar_dia_semana(dia_semana)
+    return _pendiente_semana_detalle(
+        db=db,
+        current_user=current_user,
+        desde=desde,
+        hasta=hasta,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+        dia_semana=dia_semana,
+    )
+
+
+@router.get("/saldo-favor-detalle", response_model=SaldoFavorDetalleOut)
+def reporte_saldo_favor_detalle(
+    desde: date,
+    hasta: date,
+    terapeutaid: Optional[int] = Query(None),
+    consultorioid: Optional[int] = Query(None),
+    dia_semana: Optional[int] = Query(None, ge=0, le=6),
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(get_current_user),
+):
+    desde, hasta = _default_range(desde, hasta)
+    dia_semana = _validar_dia_semana(dia_semana)
+
+    sesiones = _sesiones_reporte_filtradas(
+        db=db,
+        current_user=current_user,
+        desde=desde,
+        hasta=hasta,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+        dia_semana=dia_semana,
+    )
+    tratamiento_ids = {
+        int(s.tratamientopacienteid)
+        for s in sesiones
+        if s.tratamientopacienteid is not None
+    }
+    if not tratamiento_ids:
+        return SaldoFavorDetalleOut(desde=desde, hasta=hasta)
+
+    cuentas = _calcular_cuentas_tratamientos(
+        db,
+        current_user,
+        tratamiento_ids=tratamiento_ids,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+    )
+    consultorios_map = _obtener_consultorios_map(db)
+    terapeuta_ids = set()
+
+    tratamientos = (
+        db.query(TratamientoPaciente)
+        .options(joinedload(TratamientoPaciente.paciente))
+        .filter(TratamientoPaciente.id.in_(tratamiento_ids))
+        .all()
+    )
+    for tratamiento in tratamientos:
+        paciente = tratamiento.paciente
+        if paciente is not None and paciente.terapeutaasignadoid is not None:
+            terapeuta_ids.add(int(paciente.terapeutaasignadoid))
+
+    terapeutas_map = {
+        int(usuario.id): _nombre_usuario(usuario)
+        for usuario in db.query(Usuario).filter(Usuario.id.in_(terapeuta_ids)).all()
+    } if terapeuta_ids else {}
+
+    pacientes: List[SaldoFavorPacienteOut] = []
+    for tratamiento in tratamientos:
+        item = cuentas.get(tratamiento.id)
+        if not item:
+            continue
+        saldo = round(float(item.get("saldo_favor", 0.0) or 0.0), 2)
+        if saldo <= 0:
+            continue
+        precio = round(float(item.get("precio", _precio_aplicado(tratamiento)) or 0.0), 2)
+        paciente = tratamiento.paciente
+        sesiones_disponibles = round(saldo / precio, 2) if precio > 0 else 0.0
+        terapeuta_id = paciente.terapeutaasignadoid if paciente is not None else None
+        consultorio_id = paciente.consultorioid if paciente is not None else None
+        pacientes.append(
+            SaldoFavorPacienteOut(
+                pacienteid=int(tratamiento.pacienteid),
+                paciente=_nombre_paciente(paciente),
+                terapeutaid=terapeuta_id,
+                terapeuta=terapeutas_map.get(terapeuta_id, "Sin fisioterapeuta"),
+                consultorioid=consultorio_id,
+                consultorio=consultorios_map.get(consultorio_id, "Sin consultorio"),
+                tratamientopacienteid=int(tratamiento.id),
+                tratamiento=tratamiento.tipotratamiento or "Tratamiento",
+                valor_sesion=precio,
+                saldo_favor=saldo,
+                sesiones_disponibles=sesiones_disponibles,
+            )
+        )
+
+    pacientes.sort(key=lambda item: (item.paciente.lower(), item.tratamiento.lower()))
+    return SaldoFavorDetalleOut(
+        desde=desde,
+        hasta=hasta,
+        total_saldo_favor=round(sum(item.saldo_favor for item in pacientes), 2),
+        total_sesiones_disponibles=round(sum(item.sesiones_disponibles for item in pacientes), 2),
+        pacientes=pacientes,
+    )
+
+
+@router.get("/deuda-acumulada", response_model=DeudaAcumuladaOut)
+def reporte_deuda_acumulada(
+    desde: date,
+    hasta: date,
+    terapeutaid: Optional[int] = Query(None),
+    consultorioid: Optional[int] = Query(None),
+    dia_semana: Optional[int] = Query(None, ge=0, le=6),
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(get_current_user),
+):
+    desde, hasta = _default_range(desde, hasta)
+    dia_semana = _validar_dia_semana(dia_semana)
+
+    return _deuda_acumulada_reporte(
+        db=db,
+        current_user=current_user,
+        desde=desde,
+        hasta=hasta,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+        dia_semana=dia_semana,
     )
 
 

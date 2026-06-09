@@ -16,6 +16,7 @@ from ..models.tipo_terapia import TipoTerapia
 from ..models.tratamiento_paciente import TratamientoPaciente
 from ..models.usuario import Usuario
 from ..schemas.tratamiento_paciente import (
+    TratamientoPacienteAumentarSesiones,
     TratamientoPacienteCreate,
     TratamientoPacienteOut,
     TratamientoPacienteUpdate,
@@ -390,6 +391,74 @@ def actualizar_tratamiento_paciente(
 
     for key, value in datos.items():
         setattr(db_tratamiento, key, value)
+
+    db.commit()
+    db.refresh(db_tratamiento)
+
+    resultado = (
+        db.query(TratamientoPaciente)
+        .options(
+            joinedload(TratamientoPaciente.diagnostico),
+            joinedload(TratamientoPaciente.tipo_terapia),
+        )
+        .filter(TratamientoPaciente.id == db_tratamiento.id)
+        .first()
+    )
+
+    return resultado
+
+
+@router.post(
+    "/{tratamiento_id}/aumentar-sesiones",
+    response_model=TratamientoPacienteOut,
+)
+def aumentar_sesiones_tratamiento_paciente(
+    tratamiento_id: int,
+    payload: TratamientoPacienteAumentarSesiones,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(get_current_secretary),
+):
+    db_tratamiento = (
+        db.query(TratamientoPaciente)
+        .filter(TratamientoPaciente.id == tratamiento_id)
+        .first()
+    )
+
+    if not db_tratamiento:
+        raise HTTPException(
+            status_code=404,
+            detail="Tratamiento no encontrado",
+        )
+
+    _validar_paciente(
+        db=db,
+        paciente_id=db_tratamiento.pacienteid,
+        current_user=current_user,
+    )
+
+    actuales = int(db_tratamiento.sesiones_estimadas or 0)
+    cantidad = int(payload.cantidad)
+    nuevo_total = actuales + cantidad
+
+    db_tratamiento.sesiones_estimadas = nuevo_total
+
+    detalle = (
+        f"Se aumentaron {cantidad} sesión(es). "
+        f"Total anterior: {actuales}. Total nuevo: {nuevo_total}."
+    )
+
+    if payload.motivo:
+        detalle += f" Motivo: {payload.motivo}."
+
+    observaciones_actuales = (db_tratamiento.observaciones or "").strip()
+    db_tratamiento.observaciones = (
+        f"{observaciones_actuales} | {detalle}"
+        if observaciones_actuales
+        else detalle
+    )
+
+    if not db_tratamiento.activo:
+        db_tratamiento.activo = True
 
     db.commit()
     db.refresh(db_tratamiento)

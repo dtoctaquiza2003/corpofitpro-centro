@@ -14,6 +14,7 @@ from ..models.paciente import Paciente
 from ..models.sesion_terapia import SesionTerapia
 from ..models.usuario import Usuario
 from ..schemas.alerta import AlertaOut
+from ..utils.fechas import to_ecuador
 
 router = APIRouter(prefix="/api/alertas", tags=["alertas"])
 
@@ -56,7 +57,7 @@ def _buscar_sesion_relacionada_alerta(
 
     fecha_alerta = None
     try:
-        fecha_alerta = alerta.fecha.date() if alerta.fecha else None
+        fecha_alerta = to_ecuador(alerta.fecha).date() if alerta.fecha else None
     except Exception:
         fecha_alerta = None
 
@@ -115,7 +116,7 @@ def _alerta_a_response(
         "tipo": alerta.tipo or "",
         "tipo_label": _tipo_alerta_en_espanol(alerta.tipo),
         "descripcion": alerta.descripcion or "Alerta clínica",
-        "fecha": alerta.fecha,
+        "fecha": to_ecuador(alerta.fecha),
         "leida": bool(alerta.leida),
         "paciente_nombre": _nombre_completo_persona(paciente) if paciente else None,
         "terapeuta_id": sesion.terapeutaid if sesion else None,

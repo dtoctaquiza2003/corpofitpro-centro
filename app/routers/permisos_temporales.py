@@ -1,4 +1,4 @@
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -10,6 +10,7 @@ from ..dependencies.db import get_db
 from ..models.usuario import Usuario
 from ..models.usuario_permiso_temporal import UsuarioPermisoTemporal
 from ..services.notificacion_service import crear_notificacion_usuario
+from ..utils.fechas import ECUADOR_TZ, now_utc, to_ecuador
 from ..schemas.permiso_temporal import (
     PermisoTemporalCreate,
     PermisoTemporalEstadoOut,
@@ -33,16 +34,10 @@ TIPOS_PERMITIDOS = {
 }
 
 
-def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
-
-def now_ecuador() -> datetime:
-    return datetime.now(timezone(timedelta(hours=-5)))
-
 
 def _normalizar_fecha_programada(fecha: datetime) -> datetime:
     if fecha.tzinfo is None:
-        fecha = fecha.replace(tzinfo=timezone(timedelta(hours=-5)))
+        fecha = fecha.replace(tzinfo=ECUADOR_TZ)
     return fecha.astimezone(timezone.utc)
 
 
@@ -130,7 +125,7 @@ def _tipo_permiso_legible(tipo_permiso: str) -> str:
 
 def _formatear_fecha_permiso(fecha: datetime) -> str:
     try:
-        fecha_ecuador = fecha.astimezone(timezone(timedelta(hours=-5)))
+        fecha_ecuador = to_ecuador(fecha)
     except Exception:
         fecha_ecuador = fecha
 
@@ -148,7 +143,7 @@ def _mensaje_permiso_otorgado(
     if permiso.tipo_permiso == TIPO_REGISTRO_RETROACTIVO:
         mensaje = (
             "Se te otorgó permiso para registrar sesiones retroactivas.\n"
-            "Alcance: desde el lunes de esta semana hasta hoy.\n"
+            "Alcance: desde el domingo de esta semana hasta hoy.\n"
             f"Válido hasta: {fecha_fin}.\n"
             f"Autorizado por: {autorizador_nombre}."
         )
@@ -491,9 +486,10 @@ def crear_permiso_temporal(
     if data.tipo_permiso == TIPO_REGISTRO_RETROACTIVO:
         hoy_ecuador = now_ecuador().date()
 
-        # Monday = 0, Tuesday = 1, ..., Sunday = 6.
-        # El permiso retroactivo permite desde el lunes de la semana actual.
-        dias_atras_permitidos = hoy_ecuador.weekday()
+        # Semana CORPOFIT: domingo a sábado.
+        # date.weekday(): lunes=0, ..., domingo=6.
+        # Días transcurridos desde domingo: domingo=0, lunes=1, ..., sábado=6.
+        dias_atras_permitidos = (hoy_ecuador.weekday() + 1) % 7
 
     if data.tipo_permiso == TIPO_CREAR_TRATAMIENTOS:
         dias_atras_permitidos = 0

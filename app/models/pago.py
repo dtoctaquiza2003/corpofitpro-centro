@@ -11,12 +11,8 @@ from sqlalchemy import (
     Text,
 )
 from sqlalchemy.sql import func
-from datetime import datetime, timezone
-
 from ..database import Base
-
-def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
+from ..utils.fechas import now_utc
 
 class Pago(Base):
     __tablename__ = "pagos"

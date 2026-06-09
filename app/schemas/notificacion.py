@@ -1,7 +1,9 @@
 from datetime import datetime
 from typing import Any, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_serializer
+
+from app.utils.fechas import to_ecuador
 
 
 class NotificacionOut(BaseModel):
@@ -19,6 +21,10 @@ class NotificacionOut(BaseModel):
     fecha: datetime
 
     data: Optional[dict[str, Any]] = None
+
+    @field_serializer("fecha")
+    def serializar_fecha_ecuador(self, value: datetime, _info):
+        return to_ecuador(value) if value is not None else None
 
     class Config:
         from_attributes = True

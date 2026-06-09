@@ -71,6 +71,21 @@ class TratamientoPacienteUpdate(BaseModel):
     diagnosticoid: Optional[int] = None
 
 
+class TratamientoPacienteAumentarSesiones(BaseModel):
+    cantidad: int = Field(..., gt=0, le=300)
+    motivo: Optional[str] = None
+
+    @field_validator("motivo")
+    @classmethod
+    def limpiar_motivo_incremento(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+
+        texto = value.strip()
+
+        return texto if texto else None
+
+
 class TratamientoPacienteSimpleOut(BaseModel):
     id: int
     pacienteid: int

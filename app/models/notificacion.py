@@ -3,6 +3,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.sql import func
 
 from ..database import Base
+from ..utils.fechas import now_utc
 
 
 class Notificacion(Base):
@@ -28,6 +29,7 @@ class Notificacion(Base):
 
     fecha = Column(
         DateTime(timezone=True),
+        default=now_utc,
         server_default=func.now(),
         nullable=False,
     )

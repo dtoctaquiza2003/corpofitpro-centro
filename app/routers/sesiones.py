@@ -1,5 +1,5 @@
 import os
-from datetime import datetime, timezone, timedelta, date, time
+from datetime import date, time
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -7,6 +7,7 @@ from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session, joinedload
 
 from ..services.notificacion_service import crear_notificacion_usuario
+from ..utils.fechas import now_ecuador
 from ..auth.dependencies import get_current_terapeuta, get_current_user
 from ..auth.permissions import (
     validar_consultorio_secretario,
@@ -48,9 +49,6 @@ PAIN_NO_REDUCTION_MIN_LEVEL = int(
     os.getenv("PAIN_NO_REDUCTION_MIN_LEVEL", "7")
 )
 
-
-def now_ecuador() -> datetime:
-    return datetime.now(timezone(timedelta(hours=-5)))
 
 
 def _tiene_autorizacion_compartida_activa(
@@ -457,14 +455,17 @@ def _validar_permiso_registro_retroactivo(
             detail="No se puede registrar una atención con fecha futura.",
         )
 
-    lunes_semana_actual = hoy - timedelta(days=hoy.weekday())
+    # Semana CORPOFIT: domingo a sábado.
+    # date.weekday(): lunes=0, ..., domingo=6.
+    # Días transcurridos desde domingo: domingo=0, lunes=1, ..., sábado=6.
+    domingo_semana_actual = hoy - timedelta(days=(hoy.weekday() + 1) % 7)
 
-    if fecha_sesion < lunes_semana_actual:
+    if fecha_sesion < domingo_semana_actual:
         raise HTTPException(
             status_code=400,
             detail=(
                 "El permiso retroactivo solo permite registrar atenciones "
-                "desde el lunes de la semana actual."
+                "desde el domingo de la semana actual."
             ),
         )
 
