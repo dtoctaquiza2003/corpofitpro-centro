@@ -1166,6 +1166,11 @@ def _cobertura_sesiones_filtradas(
     sesiones_objetivo_ids = {int(s.id) for s in sesiones_validas}
     paciente_ids = {int(s.pacienteid) for s in sesiones_validas}
     tratamiento_ids = {int(s.tratamientopacienteid) for s in sesiones_validas}
+    terapeuta_ids_objetivo = {
+        int(s.terapeutaid)
+        for s in sesiones_validas
+        if s.terapeutaid is not None
+    }
     claves_objetivo = {
         (int(s.pacienteid), int(s.tratamientopacienteid))
         for s in sesiones_validas
@@ -1200,7 +1205,10 @@ def _cobertura_sesiones_filtradas(
 
     sesiones_historicas = (
         db.query(SesionTerapia)
-        .options(joinedload(SesionTerapia.tratamiento_paciente))
+        .options(
+            joinedload(SesionTerapia.tratamiento_paciente),
+            joinedload(SesionTerapia.terapeuta),
+        )
         .filter(
             SesionTerapia.pacienteid.in_(paciente_ids),
             SesionTerapia.tratamientopacienteid.in_(tratamiento_ids),
@@ -1225,6 +1233,18 @@ def _cobertura_sesiones_filtradas(
 
         clave = (int(sesion.pacienteid), int(sesion.tratamientopacienteid))
         if clave not in claves_objetivo:
+            continue
+
+        # Pacientes compartidos entre sedes:
+        # Para reportes de fisio/sede, el FIFO no debe permitir que una sesión
+        # de otro terapeuta/consultorio consuma pagos y deje como deuda una
+        # sesión que sí pertenece al fisio visible. Esto evita que una deuda del
+        # Centro aparezca en Atahualpa, o viceversa.
+        if (
+            terapeuta_ids_objetivo
+            and sesion.terapeutaid is not None
+            and int(sesion.terapeutaid) not in terapeuta_ids_objetivo
+        ):
             continue
 
         precio = float(_precio_aplicado(sesion.tratamiento_paciente) or 0.0)
@@ -1377,6 +1397,22 @@ def _deuda_acumulada_reporte(
             return False
 
         return True
+
+    # Pacientes compartidos entre sedes:
+    # Cuando el reporte está limitado por fisio, clínica o día, el FIFO también
+    # debe respetar ese mismo alcance operativo. Antes se consumían pagos contra
+    # sesiones de otras sedes y eso podía mostrar deuda a un fisio de Atahualpa
+    # aunque la deuda real fuera del Centro.
+    fifo_limitado_al_alcance = (
+        current_user.rol == 2
+        or terapeutaid is not None
+        or consultorio_resuelto is not None
+        or dia_semana is not None
+    )
+    if fifo_limitado_al_alcance:
+        sesiones_historicas = [
+            sesion for sesion in sesiones_historicas if incluir_en_detalle(sesion)
+        ]
 
     for sesion in sesiones_historicas:
         tratamiento = sesion.tratamiento_paciente
