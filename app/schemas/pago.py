@@ -23,6 +23,10 @@ class PagoCreate(BaseModel):
     # 3 = Rechazado
     estadopago: Optional[int] = 2
 
+    # Fecha contable/de caja. Si se registra después de medianoche pero
+    # pertenece al cierre anterior, la secretaria puede enviar esta fecha.
+    fechapagoreal: Optional[date] = None
+
     model_config = ConfigDict(populate_by_name=True)
 
 
@@ -262,6 +266,41 @@ class CuentaTratamientoOut(BaseModel):
     activo: bool
 
     pagos: List[PagoSimpleOut] = Field(default_factory=list)
+
+
+class SesionPendienteTerapeutaOut(BaseModel):
+    sesionid: int
+    fecha: date
+    horaingreso: Optional[str] = None
+    valor_sesion: float = 0
+    cubierto: float = 0
+    pendiente: float = 0
+
+
+class PacienteDeudaTerapeutaOut(BaseModel):
+    pacienteid: int
+    paciente: str
+    cedula: Optional[str] = None
+    tratamientopacienteid: int
+    tratamiento: str
+    tipo_terapia: Optional[str] = None
+    terapeutaid: int
+    terapeuta: str
+    precio_sesion: float = 0
+    sesiones_pendientes: int = 0
+    total_deuda: float = 0
+    fecha_ultima_pendiente: Optional[date] = None
+    sesiones: List[SesionPendienteTerapeutaOut] = Field(default_factory=list)
+
+
+class ResumenDeudasTerapeutaOut(BaseModel):
+    terapeutaid: int
+    terapeuta: str
+    total_deuda: float = 0
+    pacientes_con_deuda: int = 0
+    tratamientos_con_deuda: int = 0
+    sesiones_pendientes: int = 0
+    items: List[PacienteDeudaTerapeutaOut] = Field(default_factory=list)
 
 
 class CuentaMembresiaGimnasioOut(BaseModel):

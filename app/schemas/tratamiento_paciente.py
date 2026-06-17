@@ -33,6 +33,7 @@ class TratamientoPacienteBase(BaseModel):
     precio_sesion_aplicado: Optional[float] = Field(None, gt=0)
     sesiones_estimadas: Optional[int] = Field(None, ge=0)
     motivo_precio_especial: Optional[str] = None
+    multiple_extremidad: bool = False
 
     fechainicio: date
     fechafin: Optional[date] = None
@@ -63,6 +64,7 @@ class TratamientoPacienteUpdate(BaseModel):
     precio_sesion_aplicado: Optional[float] = Field(None, gt=0)
     sesiones_estimadas: Optional[int] = Field(None, ge=0)
     motivo_precio_especial: Optional[str] = None
+    multiple_extremidad: bool = False
 
     fechainicio: Optional[date] = None
     fechafin: Optional[date] = None
@@ -98,6 +100,7 @@ class TratamientoPacienteSimpleOut(BaseModel):
     precio_sesion_aplicado: Optional[float] = None
     sesiones_estimadas: Optional[int] = None
     motivo_precio_especial: Optional[str] = None
+    multiple_extremidad: bool = False
 
     fechainicio: date
     fechafin: Optional[date] = None

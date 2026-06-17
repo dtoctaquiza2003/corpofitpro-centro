@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy import Date, and_, cast, exists, func, or_
 from sqlalchemy.orm import Session, aliased, joinedload
-
+from collections import defaultdict
 from ..models.alerta import Alerta
 from ..models.notificacion import Notificacion
 from ..models.transferencia import Transferencia
@@ -29,6 +29,7 @@ from ..schemas.reporte import (
     DashboardLiteOut,
     DashboardResumenOut,
     FisioDetalleOut,
+    FisioDetalleDiaSueldoOut,
     FisioDetallePacienteOut,
     FisioSemanalOut,
     MetodoPagoTotalOut,
@@ -64,9 +65,24 @@ DIAS_SEMANA = [
     "Domingo",
 ]
 
-# Terapias CORPOFIT:
-# - Lunes a viernes: 35% fisioterapeuta / 65% clínica.
-# - Sábado y domingo: 40% fisioterapeuta / 60% clínica.
+# Terapias CORPOFIT - sueldo fijo por atención:
+# - Lunes a viernes: $3.50 por atención.
+# - Sábado y domingo: $4.00 por atención.
+# - Si de lunes a viernes el fisioterapeuta supera 15 atenciones en un día,
+#   todas las atenciones de ese día se pagan a $4.00.
+SUELDO_FISIO_LUNES_VIERNES = 3.50
+SUELDO_FISIO_FIN_SEMANA = 4.00
+SUELDO_FISIO_BONO_DIARIO = 4.00
+SUELDO_FISIO_MULTIPLE_EXTREMIDAD = 5.00
+# Terapias que, por carga de trabajo, pagan $5.00 al fisio por cada sesión.
+TERAPIAS_SUELDO_ESPECIAL_5 = (
+    "descarga completa precio especial",
+    "descarga muscular completa",
+)
+UMBRAL_ATENCIONES_BONO_DIARIO = 15
+
+# Porcentajes antiguos: se mantienen solo para compatibilidad con reportes
+# de clínica/caja que aún usen distribución porcentual.
 PORCENTAJE_FISIO_TERAPIA = 0.35
 PORCENTAJE_CLINICA_TERAPIA = 0.65
 PORCENTAJE_FISIO_TERAPIA_FIN_SEMANA = 0.40
@@ -94,6 +110,42 @@ def _es_fin_semana(fecha: Optional[date]) -> bool:
     return bool(fecha and fecha.weekday() in {5, 6})
 
 
+def _texto_normalizado(valor: Optional[str]) -> str:
+    return (valor or "").strip().lower()
+
+
+def _tratamiento_tarifa_especial_5(tratamiento) -> bool:
+    """True si la sesión debe pagar $5 al fisio.
+
+    Aplica cuando el tratamiento está marcado como multi-extremidad o cuando
+    el tipo de tratamiento corresponde a descargas completas trabajosas.
+    """
+    return _motivo_tarifa_especial_5(tratamiento) is not None
+
+
+def _motivo_tarifa_especial_5(tratamiento) -> Optional[str]:
+    """Motivo legible de la tarifa especial de $5.
+
+    Se usa en el detalle del sueldo para que contabilidad pueda auditar
+    por qué una sesión no se pagó con la tarifa base de $3.50/$4.00.
+    """
+    if not tratamiento:
+        return None
+
+    if bool(getattr(tratamiento, "multiple_extremidad", False)):
+        return "Más de una extremidad"
+
+    nombre = _texto_normalizado(getattr(tratamiento, "tipotratamiento", ""))
+
+    if "descarga completa precio especial" in nombre:
+        return "Descarga completa precio especial"
+
+    if "descarga muscular completa" in nombre:
+        return "Descarga muscular completa"
+
+    return None
+
+
 def porcentaje_fisio_terapia_por_fecha(fecha: Optional[date]) -> float:
     return (
         PORCENTAJE_FISIO_TERAPIA_FIN_SEMANA
@@ -117,6 +169,38 @@ def ganancia_fisio_terapia(monto: float, fecha: Optional[date]) -> float:
 def ganancia_clinica_terapia(monto: float, fecha: Optional[date]) -> float:
     return float(monto or 0) * porcentaje_clinica_terapia_por_fecha(fecha)
 
+def sueldo_fisio_por_atencion(
+    fecha: Optional[date],
+    atenciones_dia: int = 0,
+    multiple_extremidad: bool = False,
+) -> float:
+    """Valor fijo que gana el fisioterapeuta por una atención de terapia.
+
+    Reglas:
+    - Más de una extremidad o terapia especial de descarga completa: $5.00 por esa sesión.
+    - Sábado y domingo: $4.00 por atención.
+    - Lunes a viernes: $3.50 por atención.
+    - Si lunes-viernes supera 15 atenciones en ese día, todas pagan $4.00.
+    """
+    if multiple_extremidad:
+        return SUELDO_FISIO_MULTIPLE_EXTREMIDAD
+
+    if _es_fin_semana(fecha):
+        return SUELDO_FISIO_FIN_SEMANA
+
+    if atenciones_dia > UMBRAL_ATENCIONES_BONO_DIARIO:
+        return SUELDO_FISIO_BONO_DIARIO
+
+    return SUELDO_FISIO_LUNES_VIERNES
+
+
+def sueldo_fisio_terapia(
+    fecha: Optional[date],
+    atenciones_dia: int = 0,
+    multiple_extremidad: bool = False,
+) -> float:
+    return sueldo_fisio_por_atencion(fecha, atenciones_dia, multiple_extremidad)
+
 def rango_fechas_ecuador(desde: date, hasta: date) -> tuple[datetime, datetime]:
     """Devuelve [inicio, fin) del rango usando día calendario de Ecuador.
 
@@ -131,17 +215,28 @@ def rango_fechas_ecuador(desde: date, hasta: date) -> tuple[datetime, datetime]:
     return inicio, fin
 
 
-def filtro_fechapago_ecuador(desde: date, hasta: date):
-    inicio, fin = rango_fechas_ecuador(desde, hasta)
-    return and_(
-        Pago.fechapago >= inicio,
-        Pago.fechapago < fin,
+def fecha_pago_ecuador_expr():
+    """Fecha de caja del pago.
+
+    Prioridad:
+    1. fechapagoreal, cuando la secretaria registró una fecha contable/caja.
+    2. fecha local Ecuador derivada de fechapago UTC.
+
+    Esto evita que pagos registrados cerca de medianoche se vayan al día
+    incorrecto del cuadre.
+    """
+    return func.coalesce(
+        Pago.fechapagoreal,
+        cast(func.timezone("America/Guayaquil", Pago.fechapago), Date),
     )
 
 
-def fecha_pago_ecuador_expr():
-    """Fecha local de Ecuador para agrupar pagos por día."""
-    return cast(func.timezone("America/Guayaquil", Pago.fechapago), Date)
+def filtro_fechapago_ecuador(desde: date, hasta: date):
+    fecha_expr = fecha_pago_ecuador_expr()
+    return and_(
+        fecha_expr >= desde,
+        fecha_expr <= hasta,
+    )
 
 
 def fin_dia_ecuador(fecha: date) -> datetime:
@@ -172,7 +267,7 @@ def filtro_dia_pago_ecuador(dia_semana: Optional[int]):
     dia_semana = _validar_dia_semana(dia_semana)
     if dia_semana is None:
         return True
-    return func.extract("isodow", func.timezone("America/Guayaquil", Pago.fechapago)) == dia_semana + 1
+    return func.extract("isodow", fecha_pago_ecuador_expr()) == dia_semana + 1
 
 
 def _generar_dias_reporte_filtrados(desde: date, hasta: date, dia_semana: Optional[int]) -> List[ReporteDiaOut]:
@@ -264,6 +359,94 @@ def _pago_de_caja_filter():
     no esté asociado a una sesión/tratamiento registrado.
     """
     return or_(Pago.espagoprevio == False, Pago.espagoprevio.is_(None))
+
+
+
+
+def _normalizar_metodo_pago(metodo: Optional[str]) -> str:
+    value = (metodo or "").strip().lower()
+    value = value.replace("á", "a").replace("é", "e").replace("í", "i").replace("ó", "o").replace("ú", "u")
+
+    if "transfer" in value:
+        return "transferencia"
+    if "efectivo" in value:
+        return "efectivo"
+    if "tarjeta" in value or "card" in value:
+        return "tarjeta"
+    return "otros"
+
+
+def _sumar_metodo_en_resumen(resumen: Dict[str, float], metodo: Optional[str], monto: float) -> None:
+    categoria = _normalizar_metodo_pago(metodo)
+    monto = float(monto or 0)
+    if categoria == "efectivo":
+        resumen["total_efectivo"] = resumen.get("total_efectivo", 0.0) + monto
+    elif categoria == "transferencia":
+        resumen["total_transferencia"] = resumen.get("total_transferencia", 0.0) + monto
+    elif categoria == "tarjeta":
+        resumen["total_tarjeta"] = resumen.get("total_tarjeta", 0.0) + monto
+    else:
+        resumen["total_otros_metodos"] = resumen.get("total_otros_metodos", 0.0) + monto
+
+
+def _metodo_nombre_canonico(metodo: Optional[str]) -> str:
+    categoria = _normalizar_metodo_pago(metodo)
+    if categoria == "efectivo":
+        return "Efectivo"
+    if categoria == "transferencia":
+        return "Transferencia"
+    if categoria == "tarjeta":
+        return "Tarjeta"
+    return (metodo or "Otros").strip() or "Otros"
+
+
+def _totales_pendientes_transferencia(
+    db: Session,
+    current_user: Usuario,
+    desde: date,
+    hasta: date,
+    terapeutaid: Optional[int] = None,
+    consultorioid: Optional[int] = None,
+    dia_semana: Optional[int] = None,
+) -> Tuple[float, int]:
+    query = db.query(Pago).filter(
+        filtro_fechapago_ecuador(desde, hasta),
+        filtro_dia_pago_ecuador(dia_semana),
+        Pago.estadopago == 1,
+        _pago_no_anulado_filter(),
+        _pago_de_caja_filter(),
+        Pago.tratamientopacienteid != None,
+        Pago.metodopago.ilike("%transfer%"),
+    )
+
+    query = _aplicar_filtros_pagos(
+        query,
+        current_user,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+    )
+
+    total, cantidad = query.with_entities(
+        func.coalesce(func.sum(Pago.monto), 0),
+        func.count(Pago.id),
+    ).one()
+    return round(float(total or 0), 2), int(cantidad or 0)
+
+
+def _crear_por_metodo_desde_totales(totales: Dict[str, float], extra: Optional[List[MetodoPagoTotalOut]] = None) -> List[MetodoPagoTotalOut]:
+    items: List[MetodoPagoTotalOut] = []
+    pares = [
+        ("Efectivo", float(totales.get("total_efectivo", 0.0) or 0.0)),
+        ("Transferencia", float(totales.get("total_transferencia", 0.0) or 0.0)),
+        ("Tarjeta", float(totales.get("total_tarjeta", 0.0) or 0.0)),
+        ("Otros", float(totales.get("total_otros_metodos", 0.0) or 0.0)),
+    ]
+    for nombre, total in pares:
+        if round(total, 2) > 0:
+            items.append(MetodoPagoTotalOut(metodo=nombre, total=round(total, 2)))
+    if extra:
+        items.extend(extra)
+    return items
 
 
 def _query_recuperacion_cartera(
@@ -933,7 +1116,7 @@ def _pagos_aplicados_a_rango_por_tratamiento(
             _pago_no_anulado_filter(),
             or_(
                 Pago.espagoprevio == True,
-                Pago.fechapago < fin_dia_ecuador(hasta),
+                fecha_pago_ecuador_expr() <= hasta,
             ),
         )
         .group_by(Pago.tratamientopacienteid)
@@ -953,6 +1136,114 @@ def _pagos_aplicados_a_rango_por_tratamiento(
     return disponible_para_rango
 
 
+
+def _cobertura_sesiones_filtradas(
+    db: Session,
+    sesiones_objetivo: List[SesionTerapia],
+    hasta: date,
+) -> Dict[int, Tuple[float, float]]:
+    """Devuelve cuánto está pagado y pendiente para cada sesión visible.
+
+    Importante: consume pagos con FIFO real desde las sesiones más antiguas del
+    mismo paciente + tratamiento hasta la fecha de corte. Esto evita que, al
+    filtrar por un día de la semana, una sesión aparezca pagada solo porque no se
+    descontaron las sesiones anteriores de esa misma semana.
+
+    Retorna:
+        {sesion_id: (monto_aplicado, monto_pendiente)}
+    """
+    sesiones_validas = [
+        s
+        for s in sesiones_objetivo
+        if s.id is not None
+        and s.pacienteid is not None
+        and s.tratamientopacienteid is not None
+    ]
+
+    if not sesiones_validas:
+        return {}
+
+    sesiones_objetivo_ids = {int(s.id) for s in sesiones_validas}
+    paciente_ids = {int(s.pacienteid) for s in sesiones_validas}
+    tratamiento_ids = {int(s.tratamientopacienteid) for s in sesiones_validas}
+    claves_objetivo = {
+        (int(s.pacienteid), int(s.tratamientopacienteid))
+        for s in sesiones_validas
+    }
+
+    pagos_rows = (
+        db.query(
+            Pago.pacienteid,
+            Pago.tratamientopacienteid,
+            func.coalesce(func.sum(Pago.monto), 0),
+        )
+        .filter(
+            Pago.pacienteid.in_(paciente_ids),
+            Pago.tratamientopacienteid.in_(tratamiento_ids),
+            Pago.estadopago == 2,
+            _pago_no_anulado_filter(),
+            or_(Pago.esrecuperacioncartera == False, Pago.esrecuperacioncartera.is_(None)),
+            or_(
+                Pago.espagoprevio == True,
+                fecha_pago_ecuador_expr() <= hasta,
+            ),
+        )
+        .group_by(Pago.pacienteid, Pago.tratamientopacienteid)
+        .all()
+    )
+
+    disponible_por_clave: Dict[Tuple[int, int], float] = {
+        (int(paciente_id), int(tratamiento_id)): float(total or 0.0)
+        for paciente_id, tratamiento_id, total in pagos_rows
+        if paciente_id is not None and tratamiento_id is not None
+    }
+
+    sesiones_historicas = (
+        db.query(SesionTerapia)
+        .options(joinedload(SesionTerapia.tratamiento_paciente))
+        .filter(
+            SesionTerapia.pacienteid.in_(paciente_ids),
+            SesionTerapia.tratamientopacienteid.in_(tratamiento_ids),
+            SesionTerapia.horasalida != None,
+            SesionTerapia.fecha <= hasta,
+        )
+        .order_by(
+            SesionTerapia.pacienteid,
+            SesionTerapia.tratamientopacienteid,
+            SesionTerapia.fecha,
+            SesionTerapia.horaingreso,
+            SesionTerapia.id,
+        )
+        .all()
+    )
+
+    cobertura: Dict[int, Tuple[float, float]] = {}
+
+    for sesion in sesiones_historicas:
+        if sesion.id is None or sesion.pacienteid is None or sesion.tratamientopacienteid is None:
+            continue
+
+        clave = (int(sesion.pacienteid), int(sesion.tratamientopacienteid))
+        if clave not in claves_objetivo:
+            continue
+
+        precio = float(_precio_aplicado(sesion.tratamiento_paciente) or 0.0)
+        disponible = float(disponible_por_clave.get(clave, 0.0) or 0.0)
+        aplicado = min(precio, disponible)
+        pendiente = max(precio - aplicado, 0.0)
+        disponible_por_clave[clave] = max(disponible - aplicado, 0.0)
+
+        if int(sesion.id) in sesiones_objetivo_ids:
+            cobertura[int(sesion.id)] = (round(aplicado, 2), round(pendiente, 2))
+
+    for sesion in sesiones_validas:
+        sid = int(sesion.id)
+        if sid not in cobertura:
+            precio = float(_precio_aplicado(sesion.tratamiento_paciente) or 0.0)
+            cobertura[sid] = (0.0, round(precio, 2))
+
+    return cobertura
+
 def _deuda_acumulada_reporte(
     db: Session,
     current_user: Usuario,
@@ -965,13 +1256,15 @@ def _deuda_acumulada_reporte(
     """Calcula cartera acumulada sin mezclarla con caja semanal.
 
     Regla importante:
-    - Primero se busca qué tratamientos aparecen en las sesiones del rango/filtros.
-    - Para esos tratamientos se revisan todas las sesiones finalizadas hasta `hasta`.
+    - La deuda acumulada NO se basa solo en pacientes que vinieron esta semana.
+    - Se revisan todas las sesiones finalizadas hasta `hasta`, respetando filtros
+      de fisioterapeuta, clínica operativa y día cuando correspondan.
     - Los pagos verificados del MISMO paciente + tratamiento cubren las sesiones
       desde la más antigua hasta la más nueva.
     - Las sesiones que siguen sin cubrir son deuda acumulada.
 
-    Esto evita que el pago de otro paciente o de otro tratamiento cubra una deuda.
+    Esto evita que el pago de otro paciente o de otro tratamiento cubra una deuda,
+    y también evita ocultar deudas antiguas de pacientes que no vinieron en la semana.
     """
     dia_semana = _validar_dia_semana(dia_semana)
     consultorio_resuelto = _resolver_consultorioid_para_rol(
@@ -979,22 +1272,22 @@ def _deuda_acumulada_reporte(
         consultorioid,
     )
 
-    sesiones_rango_query = (
+    sesiones_corte_query = (
         db.query(SesionTerapia)
         .filter(
-            SesionTerapia.fecha.between(desde, hasta),
+            SesionTerapia.fecha <= hasta,
             SesionTerapia.horasalida != None,
             SesionTerapia.tratamientopacienteid != None,
         )
     )
 
-    sesiones_rango_query = _aplicar_filtro_dia_sesion(
-        sesiones_rango_query,
+    sesiones_corte_query = _aplicar_filtro_dia_sesion(
+        sesiones_corte_query,
         dia_semana,
     )
 
-    sesiones_rango_query = _aplicar_filtros_sesiones(
-        sesiones_rango_query,
+    sesiones_corte_query = _aplicar_filtros_sesiones(
+        sesiones_corte_query,
         current_user,
         terapeutaid=terapeutaid,
         consultorioid=consultorioid,
@@ -1002,7 +1295,7 @@ def _deuda_acumulada_reporte(
 
     tratamiento_ids = {
         row[0]
-        for row in sesiones_rango_query.with_entities(
+        for row in sesiones_corte_query.with_entities(
             SesionTerapia.tratamientopacienteid
         ).distinct().all()
         if row[0] is not None
@@ -1030,7 +1323,7 @@ def _deuda_acumulada_reporte(
             or_(Pago.esrecuperacioncartera == False, Pago.esrecuperacioncartera.is_(None)),
             or_(
                 Pago.espagoprevio == True,
-                Pago.fechapago < fin_dia_ecuador(hasta),
+                fecha_pago_ecuador_expr() <= hasta,
             ),
         )
         .group_by(Pago.pacienteid, Pago.tratamientopacienteid)
@@ -1091,8 +1384,8 @@ def _deuda_acumulada_reporte(
         if tratamiento is None or sesion.paciente is None:
             continue
 
-        if _es_paciente_ecuasanitas(sesion.paciente):
-            continue
+        # Paciente Ecuasanitas también se considera cuenta por cobrar del paciente
+        # si el copago/valor de la sesión no está cubierto.
 
         precio = _precio_aplicado(tratamiento)
         clave_pago = (int(sesion.pacienteid), int(sesion.tratamientopacienteid))
@@ -1964,6 +2257,31 @@ def reporte_terapias(
         or 0
     )
 
+    # Si se filtra por fisioterapeuta, la caja no puede ser el pago completo
+    # del tratamiento. Se reparte FIFO y solo se cuenta la parte que cubre
+    # sesiones realizadas por ese fisio.
+    caja_asignada_fisio = _caja_terapia_asignada_a_fisio(
+        db=db,
+        current_user=current_user,
+        desde=desde,
+        hasta=hasta,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+        dia_semana=dia_semana,
+    )
+    if caja_asignada_fisio is not None:
+        total_pagado_verificado = float(caja_asignada_fisio["total"] or 0.0)
+
+    transferencias_pendientes_total, transferencias_pendientes_cantidad = _totales_pendientes_transferencia(
+        db=db,
+        current_user=current_user,
+        desde=desde,
+        hasta=hasta,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+        dia_semana=dia_semana,
+    )
+
     pago_previo_query = db.query(Pago).filter(
         filtro_fechapago_ecuador(desde, hasta),
         filtro_dia_pago_ecuador(dia_semana),
@@ -2002,23 +2320,42 @@ def reporte_terapias(
         dia_semana=dia_semana,
     )
 
-    pagos_metodo_rows = (
-        pagos_query
-        .with_entities(
-            Pago.metodopago,
-            func.coalesce(func.sum(Pago.monto), 0),
+    if caja_asignada_fisio is not None:
+        totales_metodo = caja_asignada_fisio["totales"]
+        por_metodo = list(caja_asignada_fisio["por_metodo"])
+    else:
+        pagos_metodo_rows = (
+            pagos_query
+            .with_entities(
+                Pago.metodopago,
+                func.coalesce(func.sum(Pago.monto), 0),
+            )
+            .group_by(Pago.metodopago)
+            .all()
         )
-        .group_by(Pago.metodopago)
-        .all()
-    )
 
-    por_metodo = [
-        MetodoPagoTotalOut(
-            metodo=row[0] or "Sin método",
-            total=round(float(row[1] or 0), 2),
-        )
-        for row in pagos_metodo_rows
-    ]
+        totales_metodo = {
+            "total_efectivo": 0.0,
+            "total_transferencia": 0.0,
+            "total_tarjeta": 0.0,
+            "total_otros_metodos": 0.0,
+            "transferencias_pendientes_total": transferencias_pendientes_total,
+            "transferencias_pendientes_cantidad": transferencias_pendientes_cantidad,
+        }
+        por_metodo_map: Dict[str, float] = defaultdict(float)
+        for metodo, total in pagos_metodo_rows:
+            total_float = float(total or 0)
+            _sumar_metodo_en_resumen(totales_metodo, metodo, total_float)
+            por_metodo_map[_metodo_nombre_canonico(metodo)] += total_float
+
+        por_metodo = [
+            MetodoPagoTotalOut(
+                metodo=metodo,
+                total=round(float(total or 0), 2),
+            )
+            for metodo, total in sorted(por_metodo_map.items())
+            if round(float(total or 0), 2) > 0
+        ]
 
     tratamiento_map: Dict[str, Dict[str, float]] = {}
 
@@ -2057,22 +2394,51 @@ def reporte_terapias(
 
     fecha_pago_expr = fecha_pago_ecuador_expr()
 
-    pagos_por_dia = (
-        pagos_query
-        .with_entities(
-            fecha_pago_expr.label("fecha_pago"),
-            func.coalesce(func.sum(Pago.monto), 0),
-        )
-        .group_by(fecha_pago_expr)
-        .all()
-    )
-
-    for fecha_pago, total in pagos_por_dia:
-        if fecha_pago in dias_map:
-            dias_map[fecha_pago].pagos_verificados = round(
-                dias_map[fecha_pago].pagos_verificados + float(total or 0),
-                2,
+    if caja_asignada_fisio is not None:
+        for fecha_pago, data in caja_asignada_fisio["por_dia"].items():
+            if fecha_pago in dias_map:
+                dias_map[fecha_pago].pagos_verificados = round(
+                    dias_map[fecha_pago].pagos_verificados + float(data.get("total", 0.0) or 0.0),
+                    2,
+                )
+                dias_map[fecha_pago].pagos_efectivo = round(
+                    dias_map[fecha_pago].pagos_efectivo + float(data.get("efectivo", 0.0) or 0.0),
+                    2,
+                )
+                dias_map[fecha_pago].pagos_transferencia = round(
+                    dias_map[fecha_pago].pagos_transferencia + float(data.get("transferencia", 0.0) or 0.0),
+                    2,
+                )
+                dias_map[fecha_pago].pagos_tarjeta = round(
+                    dias_map[fecha_pago].pagos_tarjeta + float(data.get("tarjeta", 0.0) or 0.0),
+                    2,
+                )
+    else:
+        pagos_por_dia = (
+            pagos_query
+            .with_entities(
+                fecha_pago_expr.label("fecha_pago"),
+                Pago.metodopago,
+                func.coalesce(func.sum(Pago.monto), 0),
             )
+            .group_by(fecha_pago_expr, Pago.metodopago)
+            .all()
+        )
+
+        for fecha_pago, metodo, total in pagos_por_dia:
+            if fecha_pago in dias_map:
+                total_float = float(total or 0)
+                categoria = _normalizar_metodo_pago(metodo)
+                dias_map[fecha_pago].pagos_verificados = round(
+                    dias_map[fecha_pago].pagos_verificados + total_float,
+                    2,
+                )
+                if categoria == "efectivo":
+                    dias_map[fecha_pago].pagos_efectivo = round(dias_map[fecha_pago].pagos_efectivo + total_float, 2)
+                elif categoria == "transferencia":
+                    dias_map[fecha_pago].pagos_transferencia = round(dias_map[fecha_pago].pagos_transferencia + total_float, 2)
+                elif categoria == "tarjeta":
+                    dias_map[fecha_pago].pagos_tarjeta = round(dias_map[fecha_pago].pagos_tarjeta + total_float, 2)
 
     recuperacion_cartera_query = _query_recuperacion_cartera(
         db=db,
@@ -2092,6 +2458,8 @@ def reporte_terapias(
     )
 
     if total_recuperacion_cartera > 0:
+        total_pagado_verificado += total_recuperacion_cartera
+        _sumar_metodo_en_resumen(totales_metodo, "Recuperación de cartera", total_recuperacion_cartera)
         por_metodo.append(
             MetodoPagoTotalOut(
                 metodo="Recuperación de cartera",
@@ -2135,6 +2503,12 @@ def reporte_terapias(
         total_sesiones=len(sesiones),
         total_generado=round(total_generado, 2),
         total_pagado_verificado=round(total_pagado_verificado, 2),
+        total_efectivo=round(float(totales_metodo.get("total_efectivo", 0.0) or 0.0), 2),
+        total_transferencia=round(float(totales_metodo.get("total_transferencia", 0.0) or 0.0), 2),
+        total_tarjeta=round(float(totales_metodo.get("total_tarjeta", 0.0) or 0.0), 2),
+        total_otros_metodos=round(float(totales_metodo.get("total_otros_metodos", 0.0) or 0.0), 2),
+        transferencias_pendientes_total=round(float(totales_metodo.get("transferencias_pendientes_total", transferencias_pendientes_total) or 0.0), 2),
+        transferencias_pendientes_cantidad=int(totales_metodo.get("transferencias_pendientes_cantidad", transferencias_pendientes_cantidad) or 0),
         total_pago_previo_verificado=round(total_pago_previo_verificado, 2),
         total_ecuasanitas=round(total_ecuasanitas, 2),
         sesiones_ecuasanitas=sesiones_ecuasanitas,
@@ -2142,7 +2516,7 @@ def reporte_terapias(
         deuda_acumulada_total=round(deuda_acumulada.total_deuda, 2),
         deuda_acumulada_sesiones=deuda_acumulada.total_sesiones_pendientes,
         saldo_a_favor=round(saldo_a_favor, 2),
-        transferencias_pendientes=transferencias_pendientes,
+        transferencias_pendientes=transferencias_pendientes_cantidad,
         pendiente_verificacion_total=round(pendiente_verificacion_total, 2),
         por_metodo_pago=por_metodo,
         tratamientos_mas_realizados=tratamientos_mas,
@@ -2159,6 +2533,10 @@ def reporte_terapias(
 
 
 def _fecha_pago_local_ecuador(pago: Pago) -> date:
+    fecha_real = getattr(pago, "fechapagoreal", None)
+    if fecha_real is not None:
+        return fecha_real
+
     value = pago.fechapago
     if value is None:
         return fecha_ecuador()
@@ -2276,6 +2654,260 @@ def _terapeutas_por_tratamiento_en_sesiones(sesiones: List[SesionTerapia]) -> Di
     return {key: ", ".join(sorted(value)) for key, value in nombres.items() if value}
 
 
+
+
+def _caja_terapia_asignada_a_fisio(
+    db: Session,
+    current_user: Usuario,
+    desde: date,
+    hasta: date,
+    terapeutaid: Optional[int] = None,
+    consultorioid: Optional[int] = None,
+    dia_semana: Optional[int] = None,
+):
+    """Caja de terapias repartida por sesiones reales del fisioterapeuta.
+
+    Cuando se filtra por fisio, NO se debe sumar el pago completo del
+    tratamiento, porque ese tratamiento puede tener sesiones hechas por varios
+    terapeutas. Aquí se consume el pago FIFO por paciente + tratamiento y solo
+    se cuenta la parte que cubre sesiones atendidas por el fisio filtrado.
+    """
+    terapeuta_objetivo: Optional[int] = current_user.id if current_user.rol == 2 else terapeutaid
+    if terapeuta_objetivo is None:
+        return None
+
+    pagos_rango = (
+        _pagos_detalle_base_query(
+            db=db,
+            current_user=current_user,
+            desde=desde,
+            hasta=hasta,
+            terapeutaid=terapeuta_objetivo,
+            consultorioid=consultorioid,
+            dia_semana=dia_semana,
+            solo_caja=True,
+        )
+        .order_by(fecha_pago_ecuador_expr(), Pago.fechapago, Pago.id)
+        .all()
+    )
+
+    if not pagos_rango:
+        pendiente_total, pendiente_cantidad = _totales_pendientes_transferencia(
+            db=db,
+            current_user=current_user,
+            desde=desde,
+            hasta=hasta,
+            terapeutaid=terapeuta_objetivo,
+            consultorioid=consultorioid,
+            dia_semana=dia_semana,
+        )
+        return {
+            "total": 0.0,
+            "totales": {
+                "total_efectivo": 0.0,
+                "total_transferencia": 0.0,
+                "total_tarjeta": 0.0,
+                "total_otros_metodos": 0.0,
+                "transferencias_pendientes_total": pendiente_total,
+                "transferencias_pendientes_cantidad": pendiente_cantidad,
+            },
+            "por_metodo": [],
+            "por_dia": {},
+            "pagos_detalle": [],
+        }
+
+    pagos_rango_ids = {int(pago.id) for pago, _, _ in pagos_rango}
+    claves = {
+        (int(pago.pacienteid), int(pago.tratamientopacienteid))
+        for pago, _, _ in pagos_rango
+        if pago.pacienteid is not None and pago.tratamientopacienteid is not None
+    }
+    tratamiento_ids = {tratamiento_id for _, tratamiento_id in claves}
+    paciente_ids = {paciente_id for paciente_id, _ in claves}
+
+    sesiones = (
+        db.query(SesionTerapia)
+        .options(
+            joinedload(SesionTerapia.paciente),
+            joinedload(SesionTerapia.terapeuta),
+            joinedload(SesionTerapia.tratamiento_paciente),
+        )
+        .filter(
+            SesionTerapia.pacienteid.in_(paciente_ids),
+            SesionTerapia.tratamientopacienteid.in_(tratamiento_ids),
+            SesionTerapia.horasalida != None,
+            SesionTerapia.fecha <= hasta,
+        )
+        .order_by(
+            SesionTerapia.pacienteid,
+            SesionTerapia.tratamientopacienteid,
+            SesionTerapia.fecha,
+            SesionTerapia.horaingreso,
+            SesionTerapia.id,
+        )
+        .all()
+    )
+
+    sesiones_por_clave: Dict[Tuple[int, int], List[SesionTerapia]] = defaultdict(list)
+    for sesion in sesiones:
+        if sesion.pacienteid is None or sesion.tratamientopacienteid is None:
+            continue
+        key = (int(sesion.pacienteid), int(sesion.tratamientopacienteid))
+        if key in claves:
+            sesiones_por_clave[key].append(sesion)
+
+    pagos_hasta_corte = (
+        db.query(Pago)
+        .filter(
+            Pago.pacienteid.in_(paciente_ids),
+            Pago.tratamientopacienteid.in_(tratamiento_ids),
+            Pago.estadopago == 2,
+            _pago_no_anulado_filter(),
+            or_(Pago.esrecuperacioncartera == False, Pago.esrecuperacioncartera.is_(None)),
+            fecha_pago_ecuador_expr() <= hasta,
+        )
+        .order_by(
+            Pago.pacienteid,
+            Pago.tratamientopacienteid,
+            fecha_pago_ecuador_expr(),
+            Pago.fechapago,
+            Pago.id,
+        )
+        .all()
+    )
+
+    pagos_por_clave: Dict[Tuple[int, int], List[Pago]] = defaultdict(list)
+    for pago in pagos_hasta_corte:
+        if pago.pacienteid is None or pago.tratamientopacienteid is None:
+            continue
+        key = (int(pago.pacienteid), int(pago.tratamientopacienteid))
+        if key in claves:
+            pagos_por_clave[key].append(pago)
+
+    totales = {
+        "total_efectivo": 0.0,
+        "total_transferencia": 0.0,
+        "total_tarjeta": 0.0,
+        "total_otros_metodos": 0.0,
+        "transferencias_pendientes_total": 0.0,
+        "transferencias_pendientes_cantidad": 0,
+    }
+    por_metodo: Dict[str, float] = defaultdict(float)
+    por_dia: Dict[date, Dict[str, float]] = defaultdict(
+        lambda: {"total": 0.0, "efectivo": 0.0, "transferencia": 0.0, "tarjeta": 0.0}
+    )
+    pagos_detalle: Dict[int, Dict] = {}
+
+    for key, pagos_key in pagos_por_clave.items():
+        sesiones_key = sesiones_por_clave.get(key, [])
+        sesion_index = 0
+        restante_sesion = 0.0
+        sesion_actual: Optional[SesionTerapia] = None
+
+        def avanzar_sesion():
+            nonlocal sesion_index, restante_sesion, sesion_actual
+            while sesion_index < len(sesiones_key):
+                sesion_actual = sesiones_key[sesion_index]
+                sesion_index += 1
+                precio = _precio_aplicado(getattr(sesion_actual, "tratamiento_paciente", None))
+                restante_sesion = round(float(precio or 0.0), 2)
+                if restante_sesion > 0:
+                    return True
+            sesion_actual = None
+            restante_sesion = 0.0
+            return False
+
+        avanzar_sesion()
+
+        for pago in pagos_key:
+            restante_pago = float(pago.monto or 0.0)
+            es_pago_rango = int(pago.id) in pagos_rango_ids and not bool(getattr(pago, "espagoprevio", False))
+
+            while restante_pago > 0 and sesion_actual is not None:
+                aplicado = min(restante_pago, restante_sesion)
+                restante_pago = round(restante_pago - aplicado, 2)
+                restante_sesion = round(restante_sesion - aplicado, 2)
+
+                if es_pago_rango and sesion_actual.terapeutaid == terapeuta_objetivo:
+                    fecha_caja = _fecha_pago_local_ecuador(pago)
+                    metodo = pago.metodopago or "Sin método"
+                    categoria = _normalizar_metodo_pago(metodo)
+                    monto = round(float(aplicado or 0.0), 2)
+                    if monto > 0:
+                        _sumar_metodo_en_resumen(totales, metodo, monto)
+                        por_metodo[_metodo_nombre_canonico(metodo)] += monto
+                        por_dia[fecha_caja]["total"] += monto
+                        if categoria in {"efectivo", "transferencia", "tarjeta"}:
+                            por_dia[fecha_caja][categoria] += monto
+
+                        detalle = pagos_detalle.setdefault(
+                            int(pago.id),
+                            {
+                                "pago": pago,
+                                "sesion": sesion_actual,
+                                "monto": 0.0,
+                                "sesiones_pagadas": 0.0,
+                            },
+                        )
+                        detalle["monto"] += monto
+                        precio_sesion = _precio_aplicado(getattr(sesion_actual, "tratamiento_paciente", None))
+                        if precio_sesion > 0:
+                            detalle["sesiones_pagadas"] += monto / precio_sesion
+
+                if restante_sesion <= 0:
+                    avanzar_sesion()
+
+    pendiente_total, pendiente_cantidad = _totales_pendientes_transferencia(
+        db=db,
+        current_user=current_user,
+        desde=desde,
+        hasta=hasta,
+        terapeutaid=terapeuta_objetivo,
+        consultorioid=consultorioid,
+        dia_semana=dia_semana,
+    )
+    totales["transferencias_pendientes_total"] = pendiente_total
+    totales["transferencias_pendientes_cantidad"] = pendiente_cantidad
+
+    pagos_detalle_lista: List[CajaSemanalPagoOut] = []
+    for data in pagos_detalle.values():
+        pago = data["pago"]
+        sesion = data["sesion"]
+        tratamiento = getattr(sesion, "tratamiento_paciente", None)
+        paciente = getattr(sesion, "paciente", None)
+        precio = _precio_aplicado(tratamiento)
+        pagos_detalle_lista.append(
+            CajaSemanalPagoOut(
+                pagoid=int(pago.id),
+                fecha=_fecha_pago_local_ecuador(pago),
+                pacienteid=int(sesion.pacienteid),
+                paciente=_nombre_paciente(paciente),
+                terapeuta=_nombre_usuario(getattr(sesion, "terapeuta", None)),
+                tratamientopacienteid=int(sesion.tratamientopacienteid),
+                tratamiento=(tratamiento.tipotratamiento if tratamiento else None) or "Tratamiento",
+                metodo=pago.metodopago or "Sin método",
+                monto=round(float(data["monto"] or 0.0), 2),
+                valor_sesion=round(precio, 2),
+                sesiones_pagadas=round(float(data["sesiones_pagadas"] or 0.0), 2),
+                sesiones_realizadas_semana=0,
+            )
+        )
+
+    pagos_detalle_lista.sort(key=lambda item: (item.fecha, item.pagoid))
+
+    return {
+        "total": round(sum(float(v or 0.0) for k, v in totales.items() if k.startswith("total_")), 2),
+        "totales": {k: round(float(v or 0.0), 2) if isinstance(v, float) else v for k, v in totales.items()},
+        "por_metodo": [
+            MetodoPagoTotalOut(metodo=metodo, total=round(total, 2))
+            for metodo, total in sorted(por_metodo.items())
+            if round(total, 2) > 0
+        ],
+        "por_dia": por_dia,
+        "pagos_detalle": pagos_detalle_lista,
+    }
+
+
 def _pagos_por_clave_para_pendiente(
     db: Session,
     current_user: Usuario,
@@ -2380,7 +3012,7 @@ def _pendiente_semana_detalle(
             or_(Pago.esrecuperacioncartera == False, Pago.esrecuperacioncartera.is_(None)),
             or_(
                 Pago.espagoprevio == True,
-                Pago.fechapago < fin_dia_ecuador(hasta),
+                fecha_pago_ecuador_expr() <= hasta,
             ),
         )
         .group_by(Pago.pacienteid, Pago.tratamientopacienteid)
@@ -2437,9 +3069,24 @@ def _pendiente_semana_detalle(
 
         precio = _precio_aplicado(tratamiento)
 
-        # Ecuasanitas no queda como deuda del paciente. Tampoco debe consumir pagos
-        # de ese tratamiento para inflar o reducir deudas de forma extraña.
-        if _es_paciente_ecuasanitas(paciente):
+        # Pacientes Ecuasanitas: el copago/valor de sesión pendiente se cobra
+        # directamente al paciente, por eso SÍ cuenta como pendiente normal.
+
+        # Cuando hay filtro de día de la semana, las sesiones de la misma semana
+        # pero de un día diferente al filtrado NO deben consumir el saldo disponible
+        # en el FIFO. Solo deben consumirlo las sesiones de semanas anteriores
+        # (para el cálculo histórico correcto) y las del propio día filtrado.
+        # Esto evita que, por ejemplo, una sesión del lunes consuma el saldo
+        # antes de que el bucle llegue a la sesión del martes filtrado, haciendo
+        # que la deuda del martes desaparezca incorrectamente.
+        es_sesion_dentro_del_rango = sesion.fecha >= desde and sesion.fecha <= hasta
+        es_sesion_de_otro_dia_filtrado = (
+            dia_semana is not None
+            and es_sesion_dentro_del_rango
+            and sesion.fecha.weekday() != dia_semana
+        )
+        if es_sesion_de_otro_dia_filtrado:
+            # No consumir saldo, no reportar: saltar completamente.
             continue
 
         disponible = disponible_por_clave.get(key_pago, 0.0)
@@ -2525,6 +3172,33 @@ def reporte_caja_semanal_detalle(
     desde, hasta = _default_range(desde, hasta)
     dia_semana = _validar_dia_semana(dia_semana)
 
+    caja_asignada_fisio = _caja_terapia_asignada_a_fisio(
+        db=db,
+        current_user=current_user,
+        desde=desde,
+        hasta=hasta,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+        dia_semana=dia_semana,
+    )
+    if caja_asignada_fisio is not None:
+        totales = caja_asignada_fisio["totales"]
+        pagos_asignados = caja_asignada_fisio["pagos_detalle"]
+        return CajaSemanalDetalleOut(
+            desde=desde,
+            hasta=hasta,
+            total_caja=round(float(caja_asignada_fisio["total"] or 0.0), 2),
+            total_pagos=len(pagos_asignados),
+            total_sesiones_pagadas=round(sum(item.sesiones_pagadas for item in pagos_asignados), 2),
+            total_efectivo=round(float(totales.get("total_efectivo", 0.0) or 0.0), 2),
+            total_transferencia=round(float(totales.get("total_transferencia", 0.0) or 0.0), 2),
+            total_tarjeta=round(float(totales.get("total_tarjeta", 0.0) or 0.0), 2),
+            total_otros_metodos=round(float(totales.get("total_otros_metodos", 0.0) or 0.0), 2),
+            transferencias_pendientes_total=round(float(totales.get("transferencias_pendientes_total", 0.0) or 0.0), 2),
+            transferencias_pendientes_cantidad=int(totales.get("transferencias_pendientes_cantidad", 0) or 0),
+            pagos=pagos_asignados,
+        )
+
     sesiones = _sesiones_reporte_filtradas(
         db=db,
         current_user=current_user,
@@ -2579,12 +3253,37 @@ def reporte_caja_semanal_detalle(
             )
         )
 
+    totales_metodo = {
+        "total_efectivo": 0.0,
+        "total_transferencia": 0.0,
+        "total_tarjeta": 0.0,
+        "total_otros_metodos": 0.0,
+    }
+    for item in pagos:
+        _sumar_metodo_en_resumen(totales_metodo, item.metodo, item.monto)
+
+    transferencias_pendientes_total, transferencias_pendientes_cantidad = _totales_pendientes_transferencia(
+        db=db,
+        current_user=current_user,
+        desde=desde,
+        hasta=hasta,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+        dia_semana=dia_semana,
+    )
+
     return CajaSemanalDetalleOut(
         desde=desde,
         hasta=hasta,
         total_caja=round(sum(item.monto for item in pagos), 2),
         total_pagos=len(pagos),
         total_sesiones_pagadas=round(sum(item.sesiones_pagadas for item in pagos), 2),
+        total_efectivo=round(float(totales_metodo.get("total_efectivo", 0.0) or 0.0), 2),
+        total_transferencia=round(float(totales_metodo.get("total_transferencia", 0.0) or 0.0), 2),
+        total_tarjeta=round(float(totales_metodo.get("total_tarjeta", 0.0) or 0.0), 2),
+        total_otros_metodos=round(float(totales_metodo.get("total_otros_metodos", 0.0) or 0.0), 2),
+        transferencias_pendientes_total=transferencias_pendientes_total,
+        transferencias_pendientes_cantidad=transferencias_pendientes_cantidad,
         pagos=pagos,
     )
 
@@ -2795,15 +3494,21 @@ def reporte_fisioterapeutas_semanal(
         if s.tratamientopacienteid
     }
 
-    disponible_pagado = _pagos_aplicados_a_rango_por_tratamiento(
+    cobertura_sesiones = _cobertura_sesiones_filtradas(
         db,
-        tratamiento_ids,
-        desde,
+        sesiones,
         hasta,
     )
 
     data: Dict[int, Dict[str, float | int | str | None]] = {}
-    sesiones_no_ecuasanitas: List[Tuple[int, int, float, date]] = []
+    sesiones_no_ecuasanitas: List[Tuple[int, int, float, date, float]] = []
+
+    # Cantidad de atenciones por fisioterapeuta y por día.
+    # Sirve para aplicar la regla: lunes-viernes > 15 atenciones => $4 todas.
+    atenciones_por_terapeuta_dia: Dict[Tuple[int, date], int] = defaultdict(int)
+    for s in sesiones:
+        if s.terapeutaid is not None and s.fecha is not None:
+            atenciones_por_terapeuta_dia[(s.terapeutaid, s.fecha)] += 1
 
     for sesion in sesiones:
         terapeuta_id = sesion.terapeutaid
@@ -2829,7 +3534,12 @@ def reporte_fisioterapeutas_semanal(
             },
         )
 
-        ganancia_fisio = ganancia_fisio_terapia(precio, sesion.fecha)
+        atenciones_dia = atenciones_por_terapeuta_dia.get((terapeuta_id, sesion.fecha), 0)
+        ganancia_fisio = sueldo_fisio_terapia(
+            sesion.fecha,
+            atenciones_dia,
+            _tratamiento_tarifa_especial_5(sesion.tratamiento_paciente),
+        )
         item["sesiones"] = int(item["sesiones"]) + 1
         item["total_generado"] = float(item["total_generado"]) + precio
         item["ganancia_terapia_total"] = float(item["ganancia_terapia_total"]) + ganancia_fisio
@@ -2843,7 +3553,7 @@ def reporte_fisioterapeutas_semanal(
             )
         else:
             sesiones_no_ecuasanitas.append(
-                (terapeuta_id, tratamiento_id, precio, sesion.fecha)
+                (terapeuta_id, int(sesion.id), precio, sesion.fecha, ganancia_fisio)
             )
 
     for row in pagos_gimnasio_rows:
@@ -2874,30 +3584,35 @@ def reporte_fisioterapeutas_semanal(
         )
 
     pagado_por_terapeuta: Dict[int, float] = {tid: 0.0 for tid in data.keys()}
+    pendiente_real_por_terapeuta: Dict[int, float] = {tid: 0.0 for tid in data.keys()}
     ganancia_cobrada_no_ecuasanitas_por_terapeuta: Dict[int, float] = {tid: 0.0 for tid in data.keys()}
     ganancia_pendiente_por_terapeuta: Dict[int, float] = {tid: 0.0 for tid in data.keys()}
 
-    # Se distribuye el pago por sesión para respetar el porcentaje de cada fecha:
-    # lunes-viernes 35%, sábado-domingo 40%.
-    for terapeuta_id, tratamiento_id, precio, fecha_sesion in sesiones_no_ecuasanitas:
-        disponible = disponible_pagado.get(tratamiento_id, 0.0)
-        aplicado = min(precio, disponible)
-        pendiente = max(precio - aplicado, 0.0)
-        porcentaje_fisio = porcentaje_fisio_terapia_por_fecha(fecha_sesion)
+    # El sueldo del fisioterapeuta depende de que la sesión esté cubierta/pagada.
+    # Si la sesión todavía tiene saldo pendiente, el sueldo de esa sesión queda pendiente.
+    for terapeuta_id, sesion_id, precio, fecha_sesion, sueldo_sesion in sesiones_no_ecuasanitas:
+        aplicado, pendiente = cobertura_sesiones.get(
+            int(sesion_id),
+            (0.0, float(precio or 0.0)),
+        )
 
         pagado_por_terapeuta[terapeuta_id] = (
             pagado_por_terapeuta.get(terapeuta_id, 0.0) + aplicado
         )
-        ganancia_cobrada_no_ecuasanitas_por_terapeuta[terapeuta_id] = (
-            ganancia_cobrada_no_ecuasanitas_por_terapeuta.get(terapeuta_id, 0.0)
-            + aplicado * porcentaje_fisio
-        )
-        ganancia_pendiente_por_terapeuta[terapeuta_id] = (
-            ganancia_pendiente_por_terapeuta.get(terapeuta_id, 0.0)
-            + pendiente * porcentaje_fisio
+        pendiente_real_por_terapeuta[terapeuta_id] = (
+            pendiente_real_por_terapeuta.get(terapeuta_id, 0.0) + pendiente
         )
 
-        disponible_pagado[tratamiento_id] = max(disponible - aplicado, 0.0)
+        if pendiente <= 0.009:
+            ganancia_cobrada_no_ecuasanitas_por_terapeuta[terapeuta_id] = (
+                ganancia_cobrada_no_ecuasanitas_por_terapeuta.get(terapeuta_id, 0.0)
+                + float(sueldo_sesion or 0.0)
+            )
+        else:
+            ganancia_pendiente_por_terapeuta[terapeuta_id] = (
+                ganancia_pendiente_por_terapeuta.get(terapeuta_id, 0.0)
+                + float(sueldo_sesion or 0.0)
+            )
 
     resultado: List[FisioSemanalOut] = []
 
@@ -2905,17 +3620,18 @@ def reporte_fisioterapeutas_semanal(
         total_terapia_generado = float(item["total_generado"])
         total_ecuasanitas = float(item.get("total_ecuasanitas", 0.0))
         total_terapia_pagado = float(pagado_por_terapeuta.get(tid, 0.0))
-        total_no_ecuasanitas = max(total_terapia_generado - total_ecuasanitas, 0.0)
-        pendiente_terapia = max(total_no_ecuasanitas - total_terapia_pagado, 0.0)
+        pendiente_terapia = float(pendiente_real_por_terapeuta.get(tid, 0.0))
         total_gimnasio_pagado = float(item.get("total_gimnasio_pagado", 0.0))
 
         ganancia_terapia_total = float(item.get("ganancia_terapia_total", 0.0))
         ganancia_terapia_ecuasanitas = float(item.get("ganancia_terapia_ecuasanitas", 0.0))
         ganancia_terapia_cobrada = (
-            ganancia_cobrada_no_ecuasanitas_por_terapeuta.get(tid, 0.0)
-            + ganancia_terapia_ecuasanitas
+            ganancia_terapia_ecuasanitas
+            + float(ganancia_cobrada_no_ecuasanitas_por_terapeuta.get(tid, 0.0))
         )
-        ganancia_terapia_pendiente = ganancia_pendiente_por_terapeuta.get(tid, 0.0)
+        ganancia_terapia_pendiente = float(
+            ganancia_pendiente_por_terapeuta.get(tid, 0.0)
+        )
         ganancia_gimnasio_cobrada = total_gimnasio_pagado * PORCENTAJE_FISIO_GIMNASIO
 
         resultado.append(
@@ -3010,14 +3726,114 @@ def reporte_fisioterapeuta_detalle(
         if s.tratamientopacienteid
     }
 
-    disponible_pagado = _pagos_aplicados_a_rango_por_tratamiento(
+    cobertura_sesiones = _cobertura_sesiones_filtradas(
         db,
-        tratamiento_ids,
-        desde,
+        sesiones,
         hasta,
     )
 
     agrupado: Dict[Tuple[int, int], Dict] = {}
+
+    atenciones_por_dia: Dict[date, int] = defaultdict(int)
+    for s in sesiones:
+        if s.fecha is not None:
+            atenciones_por_dia[s.fecha] += 1
+
+    sesiones_por_dia: Dict[date, List[SesionTerapia]] = defaultdict(list)
+    for s in sesiones:
+        if s.fecha is not None:
+            sesiones_por_dia[s.fecha].append(s)
+
+    dias_sueldo: List[FisioDetalleDiaSueldoOut] = []
+    for fecha_dia, sesiones_dia in sorted(sesiones_por_dia.items()):
+        atenciones = len(sesiones_dia)
+        es_fin_semana = _es_fin_semana(fecha_dia)
+        es_bono_productividad = (
+            not es_fin_semana
+            and atenciones > UMBRAL_ATENCIONES_BONO_DIARIO
+        )
+        motivos_tarifa_5: Dict[str, int] = defaultdict(int)
+        for sd in sesiones_dia:
+            motivo_especial = _motivo_tarifa_especial_5(sd.tratamiento_paciente)
+            if motivo_especial:
+                motivos_tarifa_5[motivo_especial] += 1
+
+        atenciones_tarifa_especial_5 = sum(motivos_tarifa_5.values())
+        tarifa_base = sueldo_fisio_terapia(fecha_dia, atenciones, False)
+        total_sueldo = 0.0
+        sueldo_cobrado_dia = 0.0
+        sueldo_pendiente_dia = 0.0
+        sesiones_pagadas_dia = 0
+        sesiones_pendientes_pago_dia = 0
+        monto_pendiente_pacientes_dia = 0.0
+
+        for sd in sesiones_dia:
+            sueldo_sesion = sueldo_fisio_terapia(
+                fecha_dia,
+                atenciones,
+                _tratamiento_tarifa_especial_5(sd.tratamiento_paciente),
+            )
+            total_sueldo += sueldo_sesion
+
+            # Ecuasanitas se considera cubierta para sueldo del fisio.
+            if _es_paciente_ecuasanitas(sd.paciente):
+                sueldo_cobrado_dia += sueldo_sesion
+                sesiones_pagadas_dia += 1
+                continue
+
+            aplicado, saldo = cobertura_sesiones.get(
+                int(sd.id),
+                (0.0, _precio_aplicado(sd.tratamiento_paciente)),
+            )
+            monto_pendiente_pacientes_dia += float(saldo or 0.0)
+
+            # Regla CORPOFIT: si la sesión no está totalmente cubierta,
+            # el sueldo de esa atención queda pendiente hasta que el paciente pague.
+            if float(saldo or 0.0) <= 0.009:
+                sueldo_cobrado_dia += sueldo_sesion
+                sesiones_pagadas_dia += 1
+            else:
+                sueldo_pendiente_dia += sueldo_sesion
+                sesiones_pendientes_pago_dia += 1
+
+        detalle_tarifa_5 = ", ".join(
+            f"{cantidad} {motivo}"
+            for motivo, cantidad in sorted(motivos_tarifa_5.items())
+        )
+
+        reglas: List[str] = []
+        if es_bono_productividad:
+            reglas.append(
+                f"Bono +{UMBRAL_ATENCIONES_BONO_DIARIO}: la tarifa base del día sube a $4.00"
+            )
+        elif es_fin_semana:
+            reglas.append("Fin de semana: tarifa base $4.00")
+        else:
+            reglas.append("Tarifa base normal $3.50")
+
+        if atenciones_tarifa_especial_5 > 0:
+            reglas.append(f"Especial $5: {detalle_tarifa_5}")
+
+        motivo = " • ".join(reglas)
+
+        dias_sueldo.append(
+            FisioDetalleDiaSueldoOut(
+                fecha=fecha_dia,
+                dia_semana=fecha_dia.weekday(),
+                atenciones=atenciones,
+                tarifa=round(float(tarifa_base), 2),
+                total_sueldo=round(float(total_sueldo), 2),
+                sueldo_cobrado=round(float(sueldo_cobrado_dia), 2),
+                sueldo_pendiente=round(float(sueldo_pendiente_dia), 2),
+                sesiones_pagadas=sesiones_pagadas_dia,
+                sesiones_pendientes_pago=sesiones_pendientes_pago_dia,
+                monto_pendiente_pacientes=round(float(monto_pendiente_pacientes_dia), 2),
+                es_bono_productividad=es_bono_productividad,
+                es_fin_semana=es_fin_semana,
+                atenciones_multiple_extremidad=atenciones_tarifa_especial_5,
+                motivo=motivo,
+            )
+        )
 
     for sesion in sesiones:
         tratamiento = sesion.tratamiento_paciente
@@ -3041,15 +3857,27 @@ def reporte_fisioterapeuta_detalle(
                 "total_generado": 0.0,
                 "ganancia_total": 0.0,
                 "es_ecuasanitas": _es_paciente_ecuasanitas(sesion.paciente),
+                "multiple_extremidad": _tratamiento_tarifa_especial_5(tratamiento),
+                "sesiones_multiple_extremidad": 0,
                 "sesiones_detalle": [],
             },
         )
 
         precio = _precio_aplicado(tratamiento)
+        atenciones_dia = atenciones_por_dia.get(sesion.fecha, 0)
+        sueldo_sesion = sueldo_fisio_terapia(
+            sesion.fecha,
+            atenciones_dia,
+            _tratamiento_tarifa_especial_5(tratamiento),
+        )
+
         item["sesiones"] += 1
         item["total_generado"] += precio
-        item["ganancia_total"] += ganancia_fisio_terapia(precio, sesion.fecha)
-        item["sesiones_detalle"].append((precio, sesion.fecha))
+        item["ganancia_total"] += sueldo_sesion
+        if _tratamiento_tarifa_especial_5(tratamiento):
+            item["multiple_extremidad"] = True
+            item["sesiones_multiple_extremidad"] += 1
+        item["sesiones_detalle"].append((int(sesion.id), precio, sesion.fecha, sueldo_sesion))
 
         if _es_paciente_ecuasanitas(sesion.paciente):
             item["es_ecuasanitas"] = True
@@ -3068,25 +3896,26 @@ def reporte_fisioterapeuta_detalle(
             ganancia_cobrada = ganancia_total
             ganancia_pendiente = 0.0
         else:
-            disponible = disponible_pagado.get(tratamiento_id, 0.0)
             pagado = 0.0
             pendiente = 0.0
             ganancia_cobrada = 0.0
             ganancia_pendiente = 0.0
 
-            for precio, fecha_sesion in item.get("sesiones_detalle", []):
-                aplicado = min(float(precio or 0), disponible)
-                saldo = max(float(precio or 0) - aplicado, 0.0)
-                porcentaje_fisio = porcentaje_fisio_terapia_por_fecha(fecha_sesion)
+            for sesion_id, precio, fecha_sesion, sueldo_sesion in item.get("sesiones_detalle", []):
+                aplicado, saldo = cobertura_sesiones.get(
+                    int(sesion_id),
+                    (0.0, float(precio or 0.0)),
+                )
 
                 pagado += aplicado
                 pendiente += saldo
-                ganancia_cobrada += aplicado * porcentaje_fisio
-                ganancia_pendiente += saldo * porcentaje_fisio
-                disponible = max(disponible - aplicado, 0.0)
+
+                if saldo <= 0.009:
+                    ganancia_cobrada += float(sueldo_sesion or 0.0)
+                else:
+                    ganancia_pendiente += float(sueldo_sesion or 0.0)
 
             cubierto_ecuasanitas = 0.0
-            disponible_pagado[tratamiento_id] = disponible
 
         pacientes.append(
             FisioDetallePacienteOut(
@@ -3102,6 +3931,8 @@ def reporte_fisioterapeuta_detalle(
                 pagado_paciente=round(pagado, 2),
                 pendiente_paciente=round(pendiente, 2),
                 es_ecuasanitas=es_ecuasanitas,
+                multiple_extremidad=bool(item.get("multiple_extremidad", False)),
+                sesiones_multiple_extremidad=int(item.get("sesiones_multiple_extremidad", 0)),
                 cubierto_ecuasanitas=round(cubierto_ecuasanitas, 2),
                 ganancia_fisio=round(ganancia_total, 2),
                 ganancia_cobrada=round(ganancia_cobrada, 2),
@@ -3118,6 +3949,7 @@ def reporte_fisioterapeuta_detalle(
             pacientes,
             key=lambda item: item.paciente,
         ),
+        dias_sueldo=dias_sueldo,
     )
 
 
@@ -3464,6 +4296,221 @@ def _excel_map_tratamientos(db: Session, ids: Set[Optional[int]]) -> Dict[int, T
     }
 
 
+def _excel_motivo_especial_5(tratamiento: Optional[TratamientoPaciente]) -> str:
+    """Motivo visible para auditoría cuando una sesión paga $5 al fisio."""
+    if not tratamiento:
+        return ""
+
+    if bool(getattr(tratamiento, "multiple_extremidad", False)):
+        return "Más de una extremidad"
+
+    nombre = _excel_safe_text(getattr(tratamiento, "tipotratamiento", ""))
+    nombre_normalizado = _texto_normalizado(nombre)
+    for nombre_especial in TERAPIAS_SUELDO_ESPECIAL_5:
+        if nombre_especial in nombre_normalizado:
+            return nombre or nombre_especial.title()
+
+    return "Tarifa especial $5"
+
+
+def _excel_motivo_tarifa_fisio(
+    fecha_sesion: Optional[date],
+    atenciones_dia: int,
+    tratamiento: Optional[TratamientoPaciente],
+) -> str:
+    """Texto corto de la regla usada para calcular el sueldo de la sesión."""
+    if _tratamiento_tarifa_especial_5(tratamiento):
+        return f"Especial $5: {_excel_motivo_especial_5(tratamiento)}"
+
+    if _es_fin_semana(fecha_sesion):
+        return "Fin de semana $4"
+
+    if atenciones_dia > UMBRAL_ATENCIONES_BONO_DIARIO:
+        return f"Bono +{UMBRAL_ATENCIONES_BONO_DIARIO} atenciones $4"
+
+    return "Normal lunes-viernes $3.50"
+
+
+def _excel_estado_cobertura_sesion(
+    aplicado: float,
+    pendiente: float,
+    precio: float,
+    es_ecuasanitas: bool,
+) -> str:
+    if es_ecuasanitas:
+        return "Ecuasanitas"
+    if pendiente <= 0.009:
+        return "Pagada"
+    if aplicado <= 0.009:
+        return "No pagada"
+    if aplicado < precio:
+        return "Parcial"
+    return "Pagada"
+
+
+def _excel_sesiones_sueldo_records(
+    db: Session,
+    current_user: Usuario,
+    desde: date,
+    hasta: date,
+    terapeutaid: Optional[int] = None,
+    consultorioid: Optional[int] = None,
+    dia_semana: Optional[int] = None,
+) -> List[Dict]:
+    """Base única para auditar sesiones, deuda y sueldo del fisio en Excel.
+
+    Usa el terapeuta REAL que atendió cada sesión (`SesionTerapia.terapeutaid`).
+    Los pagos se aplican por FIFO real por paciente + tratamiento, igual que en
+    los reportes de pantalla. Así un pago no se asigna completo al terapeuta que
+    atendió un domingo si el tratamiento también tuvo sesiones con otros fisios.
+    """
+    sesiones = _sesiones_reporte_filtradas(
+        db=db,
+        current_user=current_user,
+        desde=desde,
+        hasta=hasta,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+        dia_semana=dia_semana,
+    )
+
+    cobertura_sesiones = _cobertura_sesiones_filtradas(db, sesiones, hasta)
+    consultorios_map = _obtener_consultorios_map(db)
+
+    atenciones_por_terapeuta_dia: Dict[Tuple[Optional[int], date], int] = defaultdict(int)
+    for sesion in sesiones:
+        if sesion.fecha is not None:
+            atenciones_por_terapeuta_dia[(sesion.terapeutaid, sesion.fecha)] += 1
+
+    records: List[Dict] = []
+    for sesion in sesiones:
+        paciente = sesion.paciente
+        terapeuta = sesion.terapeuta
+        tratamiento = sesion.tratamiento_paciente
+        precio = round(float(_precio_aplicado(tratamiento) or 0.0), 2)
+        es_ecuasanitas = _es_paciente_ecuasanitas(paciente)
+        atenciones_dia = atenciones_por_terapeuta_dia.get((sesion.terapeutaid, sesion.fecha), 0)
+        es_especial_5 = _tratamiento_tarifa_especial_5(tratamiento)
+        tarifa_fisio = round(float(sueldo_fisio_terapia(sesion.fecha, atenciones_dia, es_especial_5)), 2)
+        aplicado, pendiente = cobertura_sesiones.get(
+            int(sesion.id),
+            (0.0, precio),
+        ) if sesion.id is not None else (0.0, precio)
+
+        aplicado = round(float(aplicado or 0.0), 2)
+        pendiente = round(float(pendiente or 0.0), 2)
+
+        # Ecuasanitas no aparece como deuda del paciente dentro del reporte de terapias.
+        if es_ecuasanitas:
+            aplicado = precio
+            pendiente = 0.0
+
+        sueldo_cobrado = tarifa_fisio if pendiente <= 0.009 else 0.0
+        sueldo_pendiente = 0.0 if pendiente <= 0.009 else tarifa_fisio
+        motivo_especial = _excel_motivo_especial_5(tratamiento) if es_especial_5 else ""
+
+        records.append(
+            {
+                "sesion_id": int(sesion.id) if sesion.id is not None else None,
+                "fecha": sesion.fecha,
+                "dia": _excel_dia(sesion.fecha),
+                "paciente": _nombre_paciente(paciente),
+                "cedula": _excel_safe_text(getattr(paciente, "cedula", "")),
+                "fisioterapeuta": _nombre_usuario(terapeuta),
+                "consultorio_atencion": consultorios_map.get(
+                    getattr(terapeuta, "consultorioid", None),
+                    "Sin consultorio",
+                ),
+                "consultorio_paciente": consultorios_map.get(
+                    getattr(paciente, "consultorioid", None),
+                    "Sin consultorio",
+                ),
+                "tratamiento": _excel_safe_text(getattr(tratamiento, "tipotratamiento", "Sin tratamiento")),
+                "tratamiento_id": getattr(tratamiento, "id", None),
+                "hora_ingreso": _excel_hora(sesion.horaingreso),
+                "hora_salida": _excel_hora(sesion.horasalida),
+                "duracion_min": sesion.duracionminutos or 0,
+                "dolor_entrada": sesion.escaladolorentrada,
+                "dolor_salida": sesion.escaladolorsalida,
+                "precio": precio,
+                "ecuasanitas": es_ecuasanitas,
+                "atenciones_dia": int(atenciones_dia or 0),
+                "fin_semana": _es_fin_semana(sesion.fecha),
+                "bono_15": bool(
+                    sesion.fecha
+                    and not _es_fin_semana(sesion.fecha)
+                    and atenciones_dia > UMBRAL_ATENCIONES_BONO_DIARIO
+                ),
+                "especial_5": es_especial_5,
+                "motivo_especial": motivo_especial,
+                "tarifa_fisio": tarifa_fisio,
+                "motivo_tarifa": _excel_motivo_tarifa_fisio(sesion.fecha, atenciones_dia, tratamiento),
+                "pago_aplicado": aplicado,
+                "debe_paciente": pendiente,
+                "estado_cobertura": _excel_estado_cobertura_sesion(aplicado, pendiente, precio, es_ecuasanitas),
+                "sueldo_total": tarifa_fisio,
+                "sueldo_cobrado": round(float(sueldo_cobrado), 2),
+                "sueldo_retenido": round(float(sueldo_pendiente), 2),
+                "ganancia_clinica": round(max(precio - tarifa_fisio, 0.0), 2),
+            }
+        )
+
+    return records
+
+
+def _excel_detalle_sueldos_fisios(
+    db: Session,
+    current_user: Usuario,
+    desde: date,
+    hasta: date,
+    terapeutaid: Optional[int] = None,
+    consultorioid: Optional[int] = None,
+    dia_semana: Optional[int] = None,
+) -> List[List]:
+    records = _excel_sesiones_sueldo_records(
+        db=db,
+        current_user=current_user,
+        desde=desde,
+        hasta=hasta,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+        dia_semana=dia_semana,
+    )
+
+    rows: List[List] = []
+    for item in records:
+        rows.append(
+            [
+                item["fecha"],
+                item["dia"],
+                item["sesion_id"],
+                item["fisioterapeuta"],
+                item["consultorio_atencion"],
+                item["paciente"],
+                item["cedula"],
+                item["tratamiento"],
+                item["tratamiento_id"],
+                item["precio"],
+                item["pago_aplicado"],
+                item["debe_paciente"],
+                item["estado_cobertura"],
+                item["atenciones_dia"],
+                _excel_bool(item["bono_15"]),
+                _excel_bool(item["fin_semana"]),
+                item["tarifa_fisio"],
+                item["motivo_tarifa"],
+                _excel_bool(item["especial_5"]),
+                item["motivo_especial"],
+                item["sueldo_total"],
+                item["sueldo_cobrado"],
+                item["sueldo_retenido"],
+                item["consultorio_paciente"],
+            ]
+        )
+
+    return rows
+
+
 def _excel_base_sesiones(
     db: Session,
     current_user: Usuario,
@@ -3473,64 +4520,48 @@ def _excel_base_sesiones(
     consultorioid: Optional[int] = None,
     dia_semana: Optional[int] = None,
 ) -> List[List]:
-    sesiones_query = (
-        db.query(SesionTerapia)
-        .options(
-            joinedload(SesionTerapia.paciente),
-            joinedload(SesionTerapia.terapeuta),
-            joinedload(SesionTerapia.tratamiento_paciente),
-        )
-        .filter(
-            SesionTerapia.fecha.between(desde, hasta),
-            SesionTerapia.horasalida != None,
-            SesionTerapia.tratamientopacienteid != None,
-        )
-    )
-
-    sesiones_query = _aplicar_filtro_dia_sesion(sesiones_query, dia_semana)
-    sesiones_query = _aplicar_filtros_sesiones(
-        sesiones_query,
-        current_user,
+    records = _excel_sesiones_sueldo_records(
+        db=db,
+        current_user=current_user,
+        desde=desde,
+        hasta=hasta,
         terapeutaid=terapeutaid,
         consultorioid=consultorioid,
+        dia_semana=dia_semana,
     )
 
-    sesiones = sesiones_query.order_by(SesionTerapia.fecha, SesionTerapia.horaingreso).all()
-    consultorios_map = _obtener_consultorios_map(db)
-
     rows: List[List] = []
-    for sesion in sesiones:
-        paciente = sesion.paciente
-        terapeuta = sesion.terapeuta
-        tratamiento = sesion.tratamiento_paciente
-        precio = round(_precio_aplicado(tratamiento), 2)
-        porcentaje_fisio = porcentaje_fisio_terapia_por_fecha(sesion.fecha)
-        porcentaje_clinica = porcentaje_clinica_terapia_por_fecha(sesion.fecha)
-        excel_row_number = len(rows) + 2
-
+    for item in records:
         rows.append(
             [
-                sesion.id,
-                sesion.fecha,
-                _excel_dia(sesion.fecha),
-                _nombre_paciente(paciente),
-                _excel_safe_text(getattr(paciente, "cedula", "")),
-                _nombre_usuario(terapeuta),
-                consultorios_map.get(getattr(terapeuta, "consultorioid", None), "Sin consultorio"),
-                consultorios_map.get(getattr(paciente, "consultorioid", None), "Sin consultorio"),
-                _excel_safe_text(getattr(tratamiento, "tipotratamiento", "Sin tratamiento")),
-                getattr(tratamiento, "id", None),
-                _excel_hora(sesion.horaingreso),
-                _excel_hora(sesion.horasalida),
-                sesion.duracionminutos or 0,
-                sesion.escaladolorentrada,
-                sesion.escaladolorsalida,
-                precio,
-                _excel_bool(_es_paciente_ecuasanitas(paciente)),
-                porcentaje_fisio,
-                porcentaje_clinica,
-                f"=ROUND(P{excel_row_number}*R{excel_row_number},2)",
-                f"=ROUND(P{excel_row_number}*S{excel_row_number},2)",
+                item["sesion_id"],
+                item["fecha"],
+                item["dia"],
+                item["paciente"],
+                item["cedula"],
+                item["fisioterapeuta"],
+                item["consultorio_atencion"],
+                item["consultorio_paciente"],
+                item["tratamiento"],
+                item["tratamiento_id"],
+                item["hora_ingreso"],
+                item["hora_salida"],
+                item["duracion_min"],
+                item["dolor_entrada"],
+                item["dolor_salida"],
+                item["precio"],
+                _excel_bool(item["ecuasanitas"]),
+                item["pago_aplicado"],
+                item["debe_paciente"],
+                item["estado_cobertura"],
+                item["tarifa_fisio"],
+                item["motivo_tarifa"],
+                _excel_bool(item["especial_5"]),
+                item["motivo_especial"],
+                item["sueldo_total"],
+                item["sueldo_cobrado"],
+                item["sueldo_retenido"],
+                item["ganancia_clinica"],
             ]
         )
 
@@ -3570,42 +4601,15 @@ def _excel_base_pagos(
         if p.tratamientopacienteid is not None
     }
 
-    # Para pagos de terapias, si el tratamiento tuvo sesiones dentro del
-    # rango y dentro del alcance del rol, mostramos la clínica/fisio OPERATIVOS
-    # de esas sesiones. Esto evita que un secretario de Atahualpa vea
-    # "Centro Principal" solo porque el paciente compartido fue creado allí.
-    pago_operativo_por_tratamiento: Dict[int, Tuple[str, str]] = {}
-    if tratamiento_ids_pagos:
-        sesiones_pago_query = (
-            db.query(SesionTerapia)
-            .options(joinedload(SesionTerapia.terapeuta))
-            .filter(
-                SesionTerapia.tratamientopacienteid.in_(tratamiento_ids_pagos),
-                SesionTerapia.fecha.between(desde, hasta),
-                SesionTerapia.horasalida != None,
-            )
-        )
-        sesiones_pago_query = _aplicar_filtros_sesiones(
-            sesiones_pago_query,
-            current_user,
-            terapeutaid=terapeutaid,
-            consultorioid=consultorioid,
-        )
-        for sesion_ref in sesiones_pago_query.order_by(
-            SesionTerapia.fecha,
-            SesionTerapia.horaingreso,
-            SesionTerapia.id,
-        ).all():
-            if sesion_ref.tratamientopacienteid in pago_operativo_por_tratamiento:
-                continue
-            terapeuta_ref = sesion_ref.terapeuta
-            pago_operativo_por_tratamiento[sesion_ref.tratamientopacienteid] = (
-                _nombre_usuario(terapeuta_ref),
-                consultorios_map.get(
-                    getattr(terapeuta_ref, "consultorioid", None),
-                    "Sin consultorio",
-                ),
-            )
+    # Importante:
+    # Los pagos de un tratamiento NO se asignan a un fisioterapeuta operativo
+    # tomando la primera sesión del rango. Ese era el origen del error donde,
+    # si un paciente se atendía un domingo con otro terapeuta, todos los pagos
+    # del tratamiento aparecían a nombre de ese terapeuta.
+    #
+    # Base_Pagos muestra el terapeuta encargado/asignado del paciente. La
+    # distribución real por sesión atendida se audita en la hoja
+    # "Sueldos_Fisios", donde cada pago se aplica por FIFO a la sesión real.
 
     tratamiento_map = _excel_map_tratamientos(
         db,
@@ -3666,10 +4670,6 @@ def _excel_base_pagos(
         terapeuta = usuarios_map.get(getattr(paciente, "terapeutaasignadoid", None))
         responsable_pago = _nombre_usuario(terapeuta)
         consultorio_pago = consultorios_map.get(getattr(paciente, "consultorioid", None), "Sin consultorio")
-
-        operativo = pago_operativo_por_tratamiento.get(pago.tratamientopacienteid)
-        if operativo is not None:
-            responsable_pago, consultorio_pago = operativo
 
         referencia = _excel_safe_text(getattr(tratamiento, "tipotratamiento", "Terapia"))
         observacion = _excel_safe_text(pago.observacionpagoprevio or pago.motivo_rechazo or pago.motivo_anulacion)
@@ -3814,7 +4814,7 @@ def _excel_aplicar_estilo_workbook(wb) -> None:
         for row in ws.iter_rows():
             for cell in row:
                 header = str(ws.cell(row=1, column=cell.column).value or "").lower()
-                if any(word in header for word in ["monto", "total", "generado", "pagado", "pendiente", "ganancia", "caja", "ecuasanitas", "precio", "saldo"]):
+                if any(word in header for word in ["monto", "total", "generado", "pagado", "pendiente", "ganancia", "caja", "ecuasanitas", "precio", "saldo", "tarifa", "sueldo", "debe", "retenido"]):
                     cell.number_format = '$#,##0.00;[Red]-$#,##0.00'
                 if "porcentaje" in header:
                     cell.number_format = "0%"
@@ -3898,6 +4898,10 @@ def _excel_agregar_tabla(ws, start_row: int, start_col: int, headers: List[str],
         "ecuasanitas",
         "precio",
         "saldo",
+        "tarifa",
+        "sueldo",
+        "debe",
+        "retenido",
     ]
     integer_words = ["sesiones", "duración", "dolor"]
 
@@ -4114,19 +5118,19 @@ def _excel_configurar_panel_filtros_dashboard(ws, rangos: Dict[str, str], desde:
         ),
         "ganancia_fisio": _excel_formula_sum_sesiones("Ganancia fisio"),
         "ganancia_clinica": _excel_formula_sum_sesiones("Ganancia clínica"),
+        "pendiente": _excel_formula_sum_sesiones("Debe paciente"),
     }
-    formulas["pendiente"] = "=MAX(G5-D9-G9,0)"
 
     _excel_colocar_kpi(ws, "D4", "Sesiones filtradas", formulas["sesiones"], "Según clínica, fisio y día")
     _excel_colocar_kpi(ws, "G4", "Generado terapias", formulas["generado"], "Valor producido")
     _excel_colocar_kpi(ws, "D8", "Pagado caja", formulas["pagado"], "Cobros verificados")
     _excel_colocar_kpi(ws, "G8", "Ecuasanitas", formulas["ecuasanitas"], "Convenio terapias")
-    _excel_colocar_kpi(ws, "D12", "Ganancia fisio", formulas["ganancia_fisio"], "35% Lun-Vie / 40% Sáb-Dom")
-    _excel_colocar_kpi(ws, "G12", "Ganancia clínica", formulas["ganancia_clinica"], "65% Lun-Vie / 60% Sáb-Dom")
+    _excel_colocar_kpi(ws, "D12", "Sueldo fisio", formulas["ganancia_fisio"], "$3.50 / $4.00 / $5.00 según regla")
+    _excel_colocar_kpi(ws, "G12", "Ganancia clínica", formulas["ganancia_clinica"], "Precio sesión - sueldo fisio")
 
-    ws["A13"] = "Pendiente estimado"
+    ws["A13"] = "Pacientes deben"
     ws["B13"] = formulas["pendiente"]
-    ws["C13"] = "Generado - Pagado - Ecuasanitas"
+    ws["C13"] = "Suma real por sesión no cubierta"
     ws["A13"].font = Font(bold=True, color="12355B")
     ws["B13"].font = Font(bold=True, color="12355B", size=14)
     ws["B13"].fill = PatternFill("solid", fgColor=verde)
@@ -4340,7 +5344,7 @@ def _excel_crear_vistas_filtradas(
             cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
     def aplicar_formatos(ws, headers: List[str], start_row: int, end_row: int) -> None:
-        currency_words = ["monto", "total", "generado", "pagado", "pendiente", "ganancia", "caja", "ecuasanitas", "precio", "saldo"]
+        currency_words = ["monto", "total", "generado", "pagado", "pendiente", "ganancia", "caja", "ecuasanitas", "precio", "saldo", "tarifa", "sueldo", "debe", "retenido"]
         integer_words = ["sesiones", "duración", "dolor"]
         for idx, header in enumerate(headers, start=1):
             lower = header.lower()
@@ -4466,6 +5470,15 @@ def _crear_excel_reporte_corpofit(
         consultorioid=consultorioid,
         dia_semana=dia_semana,
     )
+    detalle_sueldos = _excel_detalle_sueldos_fisios(
+        db=db,
+        current_user=current_user,
+        desde=desde,
+        hasta=hasta,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+        dia_semana=dia_semana,
+    )
 
     wb = Workbook()
     # Forzar recálculo al abrir, porque el panel usa fórmulas vinculadas a tablas.
@@ -4481,6 +5494,7 @@ def _crear_excel_reporte_corpofit(
     ws_analisis = wb.create_sheet("Análisis")
     ws_sesiones = wb.create_sheet("Base_Sesiones")
     ws_pagos = wb.create_sheet("Base_Pagos")
+    ws_sueldos = wb.create_sheet("Sueldos_Fisios")
 
     subtitulo = (
         f"Periodo semanal completo: {desde.strftime('%d/%m/%Y')} - {hasta.strftime('%d/%m/%Y')} | "
@@ -4499,11 +5513,28 @@ def _crear_excel_reporte_corpofit(
         "Generado terapias",
         "Pagado caja",
         "Ecuasanitas",
-        "Pendiente estimado",
+        "Pendiente pacientes",
+        "Sueldo fisio total",
+        "Sueldo fisio cobrado",
+        "Sueldo fisio retenido",
     ]
+    sueldo_dia_map: Dict[date, Dict[str, float]] = defaultdict(lambda: {
+        "pendiente_pacientes": 0.0,
+        "sueldo_total": 0.0,
+        "sueldo_cobrado": 0.0,
+        "sueldo_retenido": 0.0,
+    })
+    for row in detalle_sueldos:
+        fecha_row = row[0]
+        if isinstance(fecha_row, date):
+            sueldo_dia_map[fecha_row]["pendiente_pacientes"] += float(row[11] or 0.0)
+            sueldo_dia_map[fecha_row]["sueldo_total"] += float(row[20] or 0.0)
+            sueldo_dia_map[fecha_row]["sueldo_cobrado"] += float(row[21] or 0.0)
+            sueldo_dia_map[fecha_row]["sueldo_retenido"] += float(row[22] or 0.0)
+
     daily_rows = []
     for item in general.sesiones_por_dia:
-        excel_row = len(daily_rows) + current_row + 1
+        sueldo_item = sueldo_dia_map.get(item.fecha, {})
         daily_rows.append(
             [
                 item.fecha,
@@ -4512,7 +5543,10 @@ def _crear_excel_reporte_corpofit(
                 item.total_generado,
                 item.pagos_verificados,
                 item.cubierto_ecuasanitas,
-                f"=MAX(D{excel_row}-E{excel_row}-F{excel_row},0)",
+                round(float(sueldo_item.get("pendiente_pacientes", 0.0)), 2),
+                round(float(sueldo_item.get("sueldo_total", 0.0)), 2),
+                round(float(sueldo_item.get("sueldo_cobrado", 0.0)), 2),
+                round(float(sueldo_item.get("sueldo_retenido", 0.0)), 2),
             ]
         )
     daily_table_start = current_row
@@ -4610,9 +5644,16 @@ def _crear_excel_reporte_corpofit(
         "Dolor salida",
         "Precio sesión",
         "Ecuasanitas",
-        "Porcentaje fisio",
-        "Porcentaje clínica",
+        "Pago aplicado",
+        "Debe paciente",
+        "Estado pago sesión",
+        "Tarifa fisio",
+        "Motivo tarifa",
+        "Especial $5",
+        "Motivo especial",
         "Ganancia fisio",
+        "Sueldo fisio cobrado",
+        "Sueldo fisio retenido",
         "Ganancia clínica",
     ]
     _excel_agregar_tabla(ws_sesiones, 1, 1, sesiones_headers, base_sesiones, "tblBaseSesiones")
@@ -4642,6 +5683,36 @@ def _crear_excel_reporte_corpofit(
     _excel_agregar_tabla(ws_pagos, 1, 1, pagos_headers, base_pagos, "tblBasePagos")
     ws_pagos.freeze_panes = "A2"
 
+    # Detalle auditable de sueldos por sesión y terapeuta real que atendió.
+    sueldos_headers = [
+        "Fecha",
+        "Día",
+        "ID Sesión",
+        "Fisioterapeuta que atendió",
+        "Clínica atención",
+        "Paciente",
+        "Cédula",
+        "Tratamiento",
+        "Tratamiento ID",
+        "Precio sesión",
+        "Pago aplicado a sesión",
+        "Debe paciente",
+        "Estado pago sesión",
+        "Atenciones fisio ese día",
+        "Bono +15",
+        "Fin de semana",
+        "Tarifa fisio",
+        "Motivo tarifa",
+        "Especial $5",
+        "Motivo especial",
+        "Sueldo total sesión",
+        "Sueldo cobrado",
+        "Sueldo retenido",
+        "Clínica paciente",
+    ]
+    _excel_agregar_tabla(ws_sueldos, 1, 1, sueldos_headers, detalle_sueldos, "tblSueldosFisios")
+    ws_sueldos.freeze_panes = "A2"
+
     # Panel central de filtros: una sola cajita controla KPIs y gráficas.
     rangos_filtros = _excel_crear_listas_filtros(wb, base_sesiones, base_pagos)
     _excel_escribir_titulo(ws_dashboard, "CORPOFIT PRO — REPORTE EXCEL", subtitulo)
@@ -4653,7 +5724,7 @@ def _crear_excel_reporte_corpofit(
     _excel_crear_graficas_dashboard(ws_dashboard, base_pagos)
 
     # Formatos y estilo visual.
-    for ws in [ws_dashboard, ws_analisis, ws_sesiones, ws_pagos]:
+    for ws in [ws_dashboard, ws_analisis, ws_sesiones, ws_pagos, ws_sueldos]:
         ws.freeze_panes = ws.freeze_panes or "A4"
         for row in ws.iter_rows():
             for cell in row:
@@ -4661,7 +5732,7 @@ def _crear_excel_reporte_corpofit(
 
     _excel_aplicar_estilo_workbook(wb)
 
-    for ws in [ws_analisis, ws_sesiones, ws_pagos]:
+    for ws in [ws_analisis, ws_sesiones, ws_pagos, ws_sueldos]:
         for row in ws.iter_rows(min_row=2):
             for cell in row:
                 header = str(ws.cell(row=1, column=cell.column).value or "").lower()
@@ -4675,7 +5746,7 @@ def _crear_excel_reporte_corpofit(
                     cell.number_format = "dd/mm/yyyy"
 
     # Ajuste final de formatos por columnas conocidas.
-    for ws in [ws_dashboard, ws_analisis, ws_sesiones, ws_pagos]:
+    for ws in [ws_dashboard, ws_analisis, ws_sesiones, ws_pagos, ws_sueldos]:
         for row in ws.iter_rows():
             for cell in row:
                 if isinstance(cell.value, date):
@@ -4684,7 +5755,7 @@ def _crear_excel_reporte_corpofit(
                     # La mayoría de valores monetarios están a partir de la columna D.
                     header_values = [str(ws.cell(row=r, column=cell.column).value or "").lower() for r in range(1, min(cell.row, 6) + 1)]
                     if any(
-                        any(word in header for word in ["monto", "total", "generado", "pagado", "pendiente", "ganancia", "caja", "precio", "ecuasanitas"])
+                        any(word in header for word in ["monto", "total", "generado", "pagado", "pendiente", "ganancia", "caja", "precio", "ecuasanitas", "tarifa", "sueldo", "debe", "retenido"])
                         for header in header_values
                     ):
                         cell.number_format = '$#,##0.00;[Red]-$#,##0.00'

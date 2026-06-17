@@ -32,6 +32,7 @@ class TratamientoPaciente(Base):
     precio_sesion_aplicado = Column(Numeric(10, 2), nullable=True)
     sesiones_estimadas = Column(Integer, nullable=True)
     motivo_precio_especial = Column(String(255), nullable=True)
+    multiple_extremidad = Column(Boolean, default=False, nullable=False)
 
     fechainicio = Column(Date, nullable=False)
     fechafin = Column(Date, nullable=True)

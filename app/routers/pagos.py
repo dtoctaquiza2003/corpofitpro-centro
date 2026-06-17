@@ -1,10 +1,11 @@
 from collections import defaultdict
+from datetime import date
 import json
 from types import SimpleNamespace
 from typing import List, Optional
 
 from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, UploadFile, status, Query
-from sqlalchemy import and_, case, exists, func, or_
+from sqlalchemy import Date, and_, case, cast, exists, func, or_
 from sqlalchemy.orm import Session, aliased, joinedload
 
 from app.schemas.pago import (
@@ -19,6 +20,9 @@ from app.schemas.pago import (
     PagoOut,
     PagoSimpleOut,
     PagoAnularRequest,
+    SesionPendienteTerapeutaOut,
+    PacienteDeudaTerapeutaOut,
+    ResumenDeudasTerapeutaOut,
 )
 
 from ..auth.dependencies import get_current_secretary, get_current_user
@@ -62,6 +66,13 @@ def _estado_pago_por_metodo(metodo: str) -> int:
     if _es_transferencia(metodo):
         return 1  # Pendiente
     return 2  # Verificado
+
+
+def _fecha_caja_pago_expr():
+    return func.coalesce(
+        Pago.fechapagoreal,
+        cast(func.timezone("America/Guayaquil", Pago.fechapago), Date),
+    )
 
 
 def _estado_cuenta(total_generado: float, pagado: float, saldo: float) -> str:
@@ -810,6 +821,360 @@ def listar_pagos(
         .all()
     )
 
+
+
+# ============================================================
+# DEUDAS PARA TERAPEUTAS
+# ============================================================
+
+def _paciente_es_ecuasanitas(paciente: Paciente) -> bool:
+    tipo_seguro = (getattr(paciente, "tiposeguro", None) or "").strip().lower()
+    return bool(getattr(paciente, "esecuasanitas", False)) or "ecuasanitas" in tipo_seguro
+
+
+def _tratamiento_es_ecuasanitas(tratamiento: TratamientoPaciente) -> bool:
+    tipo = (getattr(tratamiento, "tipotratamiento", None) or "").strip().lower()
+    tipo_terapia = getattr(tratamiento, "tipo_terapia", None)
+    nombre_catalogo = (getattr(tipo_terapia, "nombre", None) or "").strip().lower()
+    return "ecuasanitas" in tipo or "ecuasanitas" in nombre_catalogo
+
+
+def _pago_valido_para_cobertura(pago: Pago) -> bool:
+    return (
+        pago.estadopago == 2
+        and not bool(getattr(pago, "anulado", False))
+        and not bool(getattr(pago, "esrecuperacioncartera", False))
+    )
+
+
+def _nombre_usuario(usuario: Usuario | None) -> str:
+    if not usuario:
+        return "Fisioterapeuta"
+    return f"{usuario.nombres or ''} {usuario.apellidos or ''}".strip() or "Fisioterapeuta"
+
+
+def _nombre_paciente(paciente: Paciente) -> str:
+    return f"{paciente.nombres or ''} {paciente.apellidos or ''}".strip() or "Paciente"
+
+
+@router.get(
+    "/mis-pacientes-deuda",
+    response_model=ResumenDeudasTerapeutaOut,
+)
+def listar_mis_pacientes_con_deuda(
+    buscar: Optional[str] = Query(default=None),
+    terapeutaid: Optional[int] = Query(default=None),
+    desde: Optional[date] = Query(default=None),
+    hasta: Optional[date] = Query(default=None),
+    modo: str = Query(default="acumulada"),
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(get_current_user),
+):
+    """
+    Deuda real por sesiones realizadas por un fisioterapeuta.
+
+    Regla contable:
+    - Los pagos solo cubren sesiones del mismo paciente y tratamiento.
+    - Se consumen FIFO: sesiones antiguas primero.
+    - modo=acumulada: muestra TODAS las sesiones pendientes del fisioterapeuta
+      hasta la fecha de corte `hasta`, aunque el paciente no haya venido en la semana.
+    - modo=periodo: muestra solo sesiones pendientes dentro de `desde`/`hasta`.
+    - Los pacientes Ecuasanitas se incluyen como deuda normal del paciente
+      cuando el copago no está pagado.
+    """
+    if current_user.rol == 2:
+        terapeuta_objetivo = current_user
+    elif current_user.rol in (1, 3):
+        if terapeutaid is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Debes indicar el fisioterapeuta.",
+            )
+
+        terapeuta_objetivo = (
+            db.query(Usuario)
+            .filter(
+                Usuario.id == terapeutaid,
+                Usuario.rol == 2,
+                Usuario.activo == True,
+            )
+            .first()
+        )
+
+        if not terapeuta_objetivo:
+            raise HTTPException(
+                status_code=404,
+                detail="Fisioterapeuta no encontrado.",
+            )
+
+        if current_user.rol == 1:
+            validar_consultorio_secretario(
+                current_user,
+                current_user.consultorioid,
+            )
+            if terapeuta_objetivo.consultorioid != current_user.consultorioid:
+                raise HTTPException(
+                    status_code=403,
+                    detail="No puedes consultar fisioterapeutas de otra clínica.",
+                )
+    else:
+        raise HTTPException(status_code=403, detail="No autorizado")
+
+    if desde is not None and hasta is not None and desde > hasta:
+        raise HTTPException(
+            status_code=400,
+            detail="La fecha desde no puede ser mayor que la fecha hasta.",
+        )
+
+    modo_normalizado = (modo or "acumulada").strip().lower()
+    if modo_normalizado not in {"acumulada", "periodo"}:
+        modo_normalizado = "acumulada"
+
+    # 1) Definir qué tratamientos entran al análisis.
+    # Para deuda acumulada NO se usa `desde` como filtro base, porque eso
+    # oculta pacientes que deben desde semanas anteriores y no vinieron esta semana.
+    # Solo se usa `hasta` como fecha de corte.
+    tratamientos_query = db.query(SesionTerapia.tratamientopacienteid).filter(
+        SesionTerapia.terapeutaid == terapeuta_objetivo.id,
+        SesionTerapia.horasalida != None,
+        SesionTerapia.tratamientopacienteid != None,
+    )
+
+    if hasta is not None:
+        tratamientos_query = tratamientos_query.filter(SesionTerapia.fecha <= hasta)
+
+    tratamiento_ids_rows = tratamientos_query.distinct().all()
+    tratamiento_ids = [row[0] for row in tratamiento_ids_rows if row[0] is not None]
+
+    if not tratamiento_ids:
+        return ResumenDeudasTerapeutaOut(
+            terapeutaid=terapeuta_objetivo.id,
+            terapeuta=_nombre_usuario(terapeuta_objetivo),
+            total_deuda=0,
+            pacientes_con_deuda=0,
+            tratamientos_con_deuda=0,
+            sesiones_pendientes=0,
+            items=[],
+        )
+
+    tratamientos_rows = (
+        db.query(TratamientoPaciente, Paciente)
+        .options(joinedload(TratamientoPaciente.tipo_terapia))
+        .join(Paciente, Paciente.id == TratamientoPaciente.pacienteid)
+        .filter(TratamientoPaciente.id.in_(tratamiento_ids))
+        .all()
+    )
+
+    tratamiento_map = {
+        tratamiento.id: (tratamiento, paciente)
+        for tratamiento, paciente in tratamientos_rows
+    }
+
+    # 2) Traer todas las sesiones históricas de esos tratamientos hasta `hasta`.
+    # Esto permite consumir pagos FIFO sin mezclar pacientes ni tratamientos.
+    sesiones_query = db.query(SesionTerapia).filter(
+        SesionTerapia.tratamientopacienteid.in_(tratamiento_ids),
+        SesionTerapia.horasalida != None,
+    )
+
+    if hasta is not None:
+        sesiones_query = sesiones_query.filter(SesionTerapia.fecha <= hasta)
+
+    sesiones = (
+        sesiones_query.order_by(
+            SesionTerapia.tratamientopacienteid.asc(),
+            SesionTerapia.pacienteid.asc(),
+            SesionTerapia.fecha.asc(),
+            SesionTerapia.horaingreso.asc(),
+            SesionTerapia.id.asc(),
+        ).all()
+    )
+
+    # 3) Pagos válidos hasta `hasta` si existe. Si no hay hasta, toma histórico.
+    pagos_query = db.query(Pago).filter(
+        Pago.tratamientopacienteid.in_(tratamiento_ids),
+        Pago.estadopago == 2,
+        or_(Pago.anulado == False, Pago.anulado.is_(None)),
+        or_(
+            Pago.esrecuperacioncartera == False,
+            Pago.esrecuperacioncartera.is_(None),
+        ),
+    )
+
+    if hasta is not None:
+        # fechapagoreal es DATE; fechapago es timestamp. Comparamos ambas de forma segura.
+        pagos_query = pagos_query.filter(
+            or_(
+                and_(Pago.fechapagoreal != None, Pago.fechapagoreal <= hasta),
+                and_(Pago.fechapagoreal == None, _fecha_caja_pago_expr() <= hasta),
+            )
+        )
+
+    pagos = (
+        pagos_query.order_by(
+            Pago.tratamientopacienteid.asc(),
+            Pago.pacienteid.asc(),
+            Pago.fechapagoreal.asc().nulls_last(),
+            Pago.fechapago.asc(),
+            Pago.id.asc(),
+        ).all()
+    )
+
+    pagos_por_destino: dict[tuple[int, int], list[dict[str, float]]] = defaultdict(list)
+
+    for pago in pagos:
+        if not _pago_valido_para_cobertura(pago):
+            continue
+        if pago.tratamientopacienteid is None:
+            continue
+        pagos_por_destino[(pago.pacienteid, pago.tratamientopacienteid)].append(
+            {"restante": float(pago.monto or 0)}
+        )
+
+    grupos: dict[tuple[int, int], dict] = {}
+    texto_busqueda = (buscar or "").strip().lower()
+
+    for sesion in sesiones:
+        if sesion.tratamientopacienteid not in tratamiento_map:
+            continue
+
+        tratamiento, paciente = tratamiento_map[sesion.tratamientopacienteid]
+
+        # Paciente Ecuasanitas también cuenta como deuda del paciente
+        # cuando el copago/valor de la sesión no está pagado.
+
+        precio = (
+            float(tratamiento.precio_sesion_aplicado)
+            if tratamiento.precio_sesion_aplicado is not None
+            else 0.0
+        )
+
+        restante_sesion = precio
+        cubierto = 0.0
+        pagos_fifo = pagos_por_destino.get((paciente.id, tratamiento.id), [])
+
+        for pago_fifo in pagos_fifo:
+            if restante_sesion <= 0:
+                break
+            if pago_fifo["restante"] <= 0:
+                continue
+
+            aplicado = min(restante_sesion, pago_fifo["restante"])
+            pago_fifo["restante"] -= aplicado
+            restante_sesion -= aplicado
+            cubierto += aplicado
+
+        pendiente = round(max(restante_sesion, 0.0), 2)
+
+        # Luego de consumir pagos, solo se muestra la deuda de sesiones realizadas
+        # por el terapeuta seleccionado. En modo periodo se limita la lista al rango;
+        # en modo acumulada se muestran todas las pendientes hasta `hasta`.
+        if sesion.terapeutaid != terapeuta_objetivo.id or pendiente <= 0:
+            continue
+
+        if modo_normalizado == "periodo":
+            if desde is not None and sesion.fecha < desde:
+                continue
+            if hasta is not None and sesion.fecha > hasta:
+                continue
+
+        paciente_nombre = _nombre_paciente(paciente)
+        tratamiento_nombre = tratamiento.tipotratamiento or "Tratamiento"
+        tipo_terapia = (
+            tratamiento.tipo_terapia.nombre
+            if getattr(tratamiento, "tipo_terapia", None)
+            else None
+        )
+
+        if texto_busqueda:
+            texto_item = " ".join(
+                [
+                    paciente_nombre,
+                    paciente.cedula or "",
+                    tratamiento_nombre,
+                    tipo_terapia or "",
+                ]
+            ).lower()
+            if texto_busqueda not in texto_item:
+                continue
+
+        key = (paciente.id, tratamiento.id)
+
+        if key not in grupos:
+            grupos[key] = {
+                "pacienteid": paciente.id,
+                "paciente": paciente_nombre,
+                "cedula": paciente.cedula,
+                "tratamientopacienteid": tratamiento.id,
+                "tratamiento": tratamiento_nombre,
+                "tipo_terapia": tipo_terapia,
+                "terapeutaid": terapeuta_objetivo.id,
+                "terapeuta": _nombre_usuario(terapeuta_objetivo),
+                "precio_sesion": round(precio, 2),
+                "sesiones": [],
+                "total_deuda": 0.0,
+            }
+
+        grupos[key]["sesiones"].append(
+            SesionPendienteTerapeutaOut(
+                sesionid=sesion.id,
+                fecha=sesion.fecha,
+                horaingreso=(
+                    sesion.horaingreso.strftime("%H:%M")
+                    if sesion.horaingreso is not None
+                    else None
+                ),
+                valor_sesion=round(precio, 2),
+                cubierto=round(cubierto, 2),
+                pendiente=pendiente,
+            )
+        )
+        grupos[key]["total_deuda"] += pendiente
+
+    items: list[PacienteDeudaTerapeutaOut] = []
+
+    for data in grupos.values():
+        sesiones_pendientes = data["sesiones"]
+        total_deuda = round(float(data["total_deuda"] or 0), 2)
+
+        if total_deuda <= 0 or not sesiones_pendientes:
+            continue
+
+        fecha_ultima = max(s.fecha for s in sesiones_pendientes)
+
+        items.append(
+            PacienteDeudaTerapeutaOut(
+                pacienteid=data["pacienteid"],
+                paciente=data["paciente"],
+                cedula=data["cedula"],
+                tratamientopacienteid=data["tratamientopacienteid"],
+                tratamiento=data["tratamiento"],
+                tipo_terapia=data["tipo_terapia"],
+                terapeutaid=data["terapeutaid"],
+                terapeuta=data["terapeuta"],
+                precio_sesion=data["precio_sesion"],
+                sesiones_pendientes=len(sesiones_pendientes),
+                total_deuda=total_deuda,
+                fecha_ultima_pendiente=fecha_ultima,
+                sesiones=sesiones_pendientes,
+            )
+        )
+
+    items.sort(key=lambda item: (item.paciente.lower(), item.tratamiento.lower()))
+
+    total_deuda = round(sum(item.total_deuda for item in items), 2)
+    pacientes_con_deuda = len({item.pacienteid for item in items})
+    sesiones_pendientes = sum(item.sesiones_pendientes for item in items)
+
+    return ResumenDeudasTerapeutaOut(
+        terapeutaid=terapeuta_objetivo.id,
+        terapeuta=_nombre_usuario(terapeuta_objetivo),
+        total_deuda=total_deuda,
+        pacientes_con_deuda=pacientes_con_deuda,
+        tratamientos_con_deuda=len(items),
+        sesiones_pendientes=sesiones_pendientes,
+        items=items,
+    )
 
 # ============================================================
 # CUENTAS POR PAQUETE - SISTEMA ANTERIOR

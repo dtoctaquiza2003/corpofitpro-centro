@@ -165,6 +165,15 @@ class CajaSemanalDetalleOut(BaseModel):
     total_caja: float = 0
     total_pagos: int = 0
     total_sesiones_pagadas: float = 0
+
+    # Desglose para cuadre de caja.
+    total_efectivo: float = 0
+    total_transferencia: float = 0
+    total_tarjeta: float = 0
+    total_otros_metodos: float = 0
+    transferencias_pendientes_total: float = 0
+    transferencias_pendientes_cantidad: int = 0
+
     pagos: List[CajaSemanalPagoOut] = Field(default_factory=list)
 
 
@@ -219,6 +228,9 @@ class ReporteDiaOut(BaseModel):
     sesiones: int = 0
     total_generado: float = 0
     pagos_verificados: float = 0
+    pagos_efectivo: float = 0
+    pagos_transferencia: float = 0
+    pagos_tarjeta: float = 0
     cubierto_ecuasanitas: float = 0
 
 
@@ -228,6 +240,14 @@ class TerapiasReporteOut(BaseModel):
     total_sesiones: int = 0
     total_generado: float = 0
     total_pagado_verificado: float = 0
+
+    # Desglose de caja real para cuadre.
+    total_efectivo: float = 0
+    total_transferencia: float = 0
+    total_tarjeta: float = 0
+    total_otros_metodos: float = 0
+    transferencias_pendientes_total: float = 0
+    transferencias_pendientes_cantidad: int = 0
     # Pago previo / saldo inicial: no entra al cuadre de caja del rango.
     total_pago_previo_verificado: float = 0
     total_ecuasanitas: float = 0
@@ -291,10 +311,29 @@ class FisioDetallePacienteOut(BaseModel):
     pagado_paciente: float = 0
     pendiente_paciente: float = 0
     es_ecuasanitas: bool = False
+    multiple_extremidad: bool = False
+    sesiones_multiple_extremidad: int = 0
     cubierto_ecuasanitas: float = 0
     ganancia_fisio: float = 0
     ganancia_cobrada: float = 0
     ganancia_pendiente: float = 0
+
+
+class FisioDetalleDiaSueldoOut(BaseModel):
+    fecha: date
+    dia_semana: int
+    atenciones: int = 0
+    tarifa: float = 0
+    total_sueldo: float = 0
+    sueldo_cobrado: float = 0
+    sueldo_pendiente: float = 0
+    sesiones_pagadas: int = 0
+    sesiones_pendientes_pago: int = 0
+    monto_pendiente_pacientes: float = 0
+    es_bono_productividad: bool = False
+    es_fin_semana: bool = False
+    atenciones_multiple_extremidad: int = 0
+    motivo: str = ""
 
 
 class FisioDetalleOut(BaseModel):
@@ -303,6 +342,7 @@ class FisioDetalleOut(BaseModel):
     desde: date
     hasta: date
     pacientes: List[FisioDetallePacienteOut] = Field(default_factory=list)
+    dias_sueldo: List[FisioDetalleDiaSueldoOut] = Field(default_factory=list)
 
 
 # -----------------------------------------------------------------------------
