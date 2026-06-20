@@ -484,7 +484,7 @@ def crear_permiso_temporal(
     dias_atras_permitidos = data.dias_atras_permitidos
 
     if data.tipo_permiso == TIPO_REGISTRO_RETROACTIVO:
-        hoy_ecuador = now_ecuador().date()
+        hoy_ecuador = to_ecuador(now_utc()).date()
 
         # Semana CORPOFIT: domingo a sábado.
         # date.weekday(): lunes=0, ..., domingo=6.
