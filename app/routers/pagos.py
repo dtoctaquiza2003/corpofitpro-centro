@@ -2606,7 +2606,11 @@ async def registrar_transferencia_grupal(
     if not isinstance(raw_items, list) or len(raw_items) < 2:
         raise HTTPException(
             status_code=400,
-            detail="Agregue al menos 2 pacientes para registrar un pago grupal.",
+            detail=(
+                "Agregue al menos 2 destinos para registrar una transferencia "
+                "múltiple. Puede ser terapia + gimnasio del mismo paciente, "
+                "o varios pacientes."
+            ),
         )
 
     items: list[dict] = []
@@ -2616,7 +2620,7 @@ async def registrar_transferencia_grupal(
         if not isinstance(item, dict):
             raise HTTPException(
                 status_code=400,
-                detail=f"El detalle #{index} del pago grupal no es válido.",
+                detail=f"El destino #{index} de la transferencia no es válido.",
             )
 
         try:
@@ -2625,7 +2629,7 @@ async def registrar_transferencia_grupal(
         except (TypeError, ValueError):
             raise HTTPException(
                 status_code=400,
-                detail=f"Revise paciente y monto del detalle #{index}.",
+                detail=f"Revise paciente y monto del destino #{index}.",
             )
 
         tratamientopacienteid = item.get("tratamientopacienteid")
@@ -2639,7 +2643,7 @@ async def registrar_transferencia_grupal(
         if monto <= 0:
             raise HTTPException(
                 status_code=400,
-                detail=f"El monto del detalle #{index} debe ser mayor a 0.",
+                detail=f"El monto del destino #{index} debe ser mayor a 0.",
             )
 
         _validar_destino_pago(
@@ -2668,6 +2672,11 @@ async def registrar_transferencia_grupal(
             tratamientopacienteid=tratamientopacienteid,
         )
 
+        # Nota: en terapias NO se valida contra saldo generado, porque el
+        # paciente puede dejar un abono anticipado para una terapia futura que
+        # todavía no tiene sesión registrada. Ese pago entra a caja cuando se
+        # verifica la transferencia y luego queda como saldo a favor del
+        # tratamiento hasta que se registre la atención.
         membresia_gimnasio = _validar_membresia_gimnasio(
             db=db,
             pacienteid=pacienteid,
@@ -2759,6 +2768,12 @@ async def registrar_transferencia_grupal(
                 tratamientopacienteid=item["tratamientopacienteid"],
             )
 
+            _validar_membresia_gimnasio(
+                db=db,
+                pacienteid=item["pacienteid"],
+                membresiagimnasioid=item["membresiagimnasioid"],
+            )
+
             pago = Pago(
                 pacienteid=item["pacienteid"],
                 pacientepaqueteid=item["pacientepaqueteid"],
@@ -2774,6 +2789,11 @@ async def registrar_transferencia_grupal(
                 fechapago=now_utc(),
                 fecha_verificacion=None,
                 motivo_rechazo=None,
+                espagoprevio=False,
+                esrecuperacioncartera=False,
+                fechapagoreal=None,
+                observacionpagoprevio=None,
+                observacion_cartera=None,
             )
 
             db.add(pago)
