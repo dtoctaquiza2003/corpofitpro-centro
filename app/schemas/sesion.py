@@ -43,10 +43,20 @@ class FinalizarSesionCreate(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
 
+
+
+class SesionCambiarTratamientoCreate(BaseModel):
+    tratamientopacienteid: int = Field(..., ge=1)
+    motivo: Optional[str] = Field(default=None, max_length=500)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
 class SesionAtencionOut(BaseModel):
     id: int
     pacienteid: int
     terapeutaid: int
+    terapeuta_nombre: Optional[str] = None
     paciente: Optional[str] = None
 
     fecha: date

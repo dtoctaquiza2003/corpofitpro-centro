@@ -351,21 +351,48 @@ def _pago_no_anulado_filter():
     return or_(Pago.anulado == False, Pago.anulado.is_(None))
 
 
+def _normalizar_texto_pago(value: Optional[str]) -> str:
+    texto = (value or "").strip().lower()
+    traducciones = str.maketrans("áéíóúüñ", "aeiouun")
+    return texto.translate(traducciones)
+
+
+def _es_metodo_sin_caja(metodo: Optional[str]) -> bool:
+    texto = _normalizar_texto_pago(metodo)
+    return any(
+        token in texto
+        for token in ("cortesia", "exoner", "canje", "especie", "convenio")
+    )
+
+
+def _metodo_sin_caja_filter():
+    metodo = func.lower(func.coalesce(Pago.metodopago, ""))
+    return or_(
+        metodo.like("%cortesia%"),
+        metodo.like("%cortesía%"),
+        metodo.like("%exoner%"),
+        metodo.like("%canje%"),
+        metodo.like("%especie%"),
+        metodo.like("%convenio%"),
+    )
+
+
 def _pago_de_caja_filter():
     """Pagos que sí representan dinero cobrado dentro del sistema.
 
-    Excluye pagos previos porque reducen saldos, pero no son caja actual.
+    Excluye pagos previos y también cortesías/canjes/exoneraciones, porque
+    estos cubren la deuda del paciente pero no aumentan la caja real.
     Incluye recuperación de cartera porque ese dinero se cobra hoy, aunque
     no esté asociado a una sesión/tratamiento registrado.
     """
-    return or_(Pago.espagoprevio == False, Pago.espagoprevio.is_(None))
-
-
+    return and_(
+        or_(Pago.espagoprevio == False, Pago.espagoprevio.is_(None)),
+        ~_metodo_sin_caja_filter(),
+    )
 
 
 def _normalizar_metodo_pago(metodo: Optional[str]) -> str:
-    value = (metodo or "").strip().lower()
-    value = value.replace("á", "a").replace("é", "e").replace("í", "i").replace("ó", "o").replace("ú", "u")
+    value = _normalizar_texto_pago(metodo)
 
     if "transfer" in value:
         return "transferencia"
@@ -980,6 +1007,7 @@ def _calcular_cuentas_tratamientos(
             Pago.tratamientopacienteid,
             Pago.estadopago,
             Pago.espagoprevio,
+            Pago.metodopago,
             func.coalesce(func.sum(Pago.monto), 0),
         )
         .filter(
@@ -990,13 +1018,14 @@ def _calcular_cuentas_tratamientos(
             Pago.tratamientopacienteid,
             Pago.estadopago,
             Pago.espagoprevio,
+            Pago.metodopago,
         )
         .all()
     )
 
     pagos_map: Dict[int, Dict[str, float]] = {}
 
-    for tratamiento_id, estado, es_previo, total in pagos_rows:
+    for tratamiento_id, estado, es_previo, metodo, total in pagos_rows:
         if tratamiento_id is None:
             continue
 
@@ -1005,6 +1034,7 @@ def _calcular_cuentas_tratamientos(
             {
                 "pagado_caja": 0.0,
                 "pago_previo": 0.0,
+                "pagado_sin_caja": 0.0,
                 "pendiente_verificacion": 0.0,
             },
         )
@@ -1014,6 +1044,8 @@ def _calcular_cuentas_tratamientos(
         if estado == 2:
             if bool(es_previo):
                 item["pago_previo"] += total_float
+            elif _es_metodo_sin_caja(metodo):
+                item["pagado_sin_caja"] += total_float
             else:
                 item["pagado_caja"] += total_float
         elif estado == 1:
@@ -1030,12 +1062,14 @@ def _calcular_cuentas_tratamientos(
             {
                 "pagado_caja": 0.0,
                 "pago_previo": 0.0,
+                "pagado_sin_caja": 0.0,
                 "pendiente_verificacion": 0.0,
             },
         )
         pagado_caja = float(pagos_item.get("pagado_caja", 0.0) or 0.0)
         pago_previo = float(pagos_item.get("pago_previo", 0.0) or 0.0)
-        pagado_verificado = pagado_caja + pago_previo
+        pagado_sin_caja = float(pagos_item.get("pagado_sin_caja", 0.0) or 0.0)
+        pagado_verificado = pagado_caja + pago_previo + pagado_sin_caja
         pendiente_verificacion = float(
             pagos_item.get("pendiente_verificacion", 0.0) or 0.0
         )
@@ -1166,11 +1200,6 @@ def _cobertura_sesiones_filtradas(
     sesiones_objetivo_ids = {int(s.id) for s in sesiones_validas}
     paciente_ids = {int(s.pacienteid) for s in sesiones_validas}
     tratamiento_ids = {int(s.tratamientopacienteid) for s in sesiones_validas}
-    terapeuta_ids_objetivo = {
-        int(s.terapeutaid)
-        for s in sesiones_validas
-        if s.terapeutaid is not None
-    }
     claves_objetivo = {
         (int(s.pacienteid), int(s.tratamientopacienteid))
         for s in sesiones_validas
@@ -1235,18 +1264,12 @@ def _cobertura_sesiones_filtradas(
         if clave not in claves_objetivo:
             continue
 
-        # Pacientes compartidos entre sedes:
-        # Para reportes de fisio/sede, el FIFO no debe permitir que una sesión
-        # de otro terapeuta/consultorio consuma pagos y deje como deuda una
-        # sesión que sí pertenece al fisio visible. Esto evita que una deuda del
-        # Centro aparezca en Atahualpa, o viceversa.
-        if (
-            terapeuta_ids_objetivo
-            and sesion.terapeutaid is not None
-            and int(sesion.terapeutaid) not in terapeuta_ids_objetivo
-        ):
-            continue
-
+        # FIFO contable real:
+        # Los pagos del tratamiento se consumen desde la sesión más antigua,
+        # aunque esa sesión la haya hecho otro terapeuta o se haya atendido en
+        # otra sede. Luego solo se devuelve cobertura para las sesiones visibles
+        # del filtro actual. Esto evita marcar como pagada una sesión reciente
+        # cuando los pagos ya fueron consumidos por sesiones anteriores.
         precio = float(_precio_aplicado(sesion.tratamiento_paciente) or 0.0)
         disponible = float(disponible_por_clave.get(clave, 0.0) or 0.0)
         aplicado = min(precio, disponible)
@@ -1398,21 +1421,10 @@ def _deuda_acumulada_reporte(
 
         return True
 
-    # Pacientes compartidos entre sedes:
-    # Cuando el reporte está limitado por fisio, clínica o día, el FIFO también
-    # debe respetar ese mismo alcance operativo. Antes se consumían pagos contra
-    # sesiones de otras sedes y eso podía mostrar deuda a un fisio de Atahualpa
-    # aunque la deuda real fuera del Centro.
-    fifo_limitado_al_alcance = (
-        current_user.rol == 2
-        or terapeutaid is not None
-        or consultorio_resuelto is not None
-        or dia_semana is not None
-    )
-    if fifo_limitado_al_alcance:
-        sesiones_historicas = [
-            sesion for sesion in sesiones_historicas if incluir_en_detalle(sesion)
-        ]
+    # FIFO contable real:
+    # No se limita por terapeuta/consultorio. Las sesiones anteriores del mismo
+    # paciente + tratamiento deben consumir primero los pagos disponibles.
+    # Después solo se reportan las sesiones que pertenecen al filtro actual.
 
     for sesion in sesiones_historicas:
         tratamiento = sesion.tratamiento_paciente
@@ -4676,6 +4688,7 @@ def _excel_base_pagos(
             pago.estadopago == 2
             and not bool(pago.espagoprevio)
             and not bool(pago.anulado)
+            and not _es_metodo_sin_caja(pago.metodopago)
         ) else 0.0
         rows.append(
             [
@@ -4708,7 +4721,12 @@ def _excel_base_pagos(
         consultorio_pago = consultorios_map.get(getattr(paciente, "consultorioid", None), "Sin consultorio")
 
         referencia = _excel_safe_text(getattr(tratamiento, "tipotratamiento", "Terapia"))
-        observacion = _excel_safe_text(pago.observacionpagoprevio or pago.motivo_rechazo or pago.motivo_anulacion)
+        observacion = _excel_safe_text(
+            pago.observacionpagoprevio
+            or (pago.numerocomprobante if _es_metodo_sin_caja(pago.metodopago) else None)
+            or pago.motivo_rechazo
+            or pago.motivo_anulacion
+        )
         add_pago_row(
             pago=pago,
             paciente=paciente,
@@ -4751,7 +4769,12 @@ def _excel_base_pagos(
     for pago in pagos_gimnasio:
         paciente = pacientes_gym.get(pago.pacienteid)
         terapeuta = usuarios_gym.get(getattr(paciente, "terapeutaasignadoid", None))
-        observacion = _excel_safe_text(pago.observacionpagoprevio or pago.motivo_rechazo or pago.motivo_anulacion)
+        observacion = _excel_safe_text(
+            pago.observacionpagoprevio
+            or (pago.numerocomprobante if _es_metodo_sin_caja(pago.metodopago) else None)
+            or pago.motivo_rechazo
+            or pago.motivo_anulacion
+        )
         add_pago_row(
             pago=pago,
             paciente=paciente,

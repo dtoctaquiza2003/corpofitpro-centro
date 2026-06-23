@@ -1,5 +1,5 @@
 import os
-from datetime import date, time
+from datetime import date, time, timedelta
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from ..services.notificacion_service import crear_notificacion_usuario
 from ..utils.fechas import now_ecuador
-from ..auth.dependencies import get_current_terapeuta, get_current_user
+from ..auth.dependencies import get_current_secretary, get_current_terapeuta, get_current_user
 from ..auth.permissions import (
     validar_consultorio_secretario,
     permiso_temporal_activo,
@@ -18,6 +18,7 @@ from ..auth.permissions import (
 from ..dependencies.db import get_db
 from ..models.alerta import Alerta
 from ..models.asistencia import Asistencia
+from ..models.gimnasio import MovimientoGimnasio
 from ..models.paciente import Paciente
 from ..models.sesion_terapia import SesionTerapia
 from ..models.tratamiento import SesionTratamiento, TipoTratamiento
@@ -27,6 +28,7 @@ from ..schemas.sesion import (
     FinalizarSesionCreate,
     InicioSesionCreate,
     SesionAtencionOut,
+    SesionCambiarTratamientoCreate,
     TipoTratamientoOut,
 )
 from ..models.paciente_terapeuta_compartido import PacienteTerapeutaCompartido
@@ -231,12 +233,23 @@ def build_sesion_out(
     tratamientos_aplicados_override: Optional[list[str]] = None,
 ) -> SesionAtencionOut:
     paciente_nombre = None
+    terapeuta_nombre = None
     tratamiento_nombre = None
     precio_sesion_aplicado = None
     tratamientos_aplicados: list[str] = []
 
     if sesion.paciente:
         paciente_nombre = f"{sesion.paciente.nombres} {sesion.paciente.apellidos}"
+
+    if sesion.terapeuta:
+        terapeuta_nombre = f"{sesion.terapeuta.nombres} {sesion.terapeuta.apellidos}".strip()
+
+    # Refuerzo: en algunos listados viejos la relación puede no venir cargada.
+    # Si eso pasa, consultamos el usuario directamente para no devolver solo el ID.
+    if not terapeuta_nombre and sesion.terapeutaid:
+        terapeuta_db = db.query(Usuario).filter(Usuario.id == sesion.terapeutaid).first()
+        if terapeuta_db:
+            terapeuta_nombre = f"{terapeuta_db.nombres} {terapeuta_db.apellidos}".strip()
 
     if sesion.tratamiento_paciente:
         tratamiento_nombre = sesion.tratamiento_paciente.tipotratamiento
@@ -268,6 +281,7 @@ def build_sesion_out(
         id=sesion.id,
         pacienteid=sesion.pacienteid,
         terapeutaid=sesion.terapeutaid,
+        terapeuta_nombre=terapeuta_nombre,
         paciente=paciente_nombre,
         fecha=sesion.fecha,
         horaingreso=sesion.horaingreso,
@@ -1090,6 +1104,117 @@ def _crear_alerta_dolor_no_disminuye(
     )
 
 
+
+
+def _secretario_puede_gestionar_sesion_compartida(
+    current_user: Usuario,
+    sesion: SesionTerapia | None = None,
+    paciente: Paciente | None = None,
+    db: Session | None = None,
+) -> bool:
+    if current_user.rol != 1 or current_user.consultorioid is None or db is None:
+        return False
+
+    if paciente is not None and paciente.consultorioid == current_user.consultorioid:
+        return True
+
+    if sesion is not None:
+        terapeuta_sesion = (
+            db.query(Usuario.id)
+            .filter(
+                Usuario.id == sesion.terapeutaid,
+                Usuario.consultorioid == current_user.consultorioid,
+            )
+            .first()
+        )
+        if terapeuta_sesion is not None:
+            return True
+
+    if paciente is not None:
+        hoy = now_ecuador().date()
+        compartido = (
+            db.query(PacienteTerapeutaCompartido.id)
+            .join(Usuario, Usuario.id == PacienteTerapeutaCompartido.terapeutaid)
+            .filter(
+                PacienteTerapeutaCompartido.pacienteid == paciente.id,
+                PacienteTerapeutaCompartido.activo == True,
+                Usuario.consultorioid == current_user.consultorioid,
+                or_(
+                    PacienteTerapeutaCompartido.fecha_inicio == None,
+                    PacienteTerapeutaCompartido.fecha_inicio <= hoy,
+                ),
+                or_(
+                    PacienteTerapeutaCompartido.fecha_fin == None,
+                    PacienteTerapeutaCompartido.fecha_fin >= hoy,
+                ),
+            )
+            .first()
+        )
+        if compartido is not None:
+            return True
+
+    return False
+
+
+def _validar_gestor_sesion_paciente(
+    current_user: Usuario,
+    paciente: Paciente | None,
+    sesion: SesionTerapia | None = None,
+    db: Session | None = None,
+) -> None:
+    if current_user.rol == 3:
+        return
+
+    if current_user.rol == 1:
+        if paciente is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Paciente no encontrado.",
+            )
+
+        if _secretario_puede_gestionar_sesion_compartida(
+            current_user=current_user,
+            sesion=sesion,
+            paciente=paciente,
+            db=db,
+        ):
+            return
+
+        validar_consultorio_secretario(
+            current_user,
+            paciente.consultorioid,
+        )
+        return
+
+    raise HTTPException(
+        status_code=403,
+        detail="Solo secretario o jefe pueden corregir atenciones.",
+    )
+
+
+def _validar_tratamiento_para_sesion(
+    db: Session,
+    tratamiento_id: int,
+    paciente_id: int,
+) -> TratamientoPaciente:
+    tratamiento = (
+        db.query(TratamientoPaciente)
+        .filter(
+            TratamientoPaciente.id == tratamiento_id,
+            TratamientoPaciente.pacienteid == paciente_id,
+        )
+        .first()
+    )
+
+    if not tratamiento:
+        raise HTTPException(
+            status_code=400,
+            detail="El tratamiento seleccionado no pertenece a este paciente.",
+        )
+
+    return tratamiento
+
+
 @router.post(
     "/iniciar",
     response_model=SesionAtencionOut,
@@ -1227,6 +1352,7 @@ def iniciar_sesion(
         db.query(SesionTerapia)
         .options(
             joinedload(SesionTerapia.paciente),
+            joinedload(SesionTerapia.terapeuta),
             joinedload(SesionTerapia.tratamiento_paciente),
         )
         .filter(SesionTerapia.id == nueva_sesion.id)
@@ -1255,6 +1381,7 @@ def listar_sesiones_en_curso(
 ):
     query = db.query(SesionTerapia).options(
         joinedload(SesionTerapia.paciente),
+        joinedload(SesionTerapia.terapeuta),
         joinedload(SesionTerapia.tratamiento_paciente),
     ).filter(SesionTerapia.horasalida == None)
 
@@ -1313,6 +1440,7 @@ def finalizar_sesion(
         db.query(SesionTerapia)
         .options(
             joinedload(SesionTerapia.paciente),
+            joinedload(SesionTerapia.terapeuta),
             joinedload(SesionTerapia.tratamiento_paciente),
         )
         .filter(SesionTerapia.id == sesion_id)
@@ -1442,6 +1570,7 @@ def finalizar_sesion(
         db.query(SesionTerapia)
         .options(
             joinedload(SesionTerapia.paciente),
+            joinedload(SesionTerapia.terapeuta),
             joinedload(SesionTerapia.tratamiento_paciente),
         )
         .filter(SesionTerapia.id == sesion.id)
@@ -1449,6 +1578,157 @@ def finalizar_sesion(
     )
 
     return build_sesion_out(sesion, db)
+
+
+
+@router.put("/{sesion_id}/cambiar-tratamiento", response_model=SesionAtencionOut)
+def cambiar_tratamiento_sesion(
+    sesion_id: int,
+    data: SesionCambiarTratamientoCreate,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(get_current_secretary),
+):
+    sesion = (
+        db.query(SesionTerapia)
+        .options(
+            joinedload(SesionTerapia.paciente),
+            joinedload(SesionTerapia.terapeuta),
+            joinedload(SesionTerapia.tratamiento_paciente),
+        )
+        .filter(SesionTerapia.id == sesion_id)
+        .first()
+    )
+
+    if not sesion:
+        raise HTTPException(
+            status_code=404,
+            detail="Sesión no encontrada.",
+        )
+
+    paciente = sesion.paciente
+    if not paciente:
+        paciente = db.query(Paciente).filter(Paciente.id == sesion.pacienteid).first()
+
+    _validar_gestor_sesion_paciente(current_user=current_user, paciente=paciente, sesion=sesion, db=db)
+
+    tratamiento_nuevo = _validar_tratamiento_para_sesion(
+        db=db,
+        tratamiento_id=data.tratamientopacienteid,
+        paciente_id=sesion.pacienteid,
+    )
+
+    tratamiento_anterior_id = sesion.tratamientopacienteid
+
+    if tratamiento_anterior_id == tratamiento_nuevo.id:
+        return build_sesion_out(sesion, db)
+
+    sesion.tratamientopacienteid = tratamiento_nuevo.id
+
+    # Si esta terapia también generó un movimiento de gimnasio por reemplazo,
+    # mantenemos la referencia al tratamiento correcta para que reportes y saldos
+    # no queden cruzados.
+    db.query(MovimientoGimnasio).filter(
+        MovimientoGimnasio.sesionid == sesion.id
+    ).update(
+        {MovimientoGimnasio.tratamientopacienteid: tratamiento_nuevo.id},
+        synchronize_session=False,
+    )
+
+    db.commit()
+
+    sesion_actualizada = (
+        db.query(SesionTerapia)
+        .options(
+            joinedload(SesionTerapia.paciente),
+            joinedload(SesionTerapia.terapeuta),
+            joinedload(SesionTerapia.tratamiento_paciente),
+        )
+        .filter(SesionTerapia.id == sesion_id)
+        .first()
+    )
+
+    return build_sesion_out(sesion_actualizada, db)
+
+
+@router.delete("/{sesion_id}")
+def eliminar_sesion_terapia(
+    sesion_id: int,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(get_current_secretary),
+):
+    sesion = (
+        db.query(SesionTerapia)
+        .options(joinedload(SesionTerapia.paciente), joinedload(SesionTerapia.terapeuta))
+        .filter(SesionTerapia.id == sesion_id)
+        .first()
+    )
+
+    if not sesion:
+        raise HTTPException(
+            status_code=404,
+            detail="Sesión no encontrada.",
+        )
+
+    paciente = sesion.paciente
+    if not paciente:
+        paciente = db.query(Paciente).filter(Paciente.id == sesion.pacienteid).first()
+
+    _validar_gestor_sesion_paciente(current_user=current_user, paciente=paciente, sesion=sesion, db=db)
+
+    paciente_id = sesion.pacienteid
+    fecha_sesion = sesion.fecha
+
+    # Primero limpiamos las terapias aplicadas de la sesión para evitar
+    # errores por llaves foráneas.
+    db.query(SesionTratamiento).filter(
+        SesionTratamiento.sesionid == sesion.id
+    ).delete(synchronize_session=False)
+
+    # Los movimientos de gimnasio asociados a una sesión usan ON DELETE SET NULL
+    # en la DB, pero lo hacemos explícito para que funcione igual en todos los
+    # ambientes y no se pierda la asistencia de gimnasio si existía.
+    db.query(MovimientoGimnasio).filter(
+        MovimientoGimnasio.sesionid == sesion.id
+    ).update(
+        {MovimientoGimnasio.sesionid: None},
+        synchronize_session=False,
+    )
+
+    db.delete(sesion)
+    db.flush()
+
+    sesiones_restantes = (
+        db.query(SesionTerapia.id)
+        .filter(
+            SesionTerapia.pacienteid == paciente_id,
+            SesionTerapia.fecha == fecha_sesion,
+        )
+        .first()
+    )
+
+    movimientos_restantes = (
+        db.query(MovimientoGimnasio.id)
+        .filter(
+            MovimientoGimnasio.pacienteid == paciente_id,
+            MovimientoGimnasio.fecha == fecha_sesion,
+        )
+        .first()
+    )
+
+    if not sesiones_restantes and not movimientos_restantes:
+        db.query(Asistencia).filter(
+            Asistencia.pacienteid == paciente_id,
+            Asistencia.fecha == fecha_sesion,
+        ).delete(synchronize_session=False)
+
+    db.commit()
+
+    return {
+        "ok": True,
+        "message": "Atención eliminada correctamente.",
+        "sesionid": sesion_id,
+    }
+
 
 @router.get("/", response_model=List[SesionAtencionOut])
 def listar_sesiones(
@@ -1460,6 +1740,7 @@ def listar_sesiones(
 ):
     query = db.query(SesionTerapia).options(
         joinedload(SesionTerapia.paciente),
+        joinedload(SesionTerapia.terapeuta),
         joinedload(SesionTerapia.tratamiento_paciente),
     )
 

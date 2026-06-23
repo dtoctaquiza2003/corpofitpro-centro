@@ -84,6 +84,26 @@ class RecuperacionCarteraCreate(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
 
+
+
+class PagoReasignarRequest(BaseModel):
+    """
+    Cambia el destino contable de un pago ya registrado.
+
+    No anula ni duplica el pago: conserva monto, método, estado, comprobante,
+    fechas y creador/verificador. Solo cambia paciente/destino para corregir
+    pagos registrados en una terapia, membresía o paciente equivocado.
+    """
+
+    pacienteid: int = Field(..., ge=1)
+    pacientepaqueteid: Optional[int] = None
+    tratamientopacienteid: Optional[int] = None
+    membresiagimnasioid: Optional[int] = None
+    motivo: Optional[str] = Field(default=None, max_length=500)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
 class PagoOut(BaseModel):
     id: int
     pacienteid: int
@@ -253,6 +273,8 @@ class CuentaTratamientoOut(BaseModel):
     pagado_verificado: float
     # Dinero cobrado antes del sistema. No entra a caja ni ingresos del día.
     pago_previo_verificado: float = 0
+    # Cortesías/canjes/exoneraciones cubren la deuda, pero no entran a caja.
+    pagado_sin_caja_verificado: float = 0
     # Dinero realmente cobrado dentro del sistema. Útil para cuadre de caja.
     pagado_caja_verificado: float = 0
     pendiente_verificacion: float
@@ -318,6 +340,8 @@ class CuentaMembresiaGimnasioOut(BaseModel):
     pagado_verificado: float
     # Dinero cobrado antes del sistema. No entra a caja ni ingresos del día.
     pago_previo_verificado: float = 0
+    # Cortesías/canjes/exoneraciones cubren la deuda, pero no entran a caja.
+    pagado_sin_caja_verificado: float = 0
     # Dinero realmente cobrado dentro del sistema. Útil para cuadre de caja.
     pagado_caja_verificado: float = 0
     pendiente_verificacion: float

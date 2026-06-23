@@ -17,6 +17,7 @@ from app.schemas.pago import (
     PagoPrevioTratamientoCreate,
     PagoPrevioGimnasioCreate,
     RecuperacionCarteraCreate,
+    PagoReasignarRequest,
     PagoOut,
     PagoSimpleOut,
     PagoAnularRequest,
@@ -34,13 +35,14 @@ from ..dependencies.db import get_db
 from ..models.gimnasio import MembresiaGimnasio
 from ..models.paciente import Paciente
 from ..models.paciente_paquete import PacientePaquete
+from ..models.paciente_terapeuta_compartido import PacienteTerapeutaCompartido
 from ..models.pago import Pago
 from ..models.paquete import Paquete
 from ..models.sesion_terapia import SesionTerapia
 from ..models.tratamiento_paciente import TratamientoPaciente
 from ..models.usuario import Usuario
 from ..services.notificacion_service import crear_notificacion_usuario
-from ..utils.fechas import now_utc
+from ..utils.fechas import now_ecuador, now_utc
 from ..services.supabase_storage import (
     crear_url_firmada_comprobante,
     subir_comprobante_pago,
@@ -58,8 +60,64 @@ PORCENTAJE_CLINICA_TERAPIA = 0.65
 # HELPERS
 # ============================================================
 
+def _normalizar_texto_pago(value: str) -> str:
+    texto = (value or "").strip().lower()
+    traducciones = str.maketrans(
+        "áéíóúüñ",
+        "aeiouun",
+    )
+    return texto.translate(traducciones)
+
+
 def _es_transferencia(metodo: str) -> bool:
-    return "transfer" in (metodo or "").strip().lower()
+    return "transfer" in _normalizar_texto_pago(metodo)
+
+
+def _es_metodo_sin_caja(metodo: str) -> bool:
+    texto = _normalizar_texto_pago(metodo)
+    return any(
+        token in texto
+        for token in (
+            "cortesia",
+            "exoner",
+            "canje",
+            "especie",
+            "convenio",
+        )
+    )
+
+
+def _metodo_sin_caja_filter():
+    metodo = func.lower(func.coalesce(Pago.metodopago, ""))
+    return or_(
+        metodo.like("%cortesia%"),
+        metodo.like("%cortesía%"),
+        metodo.like("%exoner%"),
+        metodo.like("%canje%"),
+        metodo.like("%especie%"),
+        metodo.like("%convenio%"),
+    )
+
+
+def _no_es_metodo_sin_caja_filter():
+    return ~_metodo_sin_caja_filter()
+
+
+def _validar_motivo_si_pago_sin_caja(metodo: str, motivo: Optional[str]) -> Optional[str]:
+    if not _es_metodo_sin_caja(metodo):
+        return None
+
+    texto = (motivo or "").strip()
+    if len(texto) < 5:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Ingrese el motivo o autorización para registrar cortesía, "
+                "exoneración o canje."
+            ),
+        )
+
+    return texto[:100]
 
 
 def _estado_pago_por_metodo(metodo: str) -> int:
@@ -256,6 +314,7 @@ def _calcular_cobertura_fifo_por_terapeuta(
             {
                 "restante": float(pago.monto or 0),
                 "es_previo": bool(getattr(pago, "espagoprevio", False)),
+                "es_sin_caja": _es_metodo_sin_caja(pago.metodopago),
             }
         )
 
@@ -265,6 +324,7 @@ def _calcular_cobertura_fifo_por_terapeuta(
             "total_generado": 0.0,
             "pagado_caja_verificado": 0.0,
             "pago_previo_verificado": 0.0,
+            "pagado_sin_caja_verificado": 0.0,
             "pagado_verificado": 0.0,
             "saldo": 0.0,
             "saldo_favor": 0.0,
@@ -277,6 +337,7 @@ def _calcular_cobertura_fifo_por_terapeuta(
         restante_sesion = precio
         cubierto_caja = 0.0
         cubierto_previo = 0.0
+        cubierto_sin_caja = 0.0
 
         for pago in pagos_por_tratamiento.get(tratamiento_id, []):
             if restante_sesion <= 0:
@@ -290,6 +351,8 @@ def _calcular_cobertura_fifo_por_terapeuta(
 
             if pago["es_previo"]:
                 cubierto_previo += aplicado
+            elif pago.get("es_sin_caja"):
+                cubierto_sin_caja += aplicado
             else:
                 cubierto_caja += aplicado
 
@@ -301,7 +364,10 @@ def _calcular_cobertura_fifo_por_terapeuta(
         item["total_generado"] += precio
         item["pagado_caja_verificado"] += cubierto_caja
         item["pago_previo_verificado"] += cubierto_previo
-        item["pagado_verificado"] += cubierto_caja + cubierto_previo
+        item["pagado_sin_caja_verificado"] += cubierto_sin_caja
+        item["pagado_verificado"] += (
+            cubierto_caja + cubierto_previo + cubierto_sin_caja
+        )
         item["saldo"] += max(restante_sesion, 0)
 
     return {
@@ -317,10 +383,14 @@ def _pago_visible_para_consultorio_filter(consultorioid: int):
     """
     Para listar/verificar pagos de pacientes compartidos.
 
-    Incluye pagos del paciente de la sede y pagos aplicados a tratamientos
-    que tienen atención realizada por terapeutas de la sede.
+    Incluye pagos del paciente de la sede, pagos aplicados a tratamientos
+    con atención realizada por terapeutas de la sede y pacientes compartidos
+    activamente con terapeutas de la sede.
     """
     terapeuta_sesion = aliased(Usuario)
+    terapeuta_compartido = aliased(Usuario)
+    compartido = aliased(PacienteTerapeutaCompartido)
+    hoy = now_ecuador().date()
 
     return or_(
         Paciente.consultorioid == consultorioid,
@@ -330,6 +400,16 @@ def _pago_visible_para_consultorio_filter(consultorioid: int):
                 SesionTerapia.terapeutaid == terapeuta_sesion.id,
                 terapeuta_sesion.consultorioid == consultorioid,
                 SesionTerapia.horasalida != None,
+            )
+        ),
+        exists().where(
+            and_(
+                compartido.pacienteid == Pago.pacienteid,
+                compartido.terapeutaid == terapeuta_compartido.id,
+                terapeuta_compartido.consultorioid == consultorioid,
+                compartido.activo == True,
+                or_(compartido.fecha_inicio == None, compartido.fecha_inicio <= hoy),
+                or_(compartido.fecha_fin == None, compartido.fecha_fin >= hoy),
             )
         ),
     )
@@ -362,6 +442,42 @@ def _paciente_tiene_atencion_en_consultorio(
     return query.first() is not None
 
 
+
+
+def _paciente_compartido_con_consultorio_activo(
+    db: Session,
+    pacienteid: int,
+    consultorioid: Optional[int],
+) -> bool:
+    if consultorioid is None:
+        return False
+
+    hoy = now_ecuador().date()
+    terapeuta_compartido = aliased(Usuario)
+
+    return (
+        db.query(PacienteTerapeutaCompartido.id)
+        .join(
+            terapeuta_compartido,
+            terapeuta_compartido.id == PacienteTerapeutaCompartido.terapeutaid,
+        )
+        .filter(
+            PacienteTerapeutaCompartido.pacienteid == pacienteid,
+            PacienteTerapeutaCompartido.activo == True,
+            terapeuta_compartido.consultorioid == consultorioid,
+            or_(
+                PacienteTerapeutaCompartido.fecha_inicio == None,
+                PacienteTerapeutaCompartido.fecha_inicio <= hoy,
+            ),
+            or_(
+                PacienteTerapeutaCompartido.fecha_fin == None,
+                PacienteTerapeutaCompartido.fecha_fin >= hoy,
+            ),
+        )
+        .first()
+        is not None
+    )
+
 def _validar_paciente(
     db: Session,
     pacienteid: int,
@@ -389,14 +505,33 @@ def _validar_paciente(
             permitir_atencion_compartida
             and current_user.rol == 1
             and current_user.consultorioid is not None
-            and _paciente_tiene_atencion_en_consultorio(
-                db=db,
-                pacienteid=pacienteid,
-                consultorioid=current_user.consultorioid,
-                tratamientopacienteid=tratamientopacienteid,
-            )
         ):
-            return paciente
+            # Pacientes compartidos entre sedes:
+            # 1) Si el tratamiento ya tiene atención hecha en la sede, se permite.
+            # 2) Si el paciente ya fue atendido alguna vez en la sede, también se
+            #    permite cobrar/reasignar abonos futuros de otros tratamientos.
+            # 3) Si está compartido activamente con un terapeuta de la sede, se permite
+            #    aunque todavía no exista sesión registrada en ese tratamiento.
+            if (
+                _paciente_tiene_atencion_en_consultorio(
+                    db=db,
+                    pacienteid=pacienteid,
+                    consultorioid=current_user.consultorioid,
+                    tratamientopacienteid=tratamientopacienteid,
+                )
+                or _paciente_tiene_atencion_en_consultorio(
+                    db=db,
+                    pacienteid=pacienteid,
+                    consultorioid=current_user.consultorioid,
+                    tratamientopacienteid=None,
+                )
+                or _paciente_compartido_con_consultorio_activo(
+                    db=db,
+                    pacienteid=pacienteid,
+                    consultorioid=current_user.consultorioid,
+                )
+            ):
+                return paciente
 
         raise exc
 
@@ -1758,6 +1893,8 @@ def listar_cuentas_tratamientos(
         Pago.espagoprevio == False,
         Pago.espagoprevio.is_(None),
     )
+    metodo_sin_caja = _metodo_sin_caja_filter()
+    no_es_metodo_sin_caja = _no_es_metodo_sin_caja_filter()
 
     pagos_agregados_query = (
         db.query(
@@ -1771,6 +1908,7 @@ def listar_cuentas_tratamientos(
                                 pago_no_anulado,
                                 no_es_recuperacion_cartera,
                                 no_es_pago_previo,
+                                no_es_metodo_sin_caja,
                             ),
                             Pago.monto,
                         ),
@@ -1796,6 +1934,24 @@ def listar_cuentas_tratamientos(
                 ),
                 0,
             ).label("pago_previo_verificado"),
+            func.coalesce(
+                func.sum(
+                    case(
+                        (
+                            and_(
+                                Pago.estadopago == 2,
+                                pago_no_anulado,
+                                no_es_recuperacion_cartera,
+                                no_es_pago_previo,
+                                metodo_sin_caja,
+                            ),
+                            Pago.monto,
+                        ),
+                        else_=0,
+                    )
+                ),
+                0,
+            ).label("pagado_sin_caja_verificado"),
             func.coalesce(
                 func.sum(
                     case(
@@ -1857,6 +2013,9 @@ def listar_cuentas_tratamientos(
         row.tratamiento_id: {
             "pagado_caja_verificado": float(row.pagado_caja_verificado or 0),
             "pago_previo_verificado": float(row.pago_previo_verificado or 0),
+            "pagado_sin_caja_verificado": float(
+                getattr(row, "pagado_sin_caja_verificado", 0) or 0
+            ),
             "pendiente_verificacion": float(row.pendiente_verificacion or 0),
         }
         for row in pagos_agregados_rows
@@ -1891,6 +2050,7 @@ def listar_cuentas_tratamientos(
             {
                 "pagado_caja_verificado": 0.0,
                 "pago_previo_verificado": 0.0,
+                "pagado_sin_caja_verificado": 0.0,
                 "pendiente_verificacion": 0.0,
             },
         )
@@ -1901,11 +2061,18 @@ def listar_cuentas_tratamientos(
         pago_previo_verificado = float(
             pagos_totales["pago_previo_verificado"]
         )
+        pagado_sin_caja_verificado = float(
+            pagos_totales.get("pagado_sin_caja_verificado", 0.0)
+        )
         pendiente_verificacion = float(
             pagos_totales["pendiente_verificacion"]
         )
 
-        pagado_verificado = pagado_caja_verificado + pago_previo_verificado
+        pagado_verificado = (
+            pagado_caja_verificado
+            + pago_previo_verificado
+            + pagado_sin_caja_verificado
+        )
 
         saldo = max(total_generado - pagado_verificado, 0)
         saldo_favor = max(pagado_verificado - total_generado, 0)
@@ -1922,6 +2089,9 @@ def listar_cuentas_tratamientos(
             )
             pago_previo_verificado = float(
                 cobertura["pago_previo_verificado"] or 0
+            )
+            pagado_sin_caja_verificado = float(
+                cobertura.get("pagado_sin_caja_verificado", 0) or 0
             )
             pagado_verificado = float(cobertura["pagado_verificado"] or 0)
             saldo = float(cobertura["saldo"] or 0)
@@ -1967,6 +2137,7 @@ def listar_cuentas_tratamientos(
                 pagado_verificado=pagado_verificado,
                 pago_previo_verificado=pago_previo_verificado,
                 pagado_caja_verificado=pagado_caja_verificado,
+                pagado_sin_caja_verificado=pagado_sin_caja_verificado,
                 pendiente_verificacion=pendiente_verificacion,
                 saldo=saldo,
                 saldo_favor=saldo_favor,
@@ -2126,6 +2297,7 @@ def listar_cuentas_gimnasio(
             for pago in pagos_no_anulados
             if pago.estadopago == 2
             and not bool(getattr(pago, "espagoprevio", False))
+            and not _es_metodo_sin_caja(pago.metodopago)
         )
 
         pago_previo_verificado = sum(
@@ -2135,7 +2307,19 @@ def listar_cuentas_gimnasio(
             and bool(getattr(pago, "espagoprevio", False))
         )
 
-        pagado_verificado = pagado_caja_verificado + pago_previo_verificado
+        pagado_sin_caja_verificado = sum(
+            float(pago.monto or 0)
+            for pago in pagos_no_anulados
+            if pago.estadopago == 2
+            and not bool(getattr(pago, "espagoprevio", False))
+            and _es_metodo_sin_caja(pago.metodopago)
+        )
+
+        pagado_verificado = (
+            pagado_caja_verificado
+            + pago_previo_verificado
+            + pagado_sin_caja_verificado
+        )
 
         pendiente_verificacion = sum(
             float(pago.monto or 0)
@@ -2159,6 +2343,7 @@ def listar_cuentas_gimnasio(
                 pagado_verificado=pagado_verificado,
                 pago_previo_verificado=pago_previo_verificado,
                 pagado_caja_verificado=pagado_caja_verificado,
+                pagado_sin_caja_verificado=pagado_sin_caja_verificado,
                 pendiente_verificacion=pendiente_verificacion,
                 saldo=saldo,
                 saldo_favor=saldo_favor,
@@ -2520,10 +2705,15 @@ def registrar_pago(
         monto=pago.monto,
     )
 
+    motivo_sin_caja = _validar_motivo_si_pago_sin_caja(
+        metodo,
+        pago.numerocomprobante,
+    )
+
     data = pago.model_dump()
 
     data["metodopago"] = metodo
-    data["numerocomprobante"] = None
+    data["numerocomprobante"] = motivo_sin_caja
     data["comprobanteurl"] = None
     data["estadopago"] = 2
     data["creado_por_id"] = current_user.id
@@ -2867,6 +3057,11 @@ async def registrar_pago_con_comprobante(
             detail="Seleccione un método de pago.",
         )
 
+    motivo_sin_caja = _validar_motivo_si_pago_sin_caja(
+        metodo,
+        numerocomprobante,
+    )
+
     paciente_paquete = _validar_paciente_paquete(
         db=db,
         pacienteid=pacienteid,
@@ -2934,7 +3129,7 @@ async def registrar_pago_con_comprobante(
         estado_pago = 1
 
     else:
-        numerocomprobante = None
+        numerocomprobante = motivo_sin_caja
         comprobante_path = None
         estado_pago = 2
 
@@ -3024,6 +3219,97 @@ async def registrar_pago_con_comprobante(
     except Exception:
         db.rollback()
         raise
+
+
+# ============================================================
+# REASIGNAR PAGO
+# Corrige el destino sin anular ni duplicar el pago.
+# ============================================================
+
+@router.patch("/{pago_id}/reasignar", response_model=PagoOut)
+def reasignar_pago(
+    pago_id: int,
+    data: PagoReasignarRequest,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(get_current_secretary),
+):
+    pago, _ = _obtener_pago_con_acceso(
+        db=db,
+        pago_id=pago_id,
+        current_user=current_user,
+    )
+
+    if pago.anulado:
+        raise HTTPException(
+            status_code=400,
+            detail="No se puede reasignar un pago anulado.",
+        )
+
+    if bool(getattr(pago, "esrecuperacioncartera", False)):
+        raise HTTPException(
+            status_code=400,
+            detail="La recuperación de cartera no se puede reasignar a una terapia o membresía.",
+        )
+
+    _validar_destino_pago(
+        pacientepaqueteid=data.pacientepaqueteid,
+        tratamientopacienteid=data.tratamientopacienteid,
+        membresiagimnasioid=data.membresiagimnasioid,
+    )
+
+    _validar_paciente(
+        db=db,
+        pacienteid=data.pacienteid,
+        current_user=current_user,
+        tratamientopacienteid=data.tratamientopacienteid,
+        permitir_atencion_compartida=True,
+    )
+
+    paciente_paquete = _validar_paciente_paquete(
+        db=db,
+        pacienteid=data.pacienteid,
+        pacientepaqueteid=data.pacientepaqueteid,
+    )
+
+    _validar_tratamiento_paciente(
+        db=db,
+        pacienteid=data.pacienteid,
+        tratamientopacienteid=data.tratamientopacienteid,
+    )
+
+    membresia_gimnasio = _validar_membresia_gimnasio(
+        db=db,
+        pacienteid=data.pacienteid,
+        membresiagimnasioid=data.membresiagimnasioid,
+    )
+
+    # En terapias se permite saldo a favor/abono futuro.
+    # En paquetes/gimnasio sí se valida para no sobrepasar el precio.
+    _validar_saldo_paquete(
+        db=db,
+        paciente_paquete=paciente_paquete,
+        monto=float(pago.monto or 0),
+        excluir_pago_id=pago.id,
+    )
+
+    _validar_saldo_membresia_gimnasio(
+        db=db,
+        membresia=membresia_gimnasio,
+        monto=float(pago.monto or 0),
+        excluir_pago_id=pago.id,
+    )
+
+    pago.pacienteid = data.pacienteid
+    pago.pacientepaqueteid = data.pacientepaqueteid
+    pago.tratamientopacienteid = data.tratamientopacienteid
+    pago.membresiagimnasioid = data.membresiagimnasioid
+
+    # Conserva monto, método, comprobante, estado, fecha de caja, creador y
+    # verificador. Esta acción solo corrige a qué cuenta reduce saldo.
+    db.commit()
+    db.refresh(pago)
+
+    return pago
 
 
 # ============================================================
