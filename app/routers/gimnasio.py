@@ -10,6 +10,8 @@ from ..auth.permissions import validar_acceso_paciente_por_rol
 from ..auth.dependencies import get_current_user
 from ..dependencies.db import get_db
 from ..models.gimnasio import MembresiaGimnasio, MovimientoGimnasio
+from ..models.consultorio import Consultorio
+from ..models.usuario_permiso_temporal import UsuarioPermisoTemporal
 from ..models.paciente import Paciente
 from ..models.paciente_terapeuta_compartido import PacienteTerapeutaCompartido
 from ..models.sesion_terapia import SesionTerapia
@@ -25,6 +27,7 @@ from ..schemas.gimnasio import (
     PaseDiarioGimnasioCreate,
     GimnasioAsistenciaRapidaCreate,
     GimnasioAsistenciaRapidaOut,
+    GimnasioResponsableOut,
 )
 
 router = APIRouter(prefix="/api/gimnasio", tags=["gimnasio"])
@@ -96,11 +99,43 @@ def _validar_acceso_paciente(
             detail="Paciente no encontrado.",
         )
 
-    validar_acceso_paciente_por_rol(
-        paciente=paciente,
-        current_user=current_user,
-        db=db,
-    )
+    try:
+        validar_acceso_paciente_por_rol(
+            paciente=paciente,
+            current_user=current_user,
+            db=db,
+        )
+    except HTTPException as exc:
+        # Regla especial de gimnasio: un secretario de una clínica receptora
+        # puede crear/consultar gimnasio si el paciente está compartido con
+        # un fisioterapeuta de su consultorio.
+        if current_user.rol == 1 and current_user.consultorioid is not None:
+            hoy = fecha_ecuador()
+            compartido_en_consultorio = (
+                db.query(PacienteTerapeutaCompartido.id)
+                .join(Usuario, Usuario.id == PacienteTerapeutaCompartido.terapeutaid)
+                .filter(
+                    PacienteTerapeutaCompartido.pacienteid == paciente.id,
+                    PacienteTerapeutaCompartido.activo == True,
+                    Usuario.rol == 2,
+                    Usuario.activo == True,
+                    Usuario.consultorioid == current_user.consultorioid,
+                    or_(
+                        PacienteTerapeutaCompartido.fecha_inicio == None,
+                        PacienteTerapeutaCompartido.fecha_inicio <= hoy,
+                    ),
+                    or_(
+                        PacienteTerapeutaCompartido.fecha_fin == None,
+                        PacienteTerapeutaCompartido.fecha_fin >= hoy,
+                    ),
+                )
+                .first()
+            )
+
+            if compartido_en_consultorio is not None:
+                return paciente
+
+        raise exc
 
     return paciente
 
@@ -112,6 +147,255 @@ def _nombre_paciente(paciente: Paciente | None) -> str:
 
     return f"{paciente.nombres or ''} {paciente.apellidos or ''}".strip() or "Paciente"
 
+
+
+
+def _nombre_consultorio(consultorio: Consultorio | None) -> str:
+    if not consultorio:
+        return "Sin consultorio"
+    return consultorio.nombre or "Sin consultorio"
+
+
+def _nombre_consultorio_por_id(db: Session, consultorio_id: int | None) -> str:
+    if consultorio_id is None:
+        return "Sin consultorio"
+
+    consultorio = db.query(Consultorio).filter(Consultorio.id == consultorio_id).first()
+    return _nombre_consultorio(consultorio)
+
+
+def _resolver_consultorio_operativo_gimnasio(
+    *,
+    paciente: Paciente,
+    current_user: Usuario,
+    consultorioid: int | None = None,
+) -> int | None:
+    """Define a qué clínica pertenece el gimnasio.
+
+    Secretario: siempre su consultorio.
+    Jefe: puede enviar consultorioid; si no lo envía, se usa su consultorio
+    y, como último respaldo, el consultorio de origen del paciente.
+    """
+    if current_user.rol == 1:
+        if current_user.consultorioid is None:
+            raise HTTPException(
+                status_code=403,
+                detail="El secretario no tiene consultorio asignado.",
+            )
+
+        if consultorioid is not None and consultorioid != current_user.consultorioid:
+            raise HTTPException(
+                status_code=403,
+                detail="El gimnasio solo puede crearse para el consultorio del secretario.",
+            )
+
+        return current_user.consultorioid
+
+    if current_user.rol == 3:
+        return consultorioid or current_user.consultorioid or paciente.consultorioid
+
+    return current_user.consultorioid or paciente.consultorioid
+
+
+def _agregar_responsable_unico(
+    responsables: list[tuple[Usuario, str]],
+    ids: set[int],
+    usuario: Usuario | None,
+    motivo: str,
+) -> None:
+    if not usuario:
+        return
+    if usuario.activo is not True or usuario.rol != 2:
+        return
+    if usuario.id in ids:
+        return
+
+    responsables.append((usuario, motivo))
+    ids.add(usuario.id)
+
+
+def _responsables_gimnasio_autorizados(
+    *,
+    db: Session,
+    paciente: Paciente,
+    consultorioid: int | None,
+    fecha_referencia: date | None = None,
+) -> list[tuple[Usuario, str]]:
+    """Fisioterapeutas que pueden quedar como responsables de gimnasio.
+
+    Regla: no se listan todos los fisios de la clínica. Solo se permite:
+    - terapeuta principal si pertenece al consultorio operativo;
+    - terapeutas con el paciente compartido/cedido en ese consultorio;
+    - terapeutas con permiso temporal de atención de sucursal en ese consultorio.
+    """
+    hoy = fecha_referencia or fecha_ecuador()
+    responsables: list[tuple[Usuario, str]] = []
+    ids: set[int] = set()
+
+    if consultorioid is None:
+        return responsables
+
+    if paciente.terapeutaasignadoid:
+        terapeuta_principal = (
+            db.query(Usuario)
+            .filter(
+                Usuario.id == paciente.terapeutaasignadoid,
+                Usuario.rol == 2,
+                Usuario.activo == True,
+                Usuario.consultorioid == consultorioid,
+            )
+            .first()
+        )
+        _agregar_responsable_unico(
+            responsables,
+            ids,
+            terapeuta_principal,
+            "Terapeuta principal",
+        )
+
+    compartidos = (
+        db.query(Usuario)
+        .join(
+            PacienteTerapeutaCompartido,
+            PacienteTerapeutaCompartido.terapeutaid == Usuario.id,
+        )
+        .filter(
+            PacienteTerapeutaCompartido.pacienteid == paciente.id,
+            PacienteTerapeutaCompartido.activo == True,
+            Usuario.rol == 2,
+            Usuario.activo == True,
+            Usuario.consultorioid == consultorioid,
+            or_(
+                PacienteTerapeutaCompartido.fecha_inicio == None,
+                PacienteTerapeutaCompartido.fecha_inicio <= hoy,
+            ),
+            or_(
+                PacienteTerapeutaCompartido.fecha_fin == None,
+                PacienteTerapeutaCompartido.fecha_fin >= hoy,
+            ),
+        )
+        .order_by(Usuario.apellidos.asc(), Usuario.nombres.asc())
+        .all()
+    )
+
+    for terapeuta in compartidos:
+        _agregar_responsable_unico(
+            responsables,
+            ids,
+            terapeuta,
+            "Paciente compartido",
+        )
+
+    ahora = now_ecuador()
+    permisos = (
+        db.query(Usuario)
+        .join(UsuarioPermisoTemporal, UsuarioPermisoTemporal.usuarioid == Usuario.id)
+        .filter(
+            Usuario.rol == 2,
+            Usuario.activo == True,
+            Usuario.consultorioid == consultorioid,
+            UsuarioPermisoTemporal.activo == True,
+            UsuarioPermisoTemporal.tipo_permiso == "atencion_sucursal_temporal",
+            UsuarioPermisoTemporal.fecha_inicio <= ahora,
+            UsuarioPermisoTemporal.fecha_fin >= ahora,
+            or_(
+                UsuarioPermisoTemporal.consultorioid == None,
+                UsuarioPermisoTemporal.consultorioid == consultorioid,
+            ),
+        )
+        .order_by(Usuario.apellidos.asc(), Usuario.nombres.asc())
+        .all()
+    )
+
+    for terapeuta in permisos:
+        _agregar_responsable_unico(
+            responsables,
+            ids,
+            terapeuta,
+            "Permiso temporal de atención",
+        )
+
+    return responsables
+
+
+def _resolver_responsable_gimnasio(
+    *,
+    db: Session,
+    paciente: Paciente,
+    consultorioid: int | None,
+    responsablegimnasioid: int | None,
+    fecha_referencia: date | None = None,
+) -> int:
+    responsables = _responsables_gimnasio_autorizados(
+        db=db,
+        paciente=paciente,
+        consultorioid=consultorioid,
+        fecha_referencia=fecha_referencia,
+    )
+
+    responsables_ids = {usuario.id for usuario, _ in responsables}
+
+    if responsablegimnasioid is not None:
+        if responsablegimnasioid not in responsables_ids:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "El responsable de gimnasio seleccionado no puede atender "
+                    "a este paciente en el consultorio donde se crea el gimnasio."
+                ),
+            )
+
+        return responsablegimnasioid
+
+    if len(responsables) == 1:
+        return responsables[0][0].id
+
+    if len(responsables) == 0:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "No hay fisioterapeuta autorizado para este paciente en el "
+                "consultorio donde se quiere crear el gimnasio. Primero comparte "
+                "o asigna el paciente a un fisioterapeuta de esa clínica."
+            ),
+        )
+
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            "Este paciente tiene más de un fisioterapeuta autorizado para gimnasio. "
+            "Seleccione el responsable de gimnasio."
+        ),
+    )
+
+
+def _responsable_efectivo_membresia(membresia: MembresiaGimnasio, paciente: Paciente) -> int | None:
+    return membresia.responsablegimnasioid or paciente.terapeutaasignadoid
+
+
+def _validar_responsable_para_registro_gimnasio(
+    *,
+    membresia: MembresiaGimnasio,
+    paciente: Paciente,
+    current_user: Usuario,
+    db: Session,
+) -> None:
+    if current_user.rol != 2:
+        return
+
+    responsable_id = _responsable_efectivo_membresia(membresia, paciente)
+
+    if responsable_id is not None and responsable_id != current_user.id:
+        raise HTTPException(
+            status_code=403,
+            detail="Esta membresía de gimnasio está asignada a otro fisioterapeuta.",
+        )
+
+    validar_acceso_paciente_por_rol(
+        paciente=paciente,
+        current_user=current_user,
+        db=db,
+    )
 
 def _nombre_usuario(usuario: Usuario | None) -> str:
     if not usuario:
@@ -468,6 +752,51 @@ def _desactivar_membresia_mensual_si_terminada(
 
 
 
+@router.get(
+    "/paciente/{paciente_id}/responsables",
+    response_model=List[GimnasioResponsableOut],
+)
+def listar_responsables_gimnasio_paciente(
+    paciente_id: int,
+    consultorioid: Optional[int] = Query(default=None),
+    fecha: Optional[date] = Query(default=None),
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(get_current_user),
+):
+    paciente = _validar_acceso_paciente(
+        db=db,
+        paciente_id=paciente_id,
+        current_user=current_user,
+    )
+
+    consultorio_operativo_id = _resolver_consultorio_operativo_gimnasio(
+        paciente=paciente,
+        current_user=current_user,
+        consultorioid=consultorioid,
+    )
+
+    responsables = _responsables_gimnasio_autorizados(
+        db=db,
+        paciente=paciente,
+        consultorioid=consultorio_operativo_id,
+        fecha_referencia=fecha,
+    )
+
+    consultorio_nombre = _nombre_consultorio_por_id(db, consultorio_operativo_id)
+
+    return [
+        GimnasioResponsableOut(
+            id=usuario.id,
+            nombres=usuario.nombres or "",
+            apellidos=usuario.apellidos or "",
+            consultorioid=usuario.consultorioid,
+            consultorio=consultorio_nombre,
+            motivo=motivo,
+        )
+        for usuario, motivo in responsables
+    ]
+
+
 
 @router.post("/membresias", response_model=MembresiaGimnasioOut)
 def crear_membresia_gimnasio(
@@ -492,6 +821,20 @@ def crear_membresia_gimnasio(
             status_code=400,
             detail="La fecha de inicio debe ser de lunes a viernes.",
         )
+
+    consultorio_operativo_id = _resolver_consultorio_operativo_gimnasio(
+        paciente=paciente,
+        current_user=current_user,
+        consultorioid=data.consultorioid,
+    )
+
+    responsable_gimnasio_id = _resolver_responsable_gimnasio(
+        db=db,
+        paciente=paciente,
+        consultorioid=consultorio_operativo_id,
+        responsablegimnasioid=data.responsablegimnasioid,
+        fecha_referencia=data.fechainicio,
+    )
 
     membresia_activa = _obtener_membresia_activa(
         db=db,
@@ -526,6 +869,8 @@ def crear_membresia_gimnasio(
         fechainicio=data.fechainicio,
         diascontratados=data.diascontratados,
         precio=data.precio,
+        consultorioid=consultorio_operativo_id,
+        responsablegimnasioid=responsable_gimnasio_id,
         modalidad=MODALIDAD_MENSUAL,
         activo=True,
         observaciones=data.observaciones,
@@ -573,6 +918,20 @@ def registrar_pase_diario_gimnasio(
         )
 
     fecha_pase = data.fecha or fecha_ecuador()
+
+    consultorio_operativo_id = _resolver_consultorio_operativo_gimnasio(
+        paciente=paciente,
+        current_user=current_user,
+        consultorioid=data.consultorioid,
+    )
+
+    responsable_gimnasio_id = _resolver_responsable_gimnasio(
+        db=db,
+        paciente=paciente,
+        consultorioid=consultorio_operativo_id,
+        responsablegimnasioid=data.responsablegimnasioid,
+        fecha_referencia=fecha_pase,
+    )
 
     if not _es_dia_habil(fecha_pase):
         raise HTTPException(
@@ -649,6 +1008,8 @@ def registrar_pase_diario_gimnasio(
         fechainicio=fecha_pase,
         diascontratados=1,
         precio=data.precio,
+        consultorioid=consultorio_operativo_id,
+        responsablegimnasioid=responsable_gimnasio_id,
         modalidad=MODALIDAD_DIARIA,
         activo=False,
         observaciones=data.observacion,
@@ -822,10 +1183,19 @@ def listar_pases_diarios_gimnasio(
                 detail="El secretario no tiene consultorio asignado.",
             )
 
-        query = query.filter(Paciente.consultorioid == current_user.consultorioid)
+        query = query.filter(
+            func.coalesce(MembresiaGimnasio.consultorioid, Paciente.consultorioid)
+            == current_user.consultorioid
+        )
 
     elif current_user.rol == 2:
-        query = query.filter(Paciente.terapeutaasignadoid == current_user.id)
+        query = query.filter(
+            func.coalesce(
+                MembresiaGimnasio.responsablegimnasioid,
+                Paciente.terapeutaasignadoid,
+            )
+            == current_user.id
+        )
 
     elif current_user.rol == 3:
         pass
@@ -912,7 +1282,13 @@ def _aplicar_filtro_acceso_gimnasio(query, current_user: Usuario):
             detail="Solo los terapeutas pueden registrar asistencia de gimnasio.",
         )
 
-    return query.filter(Paciente.terapeutaasignadoid == current_user.id)
+    return query.filter(
+        func.coalesce(
+            MembresiaGimnasio.responsablegimnasioid,
+            Paciente.terapeutaasignadoid,
+        )
+        == current_user.id
+    )
 
 
 def _mensaje_asistencia_rapida(
@@ -1157,7 +1533,8 @@ def registrar_asistencia_rapida_gimnasio(
             detail="Solo los terapeutas pueden registrar asistencia de gimnasio.",
         )
 
-    validar_acceso_paciente_por_rol(
+    _validar_responsable_para_registro_gimnasio(
+        membresia=membresia,
         paciente=paciente,
         current_user=current_user,
         db=db,
@@ -1362,6 +1739,13 @@ def registrar_movimiento_gimnasio(
             status_code=400,
             detail="El paciente no tiene una membresía de gimnasio activa.",
         )
+
+    _validar_responsable_para_registro_gimnasio(
+        membresia=membresia,
+        paciente=paciente,
+        current_user=current_user,
+        db=db,
+    )
 
     if _desactivar_membresia_mensual_si_terminada(
         db=db,

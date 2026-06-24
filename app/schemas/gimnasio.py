@@ -12,6 +12,8 @@ class MembresiaGimnasioCreate(BaseModel):
     diascontratados: int = Field(default=20, ge=1, le=60)
     precio: Optional[float] = Field(default=None, ge=0)
     observaciones: Optional[str] = None
+    consultorioid: Optional[int] = None
+    responsablegimnasioid: Optional[int] = None
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -37,6 +39,8 @@ class MembresiaGimnasioOut(BaseModel):
     fechainicio: date
     diascontratados: int
     precio: Optional[float] = None
+    consultorioid: Optional[int] = None
+    responsablegimnasioid: Optional[int] = None
     modalidad: str = "MENSUAL"
     activo: bool
     observaciones: Optional[str] = None
@@ -55,6 +59,17 @@ class MovimientoGimnasioOut(BaseModel):
     tratamientopacienteid: Optional[int] = None
     observacion: Optional[str] = None
     fechacreacion: Optional[datetime] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class GimnasioResponsableOut(BaseModel):
+    id: int
+    nombres: str
+    apellidos: str
+    consultorioid: Optional[int] = None
+    consultorio: Optional[str] = None
+    motivo: str = "Autorizado"
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -83,6 +98,8 @@ class PaseDiarioGimnasioCreate(BaseModel):
     fecha: Optional[date] = None
     precio: float = Field(..., gt=0)
     observacion: Optional[str] = None
+    consultorioid: Optional[int] = None
+    responsablegimnasioid: Optional[int] = None
 
     model_config = ConfigDict(populate_by_name=True)
 

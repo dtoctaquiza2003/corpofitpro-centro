@@ -2212,15 +2212,24 @@ def listar_cuentas_gimnasio(
         .filter(MembresiaGimnasio.modalidad == "MENSUAL")
     )
 
+    responsable_gimnasio_expr = func.coalesce(
+        MembresiaGimnasio.responsablegimnasioid,
+        Paciente.terapeutaasignadoid,
+    )
+    consultorio_gimnasio_expr = func.coalesce(
+        MembresiaGimnasio.consultorioid,
+        Paciente.consultorioid,
+    )
+
     if current_user.rol == 2:
-        query = query.filter(Paciente.terapeutaasignadoid == current_user.id)
+        query = query.filter(responsable_gimnasio_expr == current_user.id)
 
     elif current_user.rol == 1:
         validar_consultorio_secretario(
             current_user,
             current_user.consultorioid,
         )
-        query = query.filter(Paciente.consultorioid == current_user.consultorioid)
+        query = query.filter(consultorio_gimnasio_expr == current_user.consultorioid)
 
     elif current_user.rol == 3:
         pass

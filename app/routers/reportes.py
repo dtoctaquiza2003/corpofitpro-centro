@@ -800,6 +800,199 @@ def _resolver_consultorioid_gimnasio_para_rol(
     return _resolver_consultorioid_para_rol(current_user, consultorioid)
 
 
+
+def _gimnasio_responsable_expr():
+    return func.coalesce(
+        MembresiaGimnasio.responsablegimnasioid,
+        Paciente.terapeutaasignadoid,
+    )
+
+
+def _gimnasio_consultorio_expr():
+    return func.coalesce(
+        MembresiaGimnasio.consultorioid,
+        Paciente.consultorioid,
+    )
+
+def _aplicar_filtros_pagos_gimnasio(
+    query,
+    current_user: Usuario,
+    terapeutaid: Optional[int] = None,
+    consultorioid: Optional[int] = None,
+):
+    """Aplica rol + filtros a pagos de gimnasio.
+
+    Gimnasio no tiene sesión de terapia asociada. Se asigna al responsable
+    guardado en la membresía y al consultorio operativo donde se creó el
+    gimnasio. Para datos antiguos sin esos campos, se mantiene el respaldo al
+    terapeuta principal y al consultorio de origen del paciente.
+    """
+    _validar_filtros_para_rol(current_user, terapeutaid)
+    consultorioid = _resolver_consultorioid_gimnasio_para_rol(
+        current_user,
+        consultorioid,
+    )
+
+    responsable_expr = _gimnasio_responsable_expr()
+    consultorio_expr = _gimnasio_consultorio_expr()
+
+    if current_user.rol == 2:
+        query = query.filter(responsable_expr == current_user.id)
+    elif terapeutaid is not None:
+        query = query.filter(responsable_expr == terapeutaid)
+
+    if consultorioid is not None:
+        query = query.filter(consultorio_expr == consultorioid)
+
+    return query
+
+
+def _pagos_gimnasio_detalle_base_query(
+    db: Session,
+    current_user: Usuario,
+    desde: date,
+    hasta: date,
+    terapeutaid: Optional[int] = None,
+    consultorioid: Optional[int] = None,
+    dia_semana: Optional[int] = None,
+    solo_caja: bool = True,
+):
+    """Pagos de gimnasio mensual / pase diario con filtros de reporte."""
+    dia_semana = _validar_dia_semana(dia_semana)
+
+    query = (
+        db.query(Pago, MembresiaGimnasio, Paciente, Usuario)
+        .select_from(Pago)
+        .join(MembresiaGimnasio, MembresiaGimnasio.id == Pago.membresiagimnasioid)
+        .join(Paciente, Paciente.id == MembresiaGimnasio.pacienteid)
+        .outerjoin(Usuario, Usuario.id == _gimnasio_responsable_expr())
+        .filter(
+            Pago.membresiagimnasioid != None,
+            filtro_fechapago_ecuador(desde, hasta),
+            filtro_dia_pago_ecuador(dia_semana),
+            Pago.estadopago == 2,
+            _pago_no_anulado_filter(),
+        )
+    )
+
+    if solo_caja:
+        query = query.filter(_pago_de_caja_filter())
+
+    return _aplicar_filtros_pagos_gimnasio(
+        query,
+        current_user,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+    )
+
+
+def _totales_pagos_gimnasio_caja(
+    db: Session,
+    current_user: Usuario,
+    desde: date,
+    hasta: date,
+    terapeutaid: Optional[int] = None,
+    consultorioid: Optional[int] = None,
+    dia_semana: Optional[int] = None,
+) -> Tuple[float, Dict[str, float], List[MetodoPagoTotalOut], Dict[date, Dict[str, float]]]:
+    """Totales de gimnasio que sí entran a caja."""
+    rows = (
+        _pagos_gimnasio_detalle_base_query(
+            db=db,
+            current_user=current_user,
+            desde=desde,
+            hasta=hasta,
+            terapeutaid=terapeutaid,
+            consultorioid=consultorioid,
+            dia_semana=dia_semana,
+            solo_caja=True,
+        )
+        .with_entities(
+            fecha_pago_ecuador_expr().label("fecha_pago"),
+            Pago.metodopago,
+            func.coalesce(func.sum(Pago.monto), 0),
+        )
+        .group_by(fecha_pago_ecuador_expr(), Pago.metodopago)
+        .all()
+    )
+
+    totales_metodo = {
+        "total_efectivo": 0.0,
+        "total_transferencia": 0.0,
+        "total_tarjeta": 0.0,
+        "total_otros_metodos": 0.0,
+    }
+    por_metodo_map: Dict[str, float] = defaultdict(float)
+    por_dia: Dict[date, Dict[str, float]] = defaultdict(lambda: {
+        "total": 0.0,
+        "efectivo": 0.0,
+        "transferencia": 0.0,
+        "tarjeta": 0.0,
+        "otros": 0.0,
+    })
+
+    total_gimnasio = 0.0
+    for fecha_pago, metodo, total in rows:
+        total_float = float(total or 0)
+        if total_float <= 0:
+            continue
+        total_gimnasio += total_float
+        _sumar_metodo_en_resumen(totales_metodo, metodo, total_float)
+        por_metodo_map[_metodo_nombre_canonico(metodo)] += total_float
+
+        categoria = _normalizar_metodo_pago(metodo)
+        por_dia[fecha_pago]["total"] += total_float
+        por_dia[fecha_pago][categoria] += total_float
+
+    por_metodo = [
+        MetodoPagoTotalOut(metodo=metodo, total=round(float(total or 0), 2))
+        for metodo, total in sorted(por_metodo_map.items())
+        if round(float(total or 0), 2) > 0
+    ]
+
+    return round(total_gimnasio, 2), totales_metodo, por_metodo, por_dia
+
+
+def _totales_pendientes_transferencia_gimnasio(
+    db: Session,
+    current_user: Usuario,
+    desde: date,
+    hasta: date,
+    terapeutaid: Optional[int] = None,
+    consultorioid: Optional[int] = None,
+    dia_semana: Optional[int] = None,
+) -> Tuple[float, int]:
+    """Transferencias de gimnasio pendientes de verificación."""
+    query = (
+        db.query(Pago)
+        .select_from(Pago)
+        .join(MembresiaGimnasio, MembresiaGimnasio.id == Pago.membresiagimnasioid)
+        .join(Paciente, Paciente.id == MembresiaGimnasio.pacienteid)
+        .filter(
+            Pago.membresiagimnasioid != None,
+            filtro_fechapago_ecuador(desde, hasta),
+            filtro_dia_pago_ecuador(dia_semana),
+            Pago.estadopago == 1,
+            _pago_no_anulado_filter(),
+            _pago_de_caja_filter(),
+            Pago.metodopago.ilike("%transfer%"),
+        )
+    )
+
+    query = _aplicar_filtros_pagos_gimnasio(
+        query,
+        current_user,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+    )
+
+    total, cantidad = query.with_entities(
+        func.coalesce(func.sum(Pago.monto), 0),
+        func.count(Pago.id),
+    ).one()
+    return round(float(total or 0), 2), int(cantidad or 0)
+
+
 def _pagos_gimnasio_por_terapeuta(
     db: Session,
     current_user: Usuario,
@@ -819,8 +1012,9 @@ def _pagos_gimnasio_por_terapeuta(
     - Terapia: 35% para fisioterapeuta de lunes a viernes; 40% sábado y domingo.
     - Gimnasio mensual y diario: 50% para fisioterapeuta.
 
-    La asignación se hace por el terapeuta principal del paciente
-    (pacientes.terapeutaasignadoid), no por quien registró el pago.
+    La asignación se hace por el responsable de gimnasio guardado en la
+    membresía. Para datos antiguos sin responsable, se usa como respaldo el
+    terapeuta principal del paciente.
     """
     _validar_filtros_para_rol(current_user, terapeutaid)
     consultorioid = _resolver_consultorioid_gimnasio_para_rol(
@@ -828,9 +1022,12 @@ def _pagos_gimnasio_por_terapeuta(
         consultorioid,
     )
 
+    responsable_expr = _gimnasio_responsable_expr()
+    consultorio_expr = _gimnasio_consultorio_expr()
+
     query = (
         db.query(
-            Paciente.terapeutaasignadoid.label("terapeutaid"),
+            responsable_expr.label("terapeutaid"),
             Usuario.nombres.label("nombres"),
             Usuario.apellidos.label("apellidos"),
             Usuario.consultorioid.label("consultorioid"),
@@ -842,7 +1039,7 @@ def _pagos_gimnasio_por_terapeuta(
             MembresiaGimnasio.id == Pago.membresiagimnasioid,
         )
         .join(Paciente, Paciente.id == MembresiaGimnasio.pacienteid)
-        .join(Usuario, Usuario.id == Paciente.terapeutaasignadoid)
+        .join(Usuario, Usuario.id == responsable_expr)
         .filter(
             Pago.membresiagimnasioid != None,
             Pago.estadopago == 2,
@@ -850,23 +1047,23 @@ def _pagos_gimnasio_por_terapeuta(
             _pago_de_caja_filter(),
             filtro_fechapago_ecuador(desde, hasta),
             filtro_dia_pago_ecuador(dia_semana),
-            Paciente.terapeutaasignadoid != None,
+            responsable_expr != None,
             Usuario.rol == 2,
             Usuario.activo == True,
         )
     )
 
     if current_user.rol == 2:
-        query = query.filter(Paciente.terapeutaasignadoid == current_user.id)
+        query = query.filter(responsable_expr == current_user.id)
     elif terapeutaid is not None:
-        query = query.filter(Paciente.terapeutaasignadoid == terapeutaid)
+        query = query.filter(responsable_expr == terapeutaid)
 
     if consultorioid is not None:
-        query = query.filter(Paciente.consultorioid == consultorioid)
+        query = query.filter(consultorio_expr == consultorioid)
 
     return (
         query.group_by(
-            Paciente.terapeutaasignadoid,
+            responsable_expr,
             Usuario.nombres,
             Usuario.apellidos,
             Usuario.consultorioid,
@@ -894,9 +1091,12 @@ def _pagos_gimnasio_por_consultorio(
         consultorioid,
     )
 
+    responsable_expr = _gimnasio_responsable_expr()
+    consultorio_expr = _gimnasio_consultorio_expr()
+
     query = (
         db.query(
-            Paciente.consultorioid.label("consultorioid"),
+            consultorio_expr.label("consultorioid"),
             func.coalesce(func.sum(Pago.monto), 0).label("total_pagado"),
         )
         .select_from(Pago)
@@ -916,14 +1116,14 @@ def _pagos_gimnasio_por_consultorio(
     )
 
     if current_user.rol == 2:
-        query = query.filter(Paciente.terapeutaasignadoid == current_user.id)
+        query = query.filter(responsable_expr == current_user.id)
     elif terapeutaid is not None:
-        query = query.filter(Paciente.terapeutaasignadoid == terapeutaid)
+        query = query.filter(responsable_expr == terapeutaid)
 
     if consultorioid is not None:
-        query = query.filter(Paciente.consultorioid == consultorioid)
+        query = query.filter(consultorio_expr == consultorioid)
 
-    return query.group_by(Paciente.consultorioid).all()
+    return query.group_by(consultorio_expr).all()
 
 
 def _obtener_consultorios_map(db: Session) -> Dict[Optional[int], str]:
@@ -2329,6 +2529,22 @@ def reporte_terapias(
         consultorioid=consultorioid,
         dia_semana=dia_semana,
     )
+    transferencias_gimnasio_total, transferencias_gimnasio_cantidad = _totales_pendientes_transferencia_gimnasio(
+        db=db,
+        current_user=current_user,
+        desde=desde,
+        hasta=hasta,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+        dia_semana=dia_semana,
+    )
+    transferencias_pendientes_total = round(
+        float(transferencias_pendientes_total or 0) + float(transferencias_gimnasio_total or 0),
+        2,
+    )
+    transferencias_pendientes_cantidad = int(transferencias_pendientes_cantidad or 0) + int(
+        transferencias_gimnasio_cantidad or 0
+    )
 
     pago_previo_query = db.query(Pago).filter(
         filtro_fechapago_ecuador(desde, hasta),
@@ -2403,6 +2619,38 @@ def reporte_terapias(
             )
             for metodo, total in sorted(por_metodo_map.items())
             if round(float(total or 0), 2) > 0
+        ]
+
+    # Mantener los pendientes de transferencia totales: terapia + gimnasio.
+    totales_metodo["transferencias_pendientes_total"] = transferencias_pendientes_total
+    totales_metodo["transferencias_pendientes_cantidad"] = transferencias_pendientes_cantidad
+
+    total_gimnasio_pagado, totales_gimnasio, por_metodo_gimnasio, gimnasio_por_dia = _totales_pagos_gimnasio_caja(
+        db=db,
+        current_user=current_user,
+        desde=desde,
+        hasta=hasta,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+        dia_semana=dia_semana,
+    )
+
+    if total_gimnasio_pagado > 0:
+        total_pagado_verificado += total_gimnasio_pagado
+        for key in ("total_efectivo", "total_transferencia", "total_tarjeta", "total_otros_metodos"):
+            totales_metodo[key] = float(totales_metodo.get(key, 0.0) or 0.0) + float(
+                totales_gimnasio.get(key, 0.0) or 0.0
+            )
+
+        por_metodo_final: Dict[str, float] = defaultdict(float)
+        for item in por_metodo:
+            por_metodo_final[item.metodo] += float(item.total or 0)
+        for item in por_metodo_gimnasio:
+            por_metodo_final[item.metodo] += float(item.total or 0)
+        por_metodo = [
+            MetodoPagoTotalOut(metodo=metodo, total=round(total, 2))
+            for metodo, total in sorted(por_metodo_final.items())
+            if round(total, 2) > 0
         ]
 
     tratamiento_map: Dict[str, Dict[str, float]] = {}
@@ -2488,6 +2736,30 @@ def reporte_terapias(
                 elif categoria == "tarjeta":
                     dias_map[fecha_pago].pagos_tarjeta = round(dias_map[fecha_pago].pagos_tarjeta + total_float, 2)
 
+    for fecha_pago, data in gimnasio_por_dia.items():
+        if fecha_pago in dias_map:
+            total_float = float(data.get("total", 0.0) or 0.0)
+            dias_map[fecha_pago].pagos_verificados = round(
+                dias_map[fecha_pago].pagos_verificados + total_float,
+                2,
+            )
+            dias_map[fecha_pago].pagos_gimnasio = round(
+                dias_map[fecha_pago].pagos_gimnasio + total_float,
+                2,
+            )
+            dias_map[fecha_pago].pagos_efectivo = round(
+                dias_map[fecha_pago].pagos_efectivo + float(data.get("efectivo", 0.0) or 0.0),
+                2,
+            )
+            dias_map[fecha_pago].pagos_transferencia = round(
+                dias_map[fecha_pago].pagos_transferencia + float(data.get("transferencia", 0.0) or 0.0),
+                2,
+            )
+            dias_map[fecha_pago].pagos_tarjeta = round(
+                dias_map[fecha_pago].pagos_tarjeta + float(data.get("tarjeta", 0.0) or 0.0),
+                2,
+            )
+
     recuperacion_cartera_query = _query_recuperacion_cartera(
         db=db,
         current_user=current_user,
@@ -2558,6 +2830,7 @@ def reporte_terapias(
         transferencias_pendientes_total=round(float(totales_metodo.get("transferencias_pendientes_total", transferencias_pendientes_total) or 0.0), 2),
         transferencias_pendientes_cantidad=int(totales_metodo.get("transferencias_pendientes_cantidad", transferencias_pendientes_cantidad) or 0),
         total_pago_previo_verificado=round(total_pago_previo_verificado, 2),
+        total_gimnasio_pagado=round(total_gimnasio_pagado, 2),
         total_ecuasanitas=round(total_ecuasanitas, 2),
         sesiones_ecuasanitas=sesiones_ecuasanitas,
         total_pendiente=round(total_pendiente, 2),
@@ -2570,7 +2843,8 @@ def reporte_terapias(
         tratamientos_mas_realizados=tratamientos_mas,
         sesiones_por_dia=list(dias_map.values()),
         estado_pagos=ResumenEstadoPagosOut(
-            pagado_verificado=round(total_pagado_verificado, 2),
+            pagado_verificado=round(max(total_pagado_verificado - total_gimnasio_pagado, 0.0), 2),
+            gimnasio_pagado=round(total_gimnasio_pagado, 2),
             pago_previo=round(total_pago_previo_verificado, 2),
             pendiente_cobro=round(total_pendiente, 2),
             saldo_a_favor=round(saldo_a_favor, 2),
@@ -2701,6 +2975,60 @@ def _terapeutas_por_tratamiento_en_sesiones(sesiones: List[SesionTerapia]) -> Di
         nombres.setdefault(key, set()).add(_nombre_usuario(getattr(sesion, "terapeuta", None)))
     return {key: ", ".join(sorted(value)) for key, value in nombres.items() if value}
 
+
+def _pagos_gimnasio_detalle_out(
+    db: Session,
+    current_user: Usuario,
+    desde: date,
+    hasta: date,
+    terapeutaid: Optional[int] = None,
+    consultorioid: Optional[int] = None,
+    dia_semana: Optional[int] = None,
+) -> List[CajaSemanalPagoOut]:
+    """Detalle de pagos de gimnasio para el bottom sheet de caja."""
+    rows = (
+        _pagos_gimnasio_detalle_base_query(
+            db=db,
+            current_user=current_user,
+            desde=desde,
+            hasta=hasta,
+            terapeutaid=terapeutaid,
+            consultorioid=consultorioid,
+            dia_semana=dia_semana,
+            solo_caja=True,
+        )
+        .order_by(Pago.fechapago, Pago.id)
+        .all()
+    )
+
+    pagos: List[CajaSemanalPagoOut] = []
+    for pago, membresia, paciente, terapeuta in rows:
+        modalidad = _texto_normalizado(getattr(membresia, "modalidad", ""))
+        if "diario" in modalidad or "dia" in modalidad:
+            concepto = "Gimnasio diario"
+        else:
+            concepto = "Membresía gimnasio"
+
+        pagos.append(
+            CajaSemanalPagoOut(
+                pagoid=int(pago.id),
+                es_gimnasio=True,
+                membresiagimnasioid=int(pago.membresiagimnasioid or 0),
+                fecha=_fecha_pago_local_ecuador(pago),
+                pacienteid=int(paciente.id),
+                paciente=_nombre_paciente(paciente),
+                terapeuta=_nombre_usuario(terapeuta),
+                tratamientopacienteid=0,
+                tratamiento=concepto,
+                metodo=pago.metodopago or "Sin método",
+                monto=round(float(pago.monto or 0), 2),
+                valor_sesion=0.0,
+                sesiones_pagadas=0.0,
+                sesiones_realizadas_semana=0,
+            )
+        )
+
+    return pagos
 
 
 
@@ -3231,19 +3559,46 @@ def reporte_caja_semanal_detalle(
     )
     if caja_asignada_fisio is not None:
         totales = caja_asignada_fisio["totales"]
-        pagos_asignados = caja_asignada_fisio["pagos_detalle"]
+        pagos_asignados = list(caja_asignada_fisio["pagos_detalle"])
+        pagos_gimnasio = _pagos_gimnasio_detalle_out(
+            db=db,
+            current_user=current_user,
+            desde=desde,
+            hasta=hasta,
+            terapeutaid=terapeutaid,
+            consultorioid=consultorioid,
+            dia_semana=dia_semana,
+        )
+        total_gimnasio = round(sum(item.monto for item in pagos_gimnasio), 2)
+        for item in pagos_gimnasio:
+            _sumar_metodo_en_resumen(totales, item.metodo, item.monto)
+        pagos_asignados.extend(pagos_gimnasio)
+
+        pendiente_gym_total, pendiente_gym_cantidad = _totales_pendientes_transferencia_gimnasio(
+            db=db,
+            current_user=current_user,
+            desde=desde,
+            hasta=hasta,
+            terapeutaid=terapeutaid,
+            consultorioid=consultorioid,
+            dia_semana=dia_semana,
+        )
+        transferencias_total = round(float(totales.get("transferencias_pendientes_total", 0.0) or 0.0) + pendiente_gym_total, 2)
+        transferencias_cantidad = int(totales.get("transferencias_pendientes_cantidad", 0) or 0) + pendiente_gym_cantidad
+
         return CajaSemanalDetalleOut(
             desde=desde,
             hasta=hasta,
-            total_caja=round(float(caja_asignada_fisio["total"] or 0.0), 2),
+            total_caja=round(float(caja_asignada_fisio["total"] or 0.0) + total_gimnasio, 2),
             total_pagos=len(pagos_asignados),
             total_sesiones_pagadas=round(sum(item.sesiones_pagadas for item in pagos_asignados), 2),
+            total_gimnasio=total_gimnasio,
             total_efectivo=round(float(totales.get("total_efectivo", 0.0) or 0.0), 2),
             total_transferencia=round(float(totales.get("total_transferencia", 0.0) or 0.0), 2),
             total_tarjeta=round(float(totales.get("total_tarjeta", 0.0) or 0.0), 2),
             total_otros_metodos=round(float(totales.get("total_otros_metodos", 0.0) or 0.0), 2),
-            transferencias_pendientes_total=round(float(totales.get("transferencias_pendientes_total", 0.0) or 0.0), 2),
-            transferencias_pendientes_cantidad=int(totales.get("transferencias_pendientes_cantidad", 0) or 0),
+            transferencias_pendientes_total=transferencias_total,
+            transferencias_pendientes_cantidad=transferencias_cantidad,
             pagos=pagos_asignados,
         )
 
@@ -3301,6 +3656,18 @@ def reporte_caja_semanal_detalle(
             )
         )
 
+    pagos_gimnasio = _pagos_gimnasio_detalle_out(
+        db=db,
+        current_user=current_user,
+        desde=desde,
+        hasta=hasta,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+        dia_semana=dia_semana,
+    )
+    total_gimnasio = round(sum(item.monto for item in pagos_gimnasio), 2)
+    pagos.extend(pagos_gimnasio)
+
     totales_metodo = {
         "total_efectivo": 0.0,
         "total_transferencia": 0.0,
@@ -3320,12 +3687,30 @@ def reporte_caja_semanal_detalle(
         dia_semana=dia_semana,
     )
 
+    transferencias_gym_total, transferencias_gym_cantidad = _totales_pendientes_transferencia_gimnasio(
+        db=db,
+        current_user=current_user,
+        desde=desde,
+        hasta=hasta,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+        dia_semana=dia_semana,
+    )
+    transferencias_pendientes_total = round(
+        float(transferencias_pendientes_total or 0) + float(transferencias_gym_total or 0),
+        2,
+    )
+    transferencias_pendientes_cantidad = int(transferencias_pendientes_cantidad or 0) + int(
+        transferencias_gym_cantidad or 0
+    )
+
     return CajaSemanalDetalleOut(
         desde=desde,
         hasta=hasta,
         total_caja=round(sum(item.monto for item in pagos), 2),
         total_pagos=len(pagos),
         total_sesiones_pagadas=round(sum(item.sesiones_pagadas for item in pagos), 2),
+        total_gimnasio=total_gimnasio,
         total_efectivo=round(float(totales_metodo.get("total_efectivo", 0.0) or 0.0), 2),
         total_transferencia=round(float(totales_metodo.get("total_transferencia", 0.0) or 0.0), 2),
         total_tarjeta=round(float(totales_metodo.get("total_tarjeta", 0.0) or 0.0), 2),
@@ -4739,8 +5124,10 @@ def _excel_base_pagos(
 
     # Pagos de gimnasio mensual / diario. Gimnasio no se cubre por Ecuasanitas.
     consultorio_resuelto = _resolver_consultorioid_gimnasio_para_rol(current_user, consultorioid)
+    responsable_expr = _gimnasio_responsable_expr()
+    consultorio_expr = _gimnasio_consultorio_expr()
     pagos_gimnasio_query = (
-        db.query(Pago)
+        db.query(Pago, MembresiaGimnasio)
         .join(MembresiaGimnasio, MembresiaGimnasio.id == Pago.membresiagimnasioid)
         .join(Paciente, Paciente.id == MembresiaGimnasio.pacienteid)
         .filter(
@@ -4751,24 +5138,30 @@ def _excel_base_pagos(
     )
 
     if current_user.rol == 2:
-        pagos_gimnasio_query = pagos_gimnasio_query.filter(Paciente.terapeutaasignadoid == current_user.id)
+        pagos_gimnasio_query = pagos_gimnasio_query.filter(responsable_expr == current_user.id)
     elif terapeutaid is not None:
-        pagos_gimnasio_query = pagos_gimnasio_query.filter(Paciente.terapeutaasignadoid == terapeutaid)
+        pagos_gimnasio_query = pagos_gimnasio_query.filter(responsable_expr == terapeutaid)
 
     if consultorio_resuelto is not None:
-        pagos_gimnasio_query = pagos_gimnasio_query.filter(Paciente.consultorioid == consultorio_resuelto)
+        pagos_gimnasio_query = pagos_gimnasio_query.filter(consultorio_expr == consultorio_resuelto)
 
-    pagos_gimnasio = pagos_gimnasio_query.order_by(Pago.fechapago, Pago.id).all()
-    pacientes_gym = _excel_map_pacientes(db, {p.pacienteid for p in pagos_gimnasio})
+    pagos_gimnasio_rows = pagos_gimnasio_query.order_by(Pago.fechapago, Pago.id).all()
+    pacientes_gym = _excel_map_pacientes(db, {pago.pacienteid for pago, _ in pagos_gimnasio_rows})
     usuarios_gym = _excel_map_usuarios(
         db,
-        {getattr(pacientes_gym.get(p.pacienteid), "terapeutaasignadoid", None) for p in pagos_gimnasio}
-        | {p.creado_por_id for p in pagos_gimnasio},
+        {
+            membresia.responsablegimnasioid
+            or getattr(pacientes_gym.get(pago.pacienteid), "terapeutaasignadoid", None)
+            for pago, membresia in pagos_gimnasio_rows
+        }
+        | {pago.creado_por_id for pago, _ in pagos_gimnasio_rows},
     )
 
-    for pago in pagos_gimnasio:
+    for pago, membresia in pagos_gimnasio_rows:
         paciente = pacientes_gym.get(pago.pacienteid)
-        terapeuta = usuarios_gym.get(getattr(paciente, "terapeutaasignadoid", None))
+        responsable_id = membresia.responsablegimnasioid or getattr(paciente, "terapeutaasignadoid", None)
+        terapeuta = usuarios_gym.get(responsable_id)
+        consultorio_pago_id = membresia.consultorioid or getattr(paciente, "consultorioid", None)
         observacion = _excel_safe_text(
             pago.observacionpagoprevio
             or (pago.numerocomprobante if _es_metodo_sin_caja(pago.metodopago) else None)
@@ -4779,7 +5172,7 @@ def _excel_base_pagos(
             pago=pago,
             paciente=paciente,
             responsable=_nombre_usuario(terapeuta),
-            consultorio_nombre=consultorios_map.get(getattr(paciente, "consultorioid", None), "Sin consultorio"),
+            consultorio_nombre=consultorios_map.get(consultorio_pago_id, "Sin consultorio"),
             tipo="Gimnasio",
             referencia=f"Membresía/Pase #{pago.membresiagimnasioid}",
             observacion=observacion,

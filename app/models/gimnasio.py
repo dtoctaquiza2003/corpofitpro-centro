@@ -12,6 +12,26 @@ class MembresiaGimnasio(Base):
     diascontratados = Column(SmallInteger, nullable=False, default=20)
     precio = Column(Numeric(10, 2), nullable=True)
 
+    # Consultorio donde se creó/atiende el gimnasio.
+    # Para pacientes compartidos entre clínicas, el ingreso de gimnasio pertenece
+    # al consultorio operativo, no necesariamente al consultorio de origen del paciente.
+    consultorioid = Column(
+        Integer,
+        ForeignKey("consultorios.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    # Fisioterapeuta responsable de gimnasio.
+    # No se usa automáticamente el terapeuta principal del paciente porque el
+    # paciente puede estar compartido o autorizado en otro consultorio.
+    responsablegimnasioid = Column(
+        Integer,
+        ForeignKey("usuarios.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
     modalidad = Column(String(20), nullable=False, default="MENSUAL")
 
     activo = Column(Boolean, nullable=False, default=True)

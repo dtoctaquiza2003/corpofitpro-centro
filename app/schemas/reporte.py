@@ -111,6 +111,9 @@ class TratamientoRealizadoOut(BaseModel):
 
 class ResumenEstadoPagosOut(BaseModel):
     pagado_verificado: float = 0
+    # Cobros verificados de gimnasio mensual / pase diario. Se muestra separado
+    # para no confundirlo con producción de terapias.
+    gimnasio_pagado: float = 0
     # Dinero pagado antes de usar CORPOFIT Pro. Reduce saldos, pero no es caja actual.
     pago_previo: float = 0
     pendiente_cobro: float = 0
@@ -146,6 +149,8 @@ class DeudaAcumuladaOut(BaseModel):
 
 class CajaSemanalPagoOut(BaseModel):
     pagoid: int
+    es_gimnasio: bool = False
+    membresiagimnasioid: Optional[int] = None
     fecha: date
     pacienteid: int
     paciente: str
@@ -165,6 +170,7 @@ class CajaSemanalDetalleOut(BaseModel):
     total_caja: float = 0
     total_pagos: int = 0
     total_sesiones_pagadas: float = 0
+    total_gimnasio: float = 0
 
     # Desglose para cuadre de caja.
     total_efectivo: float = 0
@@ -231,6 +237,7 @@ class ReporteDiaOut(BaseModel):
     pagos_efectivo: float = 0
     pagos_transferencia: float = 0
     pagos_tarjeta: float = 0
+    pagos_gimnasio: float = 0
     cubierto_ecuasanitas: float = 0
 
 
@@ -250,6 +257,9 @@ class TerapiasReporteOut(BaseModel):
     transferencias_pendientes_cantidad: int = 0
     # Pago previo / saldo inicial: no entra al cuadre de caja del rango.
     total_pago_previo_verificado: float = 0
+    # Ingreso real de gimnasio verificado en el rango. No aumenta
+    # total_generado de terapias; sí entra al cuadre de caja.
+    total_gimnasio_pagado: float = 0
     total_ecuasanitas: float = 0
     sesiones_ecuasanitas: int = 0
     total_pendiente: float = 0
