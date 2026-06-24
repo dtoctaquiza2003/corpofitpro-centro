@@ -216,19 +216,28 @@ def rango_fechas_ecuador(desde: date, hasta: date) -> tuple[datetime, datetime]:
 
 
 def fecha_pago_ecuador_expr():
-    """Fecha de caja del pago.
+    """Fecha oficial de caja del pago.
 
-    Prioridad:
-    1. fechapagoreal, cuando la secretaria registró una fecha contable/caja.
-    2. fecha local Ecuador derivada de fechapago UTC.
+    Regla de reporte/caja:
+    - Si existe `fecha_caja_ecuador`, se usa esa fecha contable local.
+    - Si no existe o está vacía, se usa `fechapago` convertido a Ecuador.
 
-    Esto evita que pagos registrados cerca de medianoche se vayan al día
-    incorrecto del cuadre.
+    No se prioriza `fechapagoreal`, porque puede mover pagos registrados
+    cerca de medianoche a otro día y descuadrar la caja semanal.
     """
-    return func.coalesce(
-        Pago.fechapagoreal,
-        cast(func.timezone("America/Guayaquil", Pago.fechapago), Date),
+    fecha_local_expr = cast(
+        func.timezone("America/Guayaquil", Pago.fechapago),
+        Date,
     )
+    fecha_caja_col = getattr(Pago, "fecha_caja_ecuador", None)
+
+    if fecha_caja_col is not None:
+        return func.coalesce(
+            cast(fecha_caja_col, Date),
+            fecha_local_expr,
+        )
+
+    return fecha_local_expr
 
 
 def filtro_fechapago_ecuador(desde: date, hasta: date):
@@ -446,7 +455,7 @@ def _totales_pendientes_transferencia(
         Pago.metodopago.ilike("%transfer%"),
     )
 
-    query = _aplicar_filtros_pagos(
+    query = _aplicar_filtros_pagos_caja(
         query,
         current_user,
         terapeutaid=terapeutaid,
@@ -790,6 +799,69 @@ def _aplicar_filtros_pagos(
         )
 
     return query
+
+
+
+
+def _aplicar_filtro_consultorio_cobrador(query, consultorioid: Optional[int]):
+    """Filtra caja por el consultorio del usuario que registró el pago.
+
+    Esta regla es distinta a la visibilidad clínica del tratamiento.
+    Un paciente puede haber sido atendido o transferido entre sedes, pero la
+    caja debe pertenecer al consultorio que cobró/registró el pago.
+    """
+    if consultorioid is None:
+        return query
+
+    cobrador = aliased(Usuario)
+    return (
+        query.join(cobrador, cobrador.id == Pago.creado_por_id)
+        .filter(cobrador.consultorioid == consultorioid)
+    )
+
+
+def _aplicar_filtros_pagos_caja(
+    query,
+    current_user: Usuario,
+    terapeutaid: Optional[int] = None,
+    consultorioid: Optional[int] = None,
+):
+    """Aplica filtros a pagos de terapia que entran a caja.
+
+    - La visibilidad por terapeuta sigue usando paciente/tratamiento/sesión.
+    - La visibilidad por consultorio usa el cobrador (`Pago.creado_por_id`).
+
+    Esto evita que un pago de Atahualpa aparezca en la caja del Centro solo
+    porque el paciente tuvo una sesión anterior en Centro, o viceversa.
+    """
+    _validar_filtros_para_rol(current_user, terapeutaid)
+
+    consultorio_resuelto = _resolver_consultorioid_para_rol(
+        current_user,
+        consultorioid,
+    )
+
+    query = (
+        query.join(
+            TratamientoPaciente,
+            TratamientoPaciente.id == Pago.tratamientopacienteid,
+        )
+        .join(Paciente, Paciente.id == TratamientoPaciente.pacienteid)
+    )
+
+    if current_user.rol == 2:
+        query = query.filter(
+            _tratamiento_visible_para_terapeuta_filter(current_user.id)
+        )
+    elif terapeutaid is not None:
+        query = query.filter(
+            _tratamiento_visible_para_terapeuta_filter(terapeutaid)
+        )
+
+    return _aplicar_filtro_consultorio_cobrador(
+        query,
+        consultorio_resuelto,
+    )
 
 
 def _resolver_consultorioid_gimnasio_para_rol(
@@ -2111,7 +2183,7 @@ def dashboard_resumen(
         Pago.tratamientopacienteid != None,
     )
 
-    pagos_hoy_query = _aplicar_filtros_pagos(
+    pagos_hoy_query = _aplicar_filtros_pagos_caja(
         pagos_hoy_query,
         current_user,
         terapeutaid=terapeutaid,
@@ -2150,7 +2222,7 @@ def dashboard_resumen(
         Pago.tratamientopacienteid != None,
     )
 
-    transferencias_pendientes_query = _aplicar_filtros_pagos(
+    transferencias_pendientes_query = _aplicar_filtros_pagos_caja(
         transferencias_pendientes_query,
         current_user,
         terapeutaid=terapeutaid,
@@ -2491,7 +2563,7 @@ def reporte_terapias(
         Pago.tratamientopacienteid != None,
     )
 
-    pagos_query = _aplicar_filtros_pagos(
+    pagos_query = _aplicar_filtros_pagos_caja(
         pagos_query,
         current_user,
         terapeutaid=terapeutaid,
@@ -2555,7 +2627,7 @@ def reporte_terapias(
         Pago.tratamientopacienteid != None,
     )
 
-    pago_previo_query = _aplicar_filtros_pagos(
+    pago_previo_query = _aplicar_filtros_pagos_caja(
         pago_previo_query,
         current_user,
         terapeutaid=terapeutaid,
@@ -2867,9 +2939,13 @@ def reporte_terapias(
 
 
 def _fecha_pago_local_ecuador(pago: Pago) -> date:
-    fecha_real = getattr(pago, "fechapagoreal", None)
-    if fecha_real is not None:
-        return fecha_real
+    """Devuelve la misma fecha de caja que usa el SQL del reporte."""
+    fecha_caja = getattr(pago, "fecha_caja_ecuador", None)
+    if fecha_caja is not None:
+        if isinstance(fecha_caja, datetime):
+            return fecha_caja.date()
+        if isinstance(fecha_caja, date):
+            return fecha_caja
 
     value = pago.fechapago
     if value is None:
@@ -2973,7 +3049,10 @@ def _pagos_detalle_base_query(
         query = query.filter(_tratamiento_visible_para_terapeuta_filter(terapeutaid))
 
     if consultorio_resuelto is not None:
-        query = query.filter(_tratamiento_visible_para_consultorio_filter(consultorio_resuelto))
+        query = _aplicar_filtro_consultorio_cobrador(
+            query,
+            consultorio_resuelto,
+        )
 
     return query
 
@@ -5193,7 +5272,7 @@ def _excel_base_pagos(
         filtro_fechapago_ecuador(desde, hasta),
         filtro_dia_pago_ecuador(dia_semana),
     )
-    pagos_terapia_query = _aplicar_filtros_pagos(
+    pagos_terapia_query = _aplicar_filtros_pagos_caja(
         pagos_terapia_query,
         current_user,
         terapeutaid=terapeutaid,
