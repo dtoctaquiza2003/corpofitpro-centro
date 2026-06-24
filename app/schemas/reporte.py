@@ -116,6 +116,9 @@ class ResumenEstadoPagosOut(BaseModel):
     gimnasio_pagado: float = 0
     # Dinero pagado antes de usar CORPOFIT Pro. Reduce saldos, pero no es caja actual.
     pago_previo: float = 0
+    # Cortesías, canjes, familiares/convenios y pagos en especie: cubren saldos,
+    # pero NO aumentan caja real.
+    cubierto_sin_caja: float = 0
     pendiente_cobro: float = 0
     saldo_a_favor: float = 0
     pendiente_verificacion: float = 0
@@ -150,6 +153,7 @@ class DeudaAcumuladaOut(BaseModel):
 class CajaSemanalPagoOut(BaseModel):
     pagoid: int
     es_gimnasio: bool = False
+    es_sin_caja: bool = False
     membresiagimnasioid: Optional[int] = None
     fecha: date
     pacienteid: int
@@ -171,6 +175,7 @@ class CajaSemanalDetalleOut(BaseModel):
     total_pagos: int = 0
     total_sesiones_pagadas: float = 0
     total_gimnasio: float = 0
+    total_no_monetario: float = 0
 
     # Desglose para cuadre de caja.
     total_efectivo: float = 0
@@ -181,6 +186,7 @@ class CajaSemanalDetalleOut(BaseModel):
     transferencias_pendientes_cantidad: int = 0
 
     pagos: List[CajaSemanalPagoOut] = Field(default_factory=list)
+    pagos_no_monetarios: List[CajaSemanalPagoOut] = Field(default_factory=list)
 
 
 class PendienteSemanaPacienteOut(BaseModel):
@@ -260,6 +266,9 @@ class TerapiasReporteOut(BaseModel):
     # Ingreso real de gimnasio verificado en el rango. No aumenta
     # total_generado de terapias; sí entra al cuadre de caja.
     total_gimnasio_pagado: float = 0
+    # Valor cubierto con cortesía/canje/familiares/pago en especie.
+    # No aumenta caja real, pero evita que quede como pendiente.
+    total_no_monetario_cubierto: float = 0
     total_ecuasanitas: float = 0
     sesiones_ecuasanitas: int = 0
     total_pendiente: float = 0

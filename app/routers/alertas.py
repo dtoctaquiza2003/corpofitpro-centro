@@ -10,10 +10,11 @@ from ..auth.permissions import (
 )
 from ..dependencies.db import get_db
 from ..models.alerta import Alerta
+from ..models.notificacion import Notificacion
 from ..models.paciente import Paciente
 from ..models.sesion_terapia import SesionTerapia
 from ..models.usuario import Usuario
-from ..schemas.alerta import AlertaOut
+from ..schemas.alerta import AlertaOut, SesionAuditoriaAlertaOut
 from ..utils.fechas import to_ecuador
 
 router = APIRouter(prefix="/api/alertas", tags=["alertas"])
@@ -124,6 +125,66 @@ def _alerta_a_response(
     }
 
 
+
+def _notificacion_a_auditoria_sesion_response(notificacion: Notificacion) -> dict:
+    data = notificacion.data or {}
+
+    tratamientos_aplicados_raw = data.get("tratamientos_aplicados") or []
+    if isinstance(tratamientos_aplicados_raw, list):
+        tratamientos_aplicados = [
+            str(item)
+            for item in tratamientos_aplicados_raw
+            if str(item).strip()
+        ]
+    else:
+        tratamientos_aplicados = []
+
+    return {
+        "id": notificacion.id,
+        "titulo": notificacion.titulo or "Auditoría de atención",
+        "mensaje": notificacion.mensaje or "",
+        "tipo": notificacion.tipo or "",
+        "leida": bool(notificacion.leida),
+        "fecha": to_ecuador(notificacion.fecha),
+        "referencia_tipo": notificacion.referencia_tipo,
+        "referencia_id": notificacion.referencia_id,
+        "accion": data.get("accion"),
+        "sesion_id": data.get("sesion_id") or notificacion.referencia_id,
+        "paciente_id": data.get("paciente_id"),
+        "paciente_nombre": data.get("paciente_nombre"),
+        "consultorioid": data.get("consultorioid"),
+        "consultorio_nombre": data.get("consultorio_nombre"),
+        "terapeuta_id": data.get("terapeuta_id"),
+        "terapeuta_nombre": data.get("terapeuta_nombre"),
+        "secretario_id": data.get("secretario_id"),
+        "secretario_nombre": data.get("secretario_nombre"),
+        "tratamiento_anterior_id": data.get("tratamiento_anterior_id"),
+        "tratamiento_anterior_nombre": data.get("tratamiento_anterior_nombre"),
+        "tratamiento_nuevo_id": data.get("tratamiento_nuevo_id"),
+        "tratamiento_nuevo_nombre": data.get("tratamiento_nuevo_nombre"),
+        "tratamientos_aplicados": tratamientos_aplicados,
+        "data": data,
+    }
+
+
+def _query_auditoria_sesiones_usuario(
+    db: Session,
+    current_user: Usuario,
+    solo_no_leidas: bool = False,
+):
+    query = db.query(Notificacion).filter(
+        Notificacion.usuarioid == current_user.id,
+        Notificacion.tipo.in_([
+            "sesion_eliminada",
+            "sesion_alterada",
+        ]),
+    )
+
+    if solo_no_leidas:
+        query = query.filter(Notificacion.leida == False)
+
+    return query
+
 def _validar_alerta_con_acceso(
     db: Session,
     alerta_id: int,
@@ -212,6 +273,68 @@ def listar_alertas(
         for alerta in alertas
     ]
 
+
+
+@router.get("/auditoria-sesiones", response_model=List[SesionAuditoriaAlertaOut])
+def listar_alertas_auditoria_sesiones(
+    solo_no_leidas: bool = False,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(get_current_user),
+):
+    """
+    Alertas administrativas separadas de las alertas clínicas.
+
+    Se alimenta desde la tabla notificaciones porque la acción ya queda
+    registrada allí cuando un secretario altera o elimina una atención.
+    No modifica la tabla alertas ni mezcla auditoría con dolor de pacientes.
+    """
+    notificaciones = (
+        _query_auditoria_sesiones_usuario(
+            db=db,
+            current_user=current_user,
+            solo_no_leidas=solo_no_leidas,
+        )
+        .order_by(Notificacion.fecha.desc())
+        .limit(100)
+        .all()
+    )
+
+    return [
+        _notificacion_a_auditoria_sesion_response(notificacion)
+        for notificacion in notificaciones
+    ]
+
+
+@router.patch(
+    "/auditoria-sesiones/{notificacion_id}/leer",
+    response_model=SesionAuditoriaAlertaOut,
+)
+def marcar_auditoria_sesion_leida(
+    notificacion_id: int,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(get_current_user),
+):
+    notificacion = (
+        _query_auditoria_sesiones_usuario(
+            db=db,
+            current_user=current_user,
+            solo_no_leidas=False,
+        )
+        .filter(Notificacion.id == notificacion_id)
+        .first()
+    )
+
+    if not notificacion:
+        raise HTTPException(
+            status_code=404,
+            detail="Alerta de auditoría no encontrada.",
+        )
+
+    notificacion.leida = True
+    db.commit()
+    db.refresh(notificacion)
+
+    return _notificacion_a_auditoria_sesion_response(notificacion)
 
 @router.put("/{alerta_id}/leer")
 def marcar_leida(

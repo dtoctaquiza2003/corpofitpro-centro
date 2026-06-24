@@ -2804,6 +2804,16 @@ def reporte_terapias(
                 2,
             )
 
+    total_no_monetario_cubierto = _total_no_monetario_cubierto(
+        db=db,
+        current_user=current_user,
+        desde=desde,
+        hasta=hasta,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+        dia_semana=dia_semana,
+    )
+
     tratamientos_mas = sorted(
         [
             TratamientoRealizadoOut(
@@ -2831,6 +2841,7 @@ def reporte_terapias(
         transferencias_pendientes_cantidad=int(totales_metodo.get("transferencias_pendientes_cantidad", transferencias_pendientes_cantidad) or 0),
         total_pago_previo_verificado=round(total_pago_previo_verificado, 2),
         total_gimnasio_pagado=round(total_gimnasio_pagado, 2),
+        total_no_monetario_cubierto=round(total_no_monetario_cubierto, 2),
         total_ecuasanitas=round(total_ecuasanitas, 2),
         sesiones_ecuasanitas=sesiones_ecuasanitas,
         total_pendiente=round(total_pendiente, 2),
@@ -2846,6 +2857,7 @@ def reporte_terapias(
             pagado_verificado=round(max(total_pagado_verificado - total_gimnasio_pagado, 0.0), 2),
             gimnasio_pagado=round(total_gimnasio_pagado, 2),
             pago_previo=round(total_pago_previo_verificado, 2),
+            cubierto_sin_caja=round(total_no_monetario_cubierto, 2),
             pendiente_cobro=round(total_pendiente, 2),
             saldo_a_favor=round(saldo_a_favor, 2),
             pendiente_verificacion=round(pendiente_verificacion_total, 2),
@@ -3030,6 +3042,142 @@ def _pagos_gimnasio_detalle_out(
 
     return pagos
 
+
+
+def _pagos_no_monetarios_detalle_out(
+    db: Session,
+    current_user: Usuario,
+    desde: date,
+    hasta: date,
+    terapeutaid: Optional[int] = None,
+    consultorioid: Optional[int] = None,
+    dia_semana: Optional[int] = None,
+) -> List[CajaSemanalPagoOut]:
+    """Pagos que cubren saldos, pero no entran a caja real.
+
+    Incluye cortesías, canjes, familiares/convenios y pagos en especie, tanto
+    de terapia como de gimnasio. Se devuelve separado para que el detalle de
+    caja no se infle con dinero que no ingresó físicamente.
+    """
+    sesiones = _sesiones_reporte_filtradas(
+        db=db,
+        current_user=current_user,
+        desde=desde,
+        hasta=hasta,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+        dia_semana=dia_semana,
+    )
+    sesiones_por_clave: Dict[Tuple[int, int], int] = {}
+    for sesion in sesiones:
+        if sesion.pacienteid is None or sesion.tratamientopacienteid is None:
+            continue
+        key = (int(sesion.pacienteid), int(sesion.tratamientopacienteid))
+        sesiones_por_clave[key] = sesiones_por_clave.get(key, 0) + 1
+    terapeutas_por_clave = _terapeutas_por_tratamiento_en_sesiones(sesiones)
+
+    pagos: List[CajaSemanalPagoOut] = []
+
+    rows_terapia = (
+        _pagos_detalle_base_query(
+            db=db,
+            current_user=current_user,
+            desde=desde,
+            hasta=hasta,
+            terapeutaid=terapeutaid,
+            consultorioid=consultorioid,
+            dia_semana=dia_semana,
+            solo_caja=False,
+        )
+        .filter(_metodo_sin_caja_filter())
+        .order_by(Pago.fechapago, Pago.id)
+        .all()
+    )
+
+    for pago, tratamiento, paciente in rows_terapia:
+        precio = _precio_aplicado(tratamiento)
+        key = (int(pago.pacienteid), int(pago.tratamientopacienteid))
+        sesiones_pagadas = round(float(pago.monto or 0) / precio, 2) if precio > 0 else 0.0
+        pagos.append(
+            CajaSemanalPagoOut(
+                pagoid=int(pago.id),
+                es_sin_caja=True,
+                fecha=_fecha_pago_local_ecuador(pago),
+                pacienteid=int(paciente.id),
+                paciente=_nombre_paciente(paciente),
+                terapeuta=terapeutas_por_clave.get(key, "Fisio no asociado a sesión de la semana"),
+                tratamientopacienteid=int(tratamiento.id),
+                tratamiento=tratamiento.tipotratamiento or "Tratamiento",
+                metodo=pago.metodopago or "Sin método",
+                monto=round(float(pago.monto or 0), 2),
+                valor_sesion=round(precio, 2),
+                sesiones_pagadas=sesiones_pagadas,
+                sesiones_realizadas_semana=int(sesiones_por_clave.get(key, 0)),
+            )
+        )
+
+    rows_gimnasio = (
+        _pagos_gimnasio_detalle_base_query(
+            db=db,
+            current_user=current_user,
+            desde=desde,
+            hasta=hasta,
+            terapeutaid=terapeutaid,
+            consultorioid=consultorioid,
+            dia_semana=dia_semana,
+            solo_caja=False,
+        )
+        .filter(_metodo_sin_caja_filter())
+        .order_by(Pago.fechapago, Pago.id)
+        .all()
+    )
+
+    for pago, membresia, paciente, terapeuta in rows_gimnasio:
+        modalidad = _texto_normalizado(getattr(membresia, "modalidad", ""))
+        concepto = "Gimnasio diario" if ("diario" in modalidad or "dia" in modalidad) else "Membresía gimnasio"
+        pagos.append(
+            CajaSemanalPagoOut(
+                pagoid=int(pago.id),
+                es_gimnasio=True,
+                es_sin_caja=True,
+                membresiagimnasioid=int(pago.membresiagimnasioid or 0),
+                fecha=_fecha_pago_local_ecuador(pago),
+                pacienteid=int(paciente.id),
+                paciente=_nombre_paciente(paciente),
+                terapeuta=_nombre_usuario(terapeuta),
+                tratamientopacienteid=0,
+                tratamiento=concepto,
+                metodo=pago.metodopago or "Sin método",
+                monto=round(float(pago.monto or 0), 2),
+                valor_sesion=0.0,
+                sesiones_pagadas=0.0,
+                sesiones_realizadas_semana=0,
+            )
+        )
+
+    pagos.sort(key=lambda item: (item.fecha, item.pagoid))
+    return pagos
+
+
+def _total_no_monetario_cubierto(
+    db: Session,
+    current_user: Usuario,
+    desde: date,
+    hasta: date,
+    terapeutaid: Optional[int] = None,
+    consultorioid: Optional[int] = None,
+    dia_semana: Optional[int] = None,
+) -> float:
+    pagos = _pagos_no_monetarios_detalle_out(
+        db=db,
+        current_user=current_user,
+        desde=desde,
+        hasta=hasta,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+        dia_semana=dia_semana,
+    )
+    return round(sum(float(item.monto or 0) for item in pagos), 2)
 
 
 def _caja_terapia_asignada_a_fisio(
@@ -3585,6 +3733,16 @@ def reporte_caja_semanal_detalle(
         )
         transferencias_total = round(float(totales.get("transferencias_pendientes_total", 0.0) or 0.0) + pendiente_gym_total, 2)
         transferencias_cantidad = int(totales.get("transferencias_pendientes_cantidad", 0) or 0) + pendiente_gym_cantidad
+        pagos_no_monetarios = _pagos_no_monetarios_detalle_out(
+            db=db,
+            current_user=current_user,
+            desde=desde,
+            hasta=hasta,
+            terapeutaid=terapeutaid,
+            consultorioid=consultorioid,
+            dia_semana=dia_semana,
+        )
+        total_no_monetario = round(sum(item.monto for item in pagos_no_monetarios), 2)
 
         return CajaSemanalDetalleOut(
             desde=desde,
@@ -3593,6 +3751,7 @@ def reporte_caja_semanal_detalle(
             total_pagos=len(pagos_asignados),
             total_sesiones_pagadas=round(sum(item.sesiones_pagadas for item in pagos_asignados), 2),
             total_gimnasio=total_gimnasio,
+            total_no_monetario=total_no_monetario,
             total_efectivo=round(float(totales.get("total_efectivo", 0.0) or 0.0), 2),
             total_transferencia=round(float(totales.get("total_transferencia", 0.0) or 0.0), 2),
             total_tarjeta=round(float(totales.get("total_tarjeta", 0.0) or 0.0), 2),
@@ -3600,6 +3759,7 @@ def reporte_caja_semanal_detalle(
             transferencias_pendientes_total=transferencias_total,
             transferencias_pendientes_cantidad=transferencias_cantidad,
             pagos=pagos_asignados,
+            pagos_no_monetarios=pagos_no_monetarios,
         )
 
     sesiones = _sesiones_reporte_filtradas(
@@ -3704,6 +3864,17 @@ def reporte_caja_semanal_detalle(
         transferencias_gym_cantidad or 0
     )
 
+    pagos_no_monetarios = _pagos_no_monetarios_detalle_out(
+        db=db,
+        current_user=current_user,
+        desde=desde,
+        hasta=hasta,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+        dia_semana=dia_semana,
+    )
+    total_no_monetario = round(sum(item.monto for item in pagos_no_monetarios), 2)
+
     return CajaSemanalDetalleOut(
         desde=desde,
         hasta=hasta,
@@ -3711,6 +3882,7 @@ def reporte_caja_semanal_detalle(
         total_pagos=len(pagos),
         total_sesiones_pagadas=round(sum(item.sesiones_pagadas for item in pagos), 2),
         total_gimnasio=total_gimnasio,
+        total_no_monetario=total_no_monetario,
         total_efectivo=round(float(totales_metodo.get("total_efectivo", 0.0) or 0.0), 2),
         total_transferencia=round(float(totales_metodo.get("total_transferencia", 0.0) or 0.0), 2),
         total_tarjeta=round(float(totales_metodo.get("total_tarjeta", 0.0) or 0.0), 2),
@@ -3718,6 +3890,7 @@ def reporte_caja_semanal_detalle(
         transferencias_pendientes_total=transferencias_pendientes_total,
         transferencias_pendientes_cantidad=transferencias_pendientes_cantidad,
         pagos=pagos,
+        pagos_no_monetarios=pagos_no_monetarios,
     )
 
 

@@ -1,5 +1,5 @@
 import os
-from datetime import date, time, timedelta
+from datetime import date, time, timedelta, datetime
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -19,6 +19,7 @@ from ..dependencies.db import get_db
 from ..models.alerta import Alerta
 from ..models.asistencia import Asistencia
 from ..models.gimnasio import MovimientoGimnasio
+from ..models.consultorio import Consultorio
 from ..models.paciente import Paciente
 from ..models.sesion_terapia import SesionTerapia
 from ..models.tratamiento import SesionTratamiento, TipoTratamiento
@@ -1215,6 +1216,225 @@ def _validar_tratamiento_para_sesion(
     return tratamiento
 
 
+
+def _consultorio_operativo_auditoria(
+    db: Session,
+    current_user: Usuario,
+    paciente: Paciente | None,
+    sesion: SesionTerapia | None = None,
+) -> tuple[int | None, str]:
+    """
+    Clínica que se muestra en la notificación al jefe.
+
+    - Para secretario: se usa su consultorio, porque ahí realizó la acción.
+    - Si no existe, se intenta usar el consultorio del fisio de la sesión.
+    - Como último respaldo, se usa el consultorio del paciente.
+    """
+    consultorio_id = getattr(current_user, "consultorioid", None)
+
+    if consultorio_id is None and sesion is not None and sesion.terapeutaid:
+        terapeuta = db.query(Usuario).filter(Usuario.id == sesion.terapeutaid).first()
+        if terapeuta and terapeuta.consultorioid:
+            consultorio_id = terapeuta.consultorioid
+
+    if consultorio_id is None and paciente is not None:
+        consultorio_id = paciente.consultorioid
+
+    nombre = "Clínica no especificada"
+    if consultorio_id is not None:
+        consultorio = (
+            db.query(Consultorio)
+            .filter(Consultorio.id == consultorio_id)
+            .first()
+        )
+        if consultorio and consultorio.nombre:
+            nombre = consultorio.nombre
+        else:
+            nombre = f"Consultorio {consultorio_id}"
+
+    return consultorio_id, nombre
+
+
+def _tratamientos_aplicados_texto(db: Session, sesion_id: int | None) -> list[str]:
+    if not sesion_id:
+        return []
+
+    rows = (
+        db.query(TipoTratamiento.nombre)
+        .join(
+            SesionTratamiento,
+            SesionTratamiento.tratamientoid == TipoTratamiento.id,
+        )
+        .filter(SesionTratamiento.sesionid == sesion_id)
+        .order_by(TipoTratamiento.nombre.asc())
+        .all()
+    )
+
+    return [row.nombre for row in rows if row.nombre]
+
+
+def _resumen_sesion_auditoria(
+    db: Session,
+    sesion: SesionTerapia,
+    paciente: Paciente | None,
+) -> dict:
+    terapeuta = None
+    if sesion.terapeutaid:
+        terapeuta = db.query(Usuario).filter(Usuario.id == sesion.terapeutaid).first()
+
+    tratamiento = None
+    if sesion.tratamientopacienteid:
+        tratamiento = (
+            db.query(TratamientoPaciente)
+            .filter(TratamientoPaciente.id == sesion.tratamientopacienteid)
+            .first()
+        )
+
+    return {
+        "sesion_id": sesion.id,
+        "paciente_id": sesion.pacienteid,
+        "paciente_nombre": _nombre_paciente(paciente),
+        "fecha": sesion.fecha.isoformat() if sesion.fecha else None,
+        "fecha_texto": _formatear_fecha_corta(sesion.fecha),
+        "hora_ingreso": sesion.horaingreso.strftime("%H:%M") if sesion.horaingreso else None,
+        "hora_salida": sesion.horasalida.strftime("%H:%M") if sesion.horasalida else None,
+        "terapeuta_id": sesion.terapeutaid,
+        "terapeuta_nombre": _nombre_usuario(terapeuta),
+        "tratamiento_id": sesion.tratamientopacienteid,
+        "tratamiento_nombre": (
+            tratamiento.tipotratamiento
+            if tratamiento and tratamiento.tipotratamiento
+            else _nombre_tratamiento_sesion(sesion)
+        ),
+        "tratamientos_aplicados": _tratamientos_aplicados_texto(db, sesion.id),
+    }
+
+
+def _notificar_jefes_auditoria_sesion(
+    db: Session,
+    *,
+    accion: str,
+    current_user: Usuario,
+    paciente: Paciente | None,
+    sesion: SesionTerapia,
+    resumen_anterior: dict,
+    resumen_nuevo: dict | None = None,
+) -> None:
+    """
+    Notifica al jefe cuando un secretario elimina o altera una atención.
+    No requiere cambios en la base de datos: usa la tabla notificaciones.
+    """
+    if getattr(current_user, "rol", None) != 1:
+        return
+
+    jefes = (
+        db.query(Usuario)
+        .filter(
+            Usuario.rol == 3,
+            Usuario.activo == True,
+        )
+        .all()
+    )
+
+    if not jefes:
+        print("ℹ️ No hay jefes activos para notificar auditoría de sesión.")
+        return
+
+    consultorio_id, consultorio_nombre = _consultorio_operativo_auditoria(
+        db=db,
+        current_user=current_user,
+        paciente=paciente,
+        sesion=sesion,
+    )
+
+    secretario_nombre = _nombre_usuario(current_user)
+    paciente_nombre = resumen_anterior.get("paciente_nombre") or _nombre_paciente(paciente)
+    fecha_texto = resumen_anterior.get("fecha_texto") or "sin fecha"
+    hora_texto = resumen_anterior.get("hora_ingreso") or "sin hora"
+    fisio_nombre = resumen_anterior.get("terapeuta_nombre") or "No asignado"
+
+    if accion == "eliminada":
+        titulo = "Atención eliminada por secretaría"
+        tratamiento_texto = resumen_anterior.get("tratamiento_nombre") or "Tratamiento no especificado"
+        aplicadas = resumen_anterior.get("tratamientos_aplicados") or []
+        aplicadas_texto = ", ".join(aplicadas) if aplicadas else "Sin terapias aplicadas registradas"
+        mensaje = (
+            f"Paciente: {paciente_nombre}\n"
+            f"Fecha: {fecha_texto} {hora_texto}\n"
+            f"Clínica: {consultorio_nombre}\n"
+            f"Fisio de la sesión: {fisio_nombre}\n"
+            f"Terapia eliminada: {tratamiento_texto}\n"
+            f"Aplicadas: {aplicadas_texto}\n"
+            f"Realizó: {secretario_nombre}"
+        )
+        tipo = "sesion_eliminada"
+    else:
+        titulo = "Atención alterada por secretaría"
+        tratamiento_anterior = resumen_anterior.get("tratamiento_nombre") or "No especificado"
+        tratamiento_nuevo = (
+            (resumen_nuevo or {}).get("tratamiento_nombre")
+            or "No especificado"
+        )
+        mensaje = (
+            f"Paciente: {paciente_nombre}\n"
+            f"Fecha: {fecha_texto} {hora_texto}\n"
+            f"Clínica: {consultorio_nombre}\n"
+            f"Fisio de la sesión: {fisio_nombre}\n"
+            f"Cambio: {tratamiento_anterior} → {tratamiento_nuevo}\n"
+            f"Realizó: {secretario_nombre}"
+        )
+        tipo = "sesion_alterada"
+
+    data = {
+        "accion": accion,
+        "sesion_id": sesion.id,
+        "paciente_id": resumen_anterior.get("paciente_id"),
+        "paciente_nombre": paciente_nombre,
+        "fecha": resumen_anterior.get("fecha"),
+        "hora_ingreso": resumen_anterior.get("hora_ingreso"),
+        "hora_salida": resumen_anterior.get("hora_salida"),
+        "terapeuta_id": resumen_anterior.get("terapeuta_id"),
+        "terapeuta_nombre": fisio_nombre,
+        "tratamiento_anterior_id": resumen_anterior.get("tratamiento_id"),
+        "tratamiento_anterior_nombre": resumen_anterior.get("tratamiento_nombre"),
+        "tratamiento_nuevo_id": (resumen_nuevo or {}).get("tratamiento_id"),
+        "tratamiento_nuevo_nombre": (resumen_nuevo or {}).get("tratamiento_nombre"),
+        "tratamientos_aplicados": resumen_anterior.get("tratamientos_aplicados") or [],
+        "consultorioid": consultorio_id,
+        "consultorio_nombre": consultorio_nombre,
+        "secretario_id": current_user.id,
+        "secretario_nombre": secretario_nombre,
+        "creado_por_id": current_user.id,
+        "actualizar": [
+            "notificaciones",
+            "sesiones",
+            "reportes",
+            "dashboard",
+        ],
+    }
+
+    creadas = 0
+    for jefe in jefes:
+        if jefe.id == getattr(current_user, "id", None):
+            continue
+
+        crear_notificacion_usuario(
+            db=db,
+            usuarioid=jefe.id,
+            titulo=titulo,
+            mensaje=mensaje,
+            tipo=tipo,
+            referencia_tipo="sesion",
+            referencia_id=sesion.id,
+            data=data,
+            hacer_flush=False,
+        )
+        creadas += 1
+
+    db.flush()
+    print(f"✅ Auditoría de sesión notificada a {creadas} jefe(s).")
+
+
 @router.post(
     "/iniciar",
     response_model=SesionAtencionOut,
@@ -1617,6 +1837,12 @@ def cambiar_tratamiento_sesion(
         paciente_id=sesion.pacienteid,
     )
 
+    resumen_anterior = _resumen_sesion_auditoria(
+        db=db,
+        sesion=sesion,
+        paciente=paciente,
+    )
+
     tratamiento_anterior_id = sesion.tratamientopacienteid
 
     if tratamiento_anterior_id == tratamiento_nuevo.id:
@@ -1632,6 +1858,22 @@ def cambiar_tratamiento_sesion(
     ).update(
         {MovimientoGimnasio.tratamientopacienteid: tratamiento_nuevo.id},
         synchronize_session=False,
+    )
+
+    resumen_nuevo = _resumen_sesion_auditoria(
+        db=db,
+        sesion=sesion,
+        paciente=paciente,
+    )
+
+    _notificar_jefes_auditoria_sesion(
+        db=db,
+        accion="alterada",
+        current_user=current_user,
+        paciente=paciente,
+        sesion=sesion,
+        resumen_anterior=resumen_anterior,
+        resumen_nuevo=resumen_nuevo,
     )
 
     db.commit()
@@ -1675,8 +1917,23 @@ def eliminar_sesion_terapia(
 
     _validar_gestor_sesion_paciente(current_user=current_user, paciente=paciente, sesion=sesion, db=db)
 
+    resumen_eliminada = _resumen_sesion_auditoria(
+        db=db,
+        sesion=sesion,
+        paciente=paciente,
+    )
+
     paciente_id = sesion.pacienteid
     fecha_sesion = sesion.fecha
+
+    _notificar_jefes_auditoria_sesion(
+        db=db,
+        accion="eliminada",
+        current_user=current_user,
+        paciente=paciente,
+        sesion=sesion,
+        resumen_anterior=resumen_eliminada,
+    )
 
     # Primero limpiamos las terapias aplicadas de la sesión para evitar
     # errores por llaves foráneas.
