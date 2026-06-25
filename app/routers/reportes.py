@@ -2707,23 +2707,13 @@ def reporte_terapias(
         dia_semana=dia_semana,
     )
 
+    # Gimnasio se mantiene separado.
+    # NO se suma a total_efectivo / total_transferencia / total_tarjeta de terapias.
+    # NO se mezcla en por_metodo_pago.
+    #
+    # total_gimnasio_pagado ya se retorna aparte en TerapiasReporteOut.
     if total_gimnasio_pagado > 0:
-        total_pagado_verificado += total_gimnasio_pagado
-        for key in ("total_efectivo", "total_transferencia", "total_tarjeta", "total_otros_metodos"):
-            totales_metodo[key] = float(totales_metodo.get(key, 0.0) or 0.0) + float(
-                totales_gimnasio.get(key, 0.0) or 0.0
-            )
-
-        por_metodo_final: Dict[str, float] = defaultdict(float)
-        for item in por_metodo:
-            por_metodo_final[item.metodo] += float(item.total or 0)
-        for item in por_metodo_gimnasio:
-            por_metodo_final[item.metodo] += float(item.total or 0)
-        por_metodo = [
-            MetodoPagoTotalOut(metodo=metodo, total=round(total, 2))
-            for metodo, total in sorted(por_metodo_final.items())
-            if round(total, 2) > 0
-        ]
+        pass
 
     tratamiento_map: Dict[str, Dict[str, float]] = {}
 
@@ -2811,26 +2801,16 @@ def reporte_terapias(
     for fecha_pago, data in gimnasio_por_dia.items():
         if fecha_pago in dias_map:
             total_float = float(data.get("total", 0.0) or 0.0)
-            dias_map[fecha_pago].pagos_verificados = round(
-                dias_map[fecha_pago].pagos_verificados + total_float,
-                2,
-            )
+
+            # Gimnasio va separado.
             dias_map[fecha_pago].pagos_gimnasio = round(
                 dias_map[fecha_pago].pagos_gimnasio + total_float,
                 2,
             )
-            dias_map[fecha_pago].pagos_efectivo = round(
-                dias_map[fecha_pago].pagos_efectivo + float(data.get("efectivo", 0.0) or 0.0),
-                2,
-            )
-            dias_map[fecha_pago].pagos_transferencia = round(
-                dias_map[fecha_pago].pagos_transferencia + float(data.get("transferencia", 0.0) or 0.0),
-                2,
-            )
-            dias_map[fecha_pago].pagos_tarjeta = round(
-                dias_map[fecha_pago].pagos_tarjeta + float(data.get("tarjeta", 0.0) or 0.0),
-                2,
-            )
+
+            # No sumar gimnasio a pagos_efectivo / pagos_transferencia / pagos_tarjeta.
+            # Si quieres una caja global diaria, crea otro campo distinto,
+            # por ejemplo pagos_caja_global.
 
     recuperacion_cartera_query = _query_recuperacion_cartera(
         db=db,
@@ -3797,8 +3777,8 @@ def reporte_caja_semanal_detalle(
             dia_semana=dia_semana,
         )
         total_gimnasio = round(sum(item.monto for item in pagos_gimnasio), 2)
-        for item in pagos_gimnasio:
-            _sumar_metodo_en_resumen(totales, item.metodo, item.monto)
+
+        # Mostrar gimnasio en detalle si quieres, pero no mezclarlo en efectivo/transferencia de terapias.
         pagos_asignados.extend(pagos_gimnasio)
 
         pendiente_gym_total, pendiente_gym_cantidad = _totales_pendientes_transferencia_gimnasio(
@@ -3895,6 +3875,9 @@ def reporte_caja_semanal_detalle(
             )
         )
 
+    # Guardamos solo pagos de terapias para calcular efectivo/transferencia/tarjeta.
+    pagos_terapia = list(pagos)
+
     pagos_gimnasio = _pagos_gimnasio_detalle_out(
         db=db,
         current_user=current_user,
@@ -3905,6 +3888,8 @@ def reporte_caja_semanal_detalle(
         dia_semana=dia_semana,
     )
     total_gimnasio = round(sum(item.monto for item in pagos_gimnasio), 2)
+
+    # Se pueden mostrar en el detalle, pero NO mezclar en totales por método.
     pagos.extend(pagos_gimnasio)
 
     totales_metodo = {
@@ -3913,7 +3898,8 @@ def reporte_caja_semanal_detalle(
         "total_tarjeta": 0.0,
         "total_otros_metodos": 0.0,
     }
-    for item in pagos:
+
+    for item in pagos_terapia:
         _sumar_metodo_en_resumen(totales_metodo, item.metodo, item.monto)
 
     transferencias_pendientes_total, transferencias_pendientes_cantidad = _totales_pendientes_transferencia(
