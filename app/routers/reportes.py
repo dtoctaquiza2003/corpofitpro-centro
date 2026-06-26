@@ -218,12 +218,14 @@ def rango_fechas_ecuador(desde: date, hasta: date) -> tuple[datetime, datetime]:
 def fecha_pago_ecuador_expr():
     """Fecha oficial de caja del pago.
 
-    Regla de reporte/caja:
-    - Si existe `fecha_caja_ecuador`, se usa esa fecha contable local.
-    - Si no existe o está vacía, se usa `fechapago` convertido a Ecuador.
+    Prioridad:
+    1. `fechapagoreal`, cuando se registra una fecha contable manual
+       (por ejemplo pagos previos o correcciones contables).
+    2. `fecha_caja_ecuador`, si existe en la tabla/modelo.
+    3. `fechapago` convertido a fecha local de Ecuador.
 
-    No se prioriza `fechapagoreal`, porque puede mover pagos registrados
-    cerca de medianoche a otro día y descuadrar la caja semanal.
+    Así los pagos normales cerca de medianoche no se mueven por UTC, pero los
+    pagos con fecha contable manual sí quedan ubicados en el día elegido.
     """
     fecha_local_expr = cast(
         func.timezone("America/Guayaquil", Pago.fechapago),
@@ -233,11 +235,15 @@ def fecha_pago_ecuador_expr():
 
     if fecha_caja_col is not None:
         return func.coalesce(
+            cast(Pago.fechapagoreal, Date),
             cast(fecha_caja_col, Date),
             fecha_local_expr,
         )
 
-    return fecha_local_expr
+    return func.coalesce(
+        cast(Pago.fechapagoreal, Date),
+        fecha_local_expr,
+    )
 
 
 def filtro_fechapago_ecuador(desde: date, hasta: date):
@@ -2920,6 +2926,13 @@ def reporte_terapias(
 
 def _fecha_pago_local_ecuador(pago: Pago) -> date:
     """Devuelve la misma fecha de caja que usa el SQL del reporte."""
+    fecha_real = getattr(pago, "fechapagoreal", None)
+    if fecha_real is not None:
+        if isinstance(fecha_real, datetime):
+            return fecha_real.date()
+        if isinstance(fecha_real, date):
+            return fecha_real
+
     fecha_caja = getattr(pago, "fecha_caja_ecuador", None)
     if fecha_caja is not None:
         if isinstance(fecha_caja, datetime):
@@ -3655,23 +3668,11 @@ def _pendiente_semana_detalle(
         # Pacientes Ecuasanitas: el copago/valor de sesión pendiente se cobra
         # directamente al paciente, por eso SÍ cuenta como pendiente normal.
 
-        # Cuando hay filtro de día de la semana, las sesiones de la misma semana
-        # pero de un día diferente al filtrado NO deben consumir el saldo disponible
-        # en el FIFO. Solo deben consumirlo las sesiones de semanas anteriores
-        # (para el cálculo histórico correcto) y las del propio día filtrado.
-        # Esto evita que, por ejemplo, una sesión del lunes consuma el saldo
-        # antes de que el bucle llegue a la sesión del martes filtrado, haciendo
-        # que la deuda del martes desaparezca incorrectamente.
-        es_sesion_dentro_del_rango = sesion.fecha >= desde and sesion.fecha <= hasta
-        es_sesion_de_otro_dia_filtrado = (
-            dia_semana is not None
-            and es_sesion_dentro_del_rango
-            and sesion.fecha.weekday() != dia_semana
-        )
-        if es_sesion_de_otro_dia_filtrado:
-            # No consumir saldo, no reportar: saltar completamente.
-            continue
-
+        # FIFO real:
+        # Aunque el reporte esté filtrado por un solo día de la semana, las
+        # sesiones anteriores del mismo paciente + tratamiento sí deben consumir
+        # saldo. Luego solo se muestra el pendiente de las sesiones visibles en
+        # el filtro actual.
         disponible = disponible_por_clave.get(key_pago, 0.0)
         aplicado = min(precio, disponible)
         pendiente = round(max(precio - aplicado, 0.0), 2)
