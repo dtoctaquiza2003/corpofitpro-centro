@@ -188,7 +188,7 @@ def sueldo_fisio_por_atencion(
     if _es_fin_semana(fecha):
         return SUELDO_FISIO_FIN_SEMANA
 
-    if atenciones_dia > UMBRAL_ATENCIONES_BONO_DIARIO:
+    if atenciones_dia >= UMBRAL_ATENCIONES_BONO_DIARIO:
         return SUELDO_FISIO_BONO_DIARIO
 
     return SUELDO_FISIO_LUNES_VIERNES
@@ -4422,7 +4422,7 @@ def reporte_fisioterapeuta_detalle(
         es_fin_semana = _es_fin_semana(fecha_dia)
         es_bono_productividad = (
             not es_fin_semana
-            and atenciones > UMBRAL_ATENCIONES_BONO_DIARIO
+            and atenciones >= UMBRAL_ATENCIONES_BONO_DIARIO
         )
         motivos_tarifa_5: Dict[str, int] = defaultdict(int)
         for sd in sesiones_dia:
@@ -4622,6 +4622,33 @@ def reporte_fisioterapeuta_detalle(
             key=lambda item: item.paciente,
         ),
         dias_sueldo=dias_sueldo,
+    )
+
+@router.get("/mi-sueldo", response_model=FisioDetalleOut)
+def reporte_mi_sueldo(
+    desde: Optional[date] = Query(None),
+    hasta: Optional[date] = Query(None),
+    dia_semana: Optional[int] = Query(None, ge=0, le=6),
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(get_current_user),
+):
+    if current_user.rol != 2:
+        raise HTTPException(
+            status_code=403,
+            detail="Este reporte es solo para fisioterapeutas.",
+        )
+
+    desde, hasta = _default_range(desde, hasta)
+    dia_semana = _validar_dia_semana(dia_semana)
+
+    return reporte_fisioterapeuta_detalle(
+        terapeutaid=current_user.id,
+        desde=desde,
+        hasta=hasta,
+        consultorioid=current_user.consultorioid,
+        dia_semana=dia_semana,
+        db=db,
+        current_user=current_user,
     )
 
 
@@ -4997,7 +5024,7 @@ def _excel_motivo_tarifa_fisio(
     if _es_fin_semana(fecha_sesion):
         return "Fin de semana $4"
 
-    if atenciones_dia > UMBRAL_ATENCIONES_BONO_DIARIO:
+    if atenciones_dia >= UMBRAL_ATENCIONES_BONO_DIARIO:
         return f"Bono +{UMBRAL_ATENCIONES_BONO_DIARIO} atenciones $4"
 
     return "Normal lunes-viernes $3.50"
@@ -5111,7 +5138,7 @@ def _excel_sesiones_sueldo_records(
                 "bono_15": bool(
                     sesion.fecha
                     and not _es_fin_semana(sesion.fecha)
-                    and atenciones_dia > UMBRAL_ATENCIONES_BONO_DIARIO
+                    and atenciones_dia >= UMBRAL_ATENCIONES_BONO_DIARIO
                 ),
                 "especial_5": es_especial_5,
                 "motivo_especial": motivo_especial,
