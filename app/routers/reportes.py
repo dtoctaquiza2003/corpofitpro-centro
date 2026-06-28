@@ -13,6 +13,7 @@ from ..models.transferencia import Transferencia
 from ..auth.dependencies import get_current_secretary, get_current_user
 from ..dependencies.db import get_db
 from ..models.consultorio import Consultorio
+from ..models.egreso import Egreso
 from ..models.gimnasio import MembresiaGimnasio
 from ..models.paciente import Paciente
 from ..models.pago import Pago
@@ -3252,6 +3253,54 @@ def _total_no_monetario_cubierto(
     return round(sum(float(item.monto or 0) for item in pagos), 2)
 
 
+def _total_egresos_caja(
+    db: Session,
+    current_user: Usuario,
+    desde: date,
+    hasta: date,
+    terapeutaid: Optional[int] = None,
+    consultorioid: Optional[int] = None,
+    dia_semana: Optional[int] = None,
+) -> float:
+    """Total de egresos de caja en el rango filtrado.
+
+    Los egresos son gastos de clínica/consultorio, por ejemplo papel,
+    limpieza, insumos o mantenimiento. No son pagos de pacientes y por eso
+    NO deben tocar FIFO, deuda, sueldos de fisios ni totales por método de
+    pago. Solo se usan para mostrar caja neta:
+
+        caja_neta = total_caja - total_egresos
+
+    Si el reporte está filtrado por fisioterapeuta, se devuelve 0 porque los
+    egresos no pertenecen a un fisio específico.
+    """
+    dia_semana = _validar_dia_semana(dia_semana)
+
+    if current_user.rol == 2 or terapeutaid is not None:
+        return 0.0
+
+    consultorio_resuelto = _resolver_consultorioid_para_rol(
+        current_user,
+        consultorioid,
+    )
+
+    query = db.query(func.coalesce(func.sum(Egreso.monto), 0)).filter(
+        Egreso.fechaegreso >= desde,
+        Egreso.fechaegreso <= hasta,
+        or_(Egreso.anulado == False, Egreso.anulado.is_(None)),
+    )
+
+    if consultorio_resuelto is not None:
+        query = query.filter(Egreso.consultorioid == consultorio_resuelto)
+
+    if dia_semana is not None:
+        query = query.filter(
+            func.extract("isodow", Egreso.fechaegreso) == dia_semana + 1
+        )
+
+    return round(float(query.scalar() or 0.0), 2)
+
+
 def _caja_terapia_asignada_a_fisio(
     db: Session,
     current_user: Usuario,
@@ -3803,11 +3852,24 @@ def reporte_caja_semanal_detalle(
             dia_semana=dia_semana,
         )
         total_no_monetario = round(sum(item.monto for item in pagos_no_monetarios), 2)
+        total_caja = round(float(caja_asignada_fisio["total"] or 0.0) + total_gimnasio, 2)
+        total_egresos = _total_egresos_caja(
+            db=db,
+            current_user=current_user,
+            desde=desde,
+            hasta=hasta,
+            terapeutaid=terapeutaid,
+            consultorioid=consultorioid,
+            dia_semana=dia_semana,
+        )
+        caja_neta = round(total_caja - total_egresos, 2)
 
         return CajaSemanalDetalleOut(
             desde=desde,
             hasta=hasta,
-            total_caja=round(float(caja_asignada_fisio["total"] or 0.0) + total_gimnasio, 2),
+            total_caja=total_caja,
+            total_egresos=total_egresos,
+            caja_neta=caja_neta,
             total_pagos=len(pagos_asignados),
             total_sesiones_pagadas=round(sum(item.sesiones_pagadas for item in pagos_asignados), 2),
             total_gimnasio=total_gimnasio,
@@ -3940,11 +4002,24 @@ def reporte_caja_semanal_detalle(
         dia_semana=dia_semana,
     )
     total_no_monetario = round(sum(item.monto for item in pagos_no_monetarios), 2)
+    total_caja = round(sum(item.monto for item in pagos), 2)
+    total_egresos = _total_egresos_caja(
+        db=db,
+        current_user=current_user,
+        desde=desde,
+        hasta=hasta,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+        dia_semana=dia_semana,
+    )
+    caja_neta = round(total_caja - total_egresos, 2)
 
     return CajaSemanalDetalleOut(
         desde=desde,
         hasta=hasta,
-        total_caja=round(sum(item.monto for item in pagos), 2),
+        total_caja=total_caja,
+        total_egresos=total_egresos,
+        caja_neta=caja_neta,
         total_pagos=len(pagos),
         total_sesiones_pagadas=round(sum(item.sesiones_pagadas for item in pagos), 2),
         total_gimnasio=total_gimnasio,

@@ -16,3 +16,4 @@ from .notificaciones import router as notificaciones_router
 from .gimnasio import router as gimnasio_router
 from .pacientes_compartidos import router as pacientes_compartidos_router
 from .permisos_temporales import router as permisos_temporales_router
+from .egresos import router as egresos_router

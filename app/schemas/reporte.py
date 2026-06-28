@@ -176,6 +176,8 @@ class CajaSemanalDetalleOut(BaseModel):
     total_sesiones_pagadas: float = 0
     total_gimnasio: float = 0
     total_no_monetario: float = 0
+    total_egresos: float = 0
+    caja_neta: float = 0
 
     # Desglose para cuadre de caja.
     total_efectivo: float = 0
@@ -244,6 +246,8 @@ class ReporteDiaOut(BaseModel):
     pagos_transferencia: float = 0
     pagos_tarjeta: float = 0
     pagos_gimnasio: float = 0
+    egresos: float = 0
+    caja_neta: float = 0
     cubierto_ecuasanitas: float = 0
 
 
@@ -266,6 +270,11 @@ class TerapiasReporteOut(BaseModel):
     # Ingreso real de gimnasio verificado en el rango. No aumenta
     # total_generado de terapias; sí entra al cuadre de caja.
     total_gimnasio_pagado: float = 0
+    # Gastos de la clínica dentro del rango: papel, insumos, transporte, etc.
+    # No se mezclan con los ingresos por método; sirven para caja neta.
+    total_egresos: float = 0
+    caja_bruta: float = 0
+    caja_neta: float = 0
     # Valor cubierto con cortesía/canje/familiares/pago en especie.
     # No aumenta caja real, pero evita que quede como pendiente.
     total_no_monetario_cubierto: float = 0

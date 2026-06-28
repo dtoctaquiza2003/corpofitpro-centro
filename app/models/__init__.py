@@ -17,3 +17,4 @@ from .usuario_dispositivo import UsuarioDispositivo
 from .gimnasio import MembresiaGimnasio, MovimientoGimnasio
 from .paciente_terapeuta_compartido import PacienteTerapeutaCompartido
 from .usuario_permiso_temporal import UsuarioPermisoTemporal
+from .egreso import Egreso

@@ -22,3 +22,10 @@ from .gimnasio import (
 )
 from.paciente_compartido import PacienteCompartidoCreate, PacienteCompartidoOut
 from .permiso_temporal import PermisoTemporalCreate, PermisoTemporalOut, PermisoTemporalEstadoOut
+from .egreso import (
+    EgresoCreate,
+    EgresoUpdate,
+    EgresoAnularRequest,
+    EgresoOut,
+    EgresosResumenOut,
+)
