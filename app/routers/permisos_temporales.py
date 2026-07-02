@@ -301,7 +301,8 @@ def _validar_autorizador(
     """
     Reglas:
     - Jefe puede activar permisos retroactivos, creación de tratamientos y admin temporal.
-    - Secretario puede activar registro retroactivo y creación de tratamientos solo para usuarios de su consultorio.
+    - Secretario puede activar registro retroactivo, creación de tratamientos y
+      modo piscina, solo para usuarios de su consultorio.
     - Administrador temporal NO puede crear permisos temporales.
     """
 
@@ -315,12 +316,14 @@ def _validar_autorizador(
             TIPO_REGISTRO_RETROACTIVO,
             TIPO_CREAR_TRATAMIENTOS,
             TIPO_ATENCION_SUCURSAL_TEMPORAL,
+            TIPO_MODO_PISCINA,
         ):
             raise HTTPException(
                 status_code=403,
                 detail=(
                     "El secretario solo puede activar permisos de registro retroactivo, "
-                    "creación temporal de tratamientos o atención temporal por sucursal."
+                    "creación temporal de tratamientos, atención temporal por sucursal "
+                    "o modo piscina."
                 ),
             )
 
@@ -374,6 +377,33 @@ def usuario_tiene_permiso_temporal(
     )
 
 
+def _enriquecer_permisos_con_nombres(
+    db: Session,
+    permisos: list,
+) -> list[PermisoTemporalOut]:
+    """
+    Devuelve la lista como PermisoTemporalOut con usuario_nombre llenado.
+    Hace una sola query para obtener todos los usuarios necesarios.
+    """
+    ids = {p.usuarioid for p in permisos if p.usuarioid}
+    if not ids:
+        return [PermisoTemporalOut.model_validate(p) for p in permisos]
+
+    usuarios = {
+        u.id: u
+        for u in db.query(Usuario).filter(Usuario.id.in_(ids)).all()
+    }
+
+    resultado = []
+    for p in permisos:
+        out = PermisoTemporalOut.model_validate(p)
+        u = usuarios.get(p.usuarioid)
+        if u:
+            out.usuario_nombre = f"{(u.nombres or '').strip()} {(u.apellidos or '').strip()}".strip()
+        resultado.append(out)
+    return resultado
+
+
 @router.get("/", response_model=List[PermisoTemporalOut])
 def listar_permisos_temporales(
     activos: bool = Query(default=True),
@@ -405,7 +435,7 @@ def listar_permisos_temporales(
             UsuarioPermisoTemporal.consultorioid == current_user.consultorioid
         )
 
-    return (
+    permisos = (
         query.order_by(
             UsuarioPermisoTemporal.fecha_fin.desc(),
             UsuarioPermisoTemporal.id.desc(),
@@ -413,6 +443,7 @@ def listar_permisos_temporales(
         .limit(100)
         .all()
     )
+    return _enriquecer_permisos_con_nombres(db, permisos)
 
 
 @router.get("/me", response_model=List[PermisoTemporalOut])
@@ -422,7 +453,7 @@ def listar_mis_permisos_temporales(
 ):
     ahora = now_utc()
 
-    return (
+    permisos = (
         db.query(UsuarioPermisoTemporal)
         .filter(
             UsuarioPermisoTemporal.usuarioid == current_user.id,
@@ -433,6 +464,7 @@ def listar_mis_permisos_temporales(
         .order_by(UsuarioPermisoTemporal.fecha_fin.desc())
         .all()
     )
+    return _enriquecer_permisos_con_nombres(db, permisos)
 
 
 @router.get("/me/{tipo_permiso}", response_model=PermisoTemporalEstadoOut)

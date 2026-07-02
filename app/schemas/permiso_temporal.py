@@ -29,6 +29,7 @@ class PermisoTemporalCreate(BaseModel):
 class PermisoTemporalOut(BaseModel):
     id: int
     usuarioid: int
+    usuario_nombre: Optional[str] = None       # nombre completo del beneficiario
     autorizado_por_id: int
     consultorioid: Optional[int] = None
 

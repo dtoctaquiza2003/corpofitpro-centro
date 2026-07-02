@@ -1841,6 +1841,17 @@ def listar_cuentas_tratamientos(
     else:
         raise HTTPException(status_code=403, detail="No autorizado")
 
+    # Esta pantalla es de cuentas por cobrar/pagos. Un tratamiento con
+    # precio_sesion_aplicado = 0 (p. ej. Modo piscina, que se registra como
+    # asistencia y nunca entra a caja) no genera cuenta, así que no debe
+    # listarse aquí aunque el paciente sí tenga sesiones registradas.
+    query = query.filter(
+        or_(
+            TratamientoPaciente.precio_sesion_aplicado.is_(None),
+            TratamientoPaciente.precio_sesion_aplicado != 0,
+        )
+    )
+
     terapeuta_sesion_filtro = _obtener_terapeuta_para_filtro(
         db=db,
         terapeuta_sesion_id=terapeuta_sesion_id,

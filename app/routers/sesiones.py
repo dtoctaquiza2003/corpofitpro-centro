@@ -1679,10 +1679,18 @@ def _obtener_o_crear_tratamiento_piscina(
         diagnosticoid=None,
         tipotratamiento=tipo_terapia_piscina.nombre,
         tipoterapiaid=tipo_terapia_piscina.id,
+        # precio_sesion_oficial queda como referencia de lo que cuesta el
+        # tipo de terapia "Piscina" en el catálogo. precio_sesion_aplicado
+        # se deja en 0 a propósito: en la práctica ese dinero nunca entra a
+        # caja, así que Modo piscina no debe generar cuenta por cobrar.
+        # La sesión sigue quedando registrada (y la Asistencia también) para
+        # historial clínico y conteo, solo que sin impacto en caja/deuda.
         precio_sesion_oficial=precio,
-        precio_sesion_aplicado=precio,
+        precio_sesion_aplicado=0.0,
         sesiones_estimadas=None,
-        motivo_precio_especial=None,
+        motivo_precio_especial=(
+            "Modo piscina: se registra como asistencia, no genera cuenta por cobrar."
+        ),
         multiple_extremidad=False,
         fechainicio=fecha_atencion,
         fechafin=None,
@@ -1940,6 +1948,48 @@ def registrar_bloque_piscina(
         )
 
     db.commit()
+
+    # Notificar al jefe y secretarias de la sucursal del fisio para que
+    # el dashboard y el resumen del día se actualicen automáticamente.
+    if creadas > 0:
+        nombre_fisio = f"{(terapeuta_default.nombres or '').strip()} {(terapeuta_default.apellidos or '').strip()}".strip()
+        titulo_notif = "Bloque de piscina registrado"
+        mensaje_notif = (
+            f"{nombre_fisio} registró {creadas} sesión{'es' if creadas != 1 else ''} "
+            f"de piscina el {data.fecha_atencion}."
+            + (f" ({fallidas} fallidas)" if fallidas > 0 else "")
+        )
+        supervisores = (
+            db.query(Usuario)
+            .filter(
+                Usuario.rol.in_([1, 3]),
+                Usuario.activo == True,
+                Usuario.consultorioid == terapeuta_default.consultorioid,
+            )
+            .all()
+        )
+        for supervisor in supervisores:
+            if supervisor.id == current_user.id:
+                continue
+            crear_notificacion_usuario(
+                db=db,
+                usuarioid=supervisor.id,
+                titulo=titulo_notif,
+                mensaje=mensaje_notif,
+                tipo="bloque_piscina_registrado",
+                referencia_tipo="sesion",
+                referencia_id=None,
+                data={
+                    "terapeuta_id": terapeuta_default.id,
+                    "terapeuta_nombre": nombre_fisio,
+                    "fecha": str(data.fecha_atencion),
+                    "sesiones_creadas": creadas,
+                    "sesiones_fallidas": fallidas,
+                    "actualizar": ["sesiones", "dashboard", "resumen_dia"],
+                },
+                hacer_flush=False,
+            )
+        db.commit()
 
     return PiscinaBatchResumen(
         creadas=creadas,
