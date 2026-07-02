@@ -104,6 +104,27 @@ class PagoReasignarRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
 
+class PagoCompartirRequest(BaseModel):
+    """
+    Divide el saldo a favor de un pago ya verificado: una parte se queda
+    cubriendo la cuenta original y el resto se traspasa a otra terapia,
+    paquete o membresía de gimnasio, del mismo paciente o de un familiar.
+
+    No anula el pago original ni crea dinero nuevo: la suma de ambos pagos
+    después de compartir sigue siendo igual al monto original, por lo que
+    el comprobante y la caja del día no se ven afectados.
+    """
+
+    monto: float = Field(..., gt=0)
+    pacienteid_destino: int = Field(..., ge=1)
+    pacientepaqueteid: Optional[int] = None
+    tratamientopacienteid: Optional[int] = None
+    membresiagimnasioid: Optional[int] = None
+    motivo: Optional[str] = Field(default=None, max_length=500)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
 class PagoOut(BaseModel):
     id: int
     pacienteid: int
@@ -143,9 +164,23 @@ class PagoOut(BaseModel):
     fecha_anulacion: Optional[datetime] = None
     motivo_anulacion: Optional[str] = None
 
+    # Compartir / dividir pago: si este pago nació de dividir el saldo a
+    # favor de otro pago, aquí queda el id del pago original.
+    pago_origen_id: Optional[int] = None
+    motivo_comparticion: Optional[str] = None
+
     @field_serializer("fechapago", "fecha_verificacion", "fecha_anulacion")
     def serializar_fecha_ecuador(self, value: Optional[datetime], _info):
         return to_ecuador(value) if value is not None else None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class PagoCompartirResponse(BaseModel):
+    """Resultado de compartir un pago: la cuenta original y la nueva."""
+
+    pago_original: PagoOut
+    pago_nuevo: PagoOut
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -185,6 +220,10 @@ class PagoSimpleOut(BaseModel):
     anulado_por_id: Optional[int] = None
     fecha_anulacion: Optional[datetime] = None
     motivo_anulacion: Optional[str] = None
+
+    # Compartir / dividir pago
+    pago_origen_id: Optional[int] = None
+    motivo_comparticion: Optional[str] = None
 
     @field_serializer("fechapago", "fecha_verificacion", "fecha_anulacion")
     def serializar_fecha_ecuador(self, value: Optional[datetime], _info):

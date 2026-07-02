@@ -18,6 +18,8 @@ from app.schemas.pago import (
     PagoPrevioGimnasioCreate,
     RecuperacionCarteraCreate,
     PagoReasignarRequest,
+    PagoCompartirRequest,
+    PagoCompartirResponse,
     PagoOut,
     PagoSimpleOut,
     PagoAnularRequest,
@@ -757,6 +759,112 @@ def _validar_saldo_membresia_gimnasio(
             status_code=400,
             detail="El abono supera el saldo pendiente de la membresía de gimnasio.",
         )
+
+
+def _calcular_saldo_favor_destino(
+    db: Session,
+    tratamientopacienteid: Optional[int] = None,
+    pacientepaqueteid: Optional[int] = None,
+    membresiagimnasioid: Optional[int] = None,
+) -> float:
+    """
+    Calcula cuánto saldo a favor (pagado_verificado - total_generado) tiene
+    hoy la cuenta de origen de un pago, para limitar cuánto se puede
+    "compartir" con otra terapia, paquete o membresía sin descubrir la
+    cuenta original. Misma fórmula que usan los endpoints de cuenta de
+    tratamiento/paquete/gimnasio (saldo_favor).
+    """
+
+    if tratamientopacienteid is not None:
+        tratamiento = (
+            db.query(TratamientoPaciente)
+            .filter(TratamientoPaciente.id == tratamientopacienteid)
+            .first()
+        )
+
+        if tratamiento is None:
+            return 0.0
+
+        sesiones_realizadas = (
+            db.query(func.count(SesionTerapia.id))
+            .filter(
+                SesionTerapia.tratamientopacienteid == tratamientopacienteid,
+                SesionTerapia.horasalida != None,
+            )
+            .scalar()
+            or 0
+        )
+
+        precio_aplicado = (
+            float(tratamiento.precio_sesion_aplicado)
+            if tratamiento.precio_sesion_aplicado is not None
+            else 0.0
+        )
+
+        total_generado = float(sesiones_realizadas) * precio_aplicado
+
+        pagado_verificado = (
+            db.query(func.coalesce(func.sum(Pago.monto), 0))
+            .filter(
+                Pago.tratamientopacienteid == tratamientopacienteid,
+                Pago.estadopago == 2,
+                Pago.anulado == False,
+            )
+            .scalar()
+            or 0
+        )
+
+        return max(float(pagado_verificado) - total_generado, 0.0)
+
+    if pacientepaqueteid is not None:
+        paciente_paquete = (
+            db.query(PacientePaquete)
+            .filter(PacientePaquete.id == pacientepaqueteid)
+            .first()
+        )
+
+        if paciente_paquete is None:
+            return 0.0
+
+        pagado_verificado = (
+            db.query(func.coalesce(func.sum(Pago.monto), 0))
+            .filter(
+                Pago.pacientepaqueteid == pacientepaqueteid,
+                Pago.estadopago == 2,
+                Pago.anulado == False,
+            )
+            .scalar()
+            or 0
+        )
+
+        precio_final = float(paciente_paquete.preciofinal or 0)
+        return max(float(pagado_verificado) - precio_final, 0.0)
+
+    if membresiagimnasioid is not None:
+        membresia = (
+            db.query(MembresiaGimnasio)
+            .filter(MembresiaGimnasio.id == membresiagimnasioid)
+            .first()
+        )
+
+        if membresia is None:
+            return 0.0
+
+        pagado_verificado = (
+            db.query(func.coalesce(func.sum(Pago.monto), 0))
+            .filter(
+                Pago.membresiagimnasioid == membresiagimnasioid,
+                Pago.estadopago == 2,
+                Pago.anulado == False,
+            )
+            .scalar()
+            or 0
+        )
+
+        precio = float(membresia.precio or 0)
+        return max(float(pagado_verificado) - precio, 0.0)
+
+    return 0.0
 
 
 
@@ -3319,6 +3427,169 @@ def reasignar_pago(
     db.refresh(pago)
 
     return pago
+
+
+# ============================================================
+# COMPARTIR PAGO
+# Divide el saldo a favor de un pago verificado entre su cuenta original
+# y otra terapia, paquete o membresía de gimnasio (propia o de un
+# familiar), sin anular ni inflar el dinero recibido en caja.
+# ============================================================
+
+@router.post("/{pago_id}/compartir", response_model=PagoCompartirResponse)
+def compartir_pago(
+    pago_id: int,
+    data: PagoCompartirRequest,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(get_current_secretary),
+):
+    pago, paciente_origen = _obtener_pago_con_acceso(
+        db=db,
+        pago_id=pago_id,
+        current_user=current_user,
+    )
+
+    if pago.anulado:
+        raise HTTPException(
+            status_code=400,
+            detail="No se puede compartir un pago anulado.",
+        )
+
+    if pago.estadopago != 2:
+        raise HTTPException(
+            status_code=400,
+            detail="Solo se puede compartir un pago ya verificado.",
+        )
+
+    if bool(getattr(pago, "esrecuperacioncartera", False)):
+        raise HTTPException(
+            status_code=400,
+            detail="La recuperación de cartera no se puede compartir con otra cuenta.",
+        )
+
+    monto_compartir = round(float(data.monto), 2)
+
+    if monto_compartir >= round(float(pago.monto), 2):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "El monto a compartir debe ser menor al monto total del pago. "
+                "Si quiere mover el pago completo a otra cuenta, use la opción "
+                "de reasignar."
+            ),
+        )
+
+    saldo_favor_actual = _calcular_saldo_favor_destino(
+        db=db,
+        tratamientopacienteid=pago.tratamientopacienteid,
+        pacientepaqueteid=pago.pacientepaqueteid,
+        membresiagimnasioid=pago.membresiagimnasioid,
+    )
+
+    if monto_compartir > saldo_favor_actual + 0.01:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Este pago no tiene suficiente saldo a favor para compartir. "
+                f"Saldo a favor disponible: ${saldo_favor_actual:.2f}."
+            ),
+        )
+
+    _validar_destino_pago(
+        pacientepaqueteid=data.pacientepaqueteid,
+        tratamientopacienteid=data.tratamientopacienteid,
+        membresiagimnasioid=data.membresiagimnasioid,
+    )
+
+    paciente_destino = _validar_paciente(
+        db=db,
+        pacienteid=data.pacienteid_destino,
+        current_user=current_user,
+        tratamientopacienteid=data.tratamientopacienteid,
+        permitir_atencion_compartida=True,
+    )
+
+    paciente_paquete_destino = _validar_paciente_paquete(
+        db=db,
+        pacienteid=data.pacienteid_destino,
+        pacientepaqueteid=data.pacientepaqueteid,
+    )
+
+    _validar_tratamiento_paciente(
+        db=db,
+        pacienteid=data.pacienteid_destino,
+        tratamientopacienteid=data.tratamientopacienteid,
+    )
+
+    membresia_destino = _validar_membresia_gimnasio(
+        db=db,
+        pacienteid=data.pacienteid_destino,
+        membresiagimnasioid=data.membresiagimnasioid,
+    )
+
+    # En terapias se permite saldo a favor/abono futuro; en paquetes y
+    # membresías de gimnasio sí se valida para no sobrepasar el precio.
+    _validar_saldo_paquete(
+        db=db,
+        paciente_paquete=paciente_paquete_destino,
+        monto=monto_compartir,
+    )
+
+    _validar_saldo_membresia_gimnasio(
+        db=db,
+        membresia=membresia_destino,
+        monto=monto_compartir,
+    )
+
+    motivo_texto = (data.motivo or "").strip()[:500] or None
+
+    # Reduce el pago original: sigue cubriendo su cuenta, solo que por menos.
+    pago.monto = round(float(pago.monto) - monto_compartir, 2)
+    if motivo_texto:
+        pago.motivo_comparticion = (
+            f"Se compartieron ${monto_compartir:.2f} con "
+            f"{_nombre_paciente(paciente_destino)}: {motivo_texto}"
+        )
+
+    nuevo_pago = Pago(
+        pacienteid=data.pacienteid_destino,
+        pacientepaqueteid=data.pacientepaqueteid,
+        tratamientopacienteid=data.tratamientopacienteid,
+        membresiagimnasioid=data.membresiagimnasioid,
+        monto=monto_compartir,
+        metodopago=pago.metodopago,
+        fechapago=pago.fechapago,
+        numerocomprobante=pago.numerocomprobante,
+        comprobanteurl=pago.comprobanteurl,
+        estadopago=pago.estadopago,
+        creado_por_id=current_user.id,
+        verificado_por_id=pago.verificado_por_id,
+        fecha_verificacion=pago.fecha_verificacion,
+        motivo_rechazo=None,
+        # Conserva la naturaleza del pago original (si era pago previo al
+        # sistema, la parte compartida también lo es, para no inflar la
+        # caja del día con dinero que en realidad no entró hoy).
+        espagoprevio=bool(getattr(pago, "espagoprevio", False)),
+        fechapagoreal=pago.fechapagoreal,
+        observacionpagoprevio=pago.observacionpagoprevio,
+        esrecuperacioncartera=False,
+        observacion_cartera=None,
+        pago_origen_id=pago.id,
+        motivo_comparticion=(
+            f"Saldo compartido desde pago #{pago.id} de "
+            f"{_nombre_paciente(paciente_origen)}"
+            + (f": {motivo_texto}" if motivo_texto else ".")
+        ),
+    )
+
+    db.add(nuevo_pago)
+    db.flush()
+
+    db.commit()
+    db.refresh(pago)
+    db.refresh(nuevo_pago)
+
+    return PagoCompartirResponse(pago_original=pago, pago_nuevo=nuevo_pago)
 
 
 # ============================================================

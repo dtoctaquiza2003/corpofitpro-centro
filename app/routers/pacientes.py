@@ -206,6 +206,7 @@ def listar_pacientes_paginado(
     terapeuta_id: Optional[int] = Query(None),
     consultorio_id: Optional[int] = Query(None),
     search: Optional[str] = Query(None),
+    piscina_mode: bool = Query(False),
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
@@ -250,9 +251,14 @@ def listar_pacientes_paginado(
             current_user.consultorioid,
         )
 
-        query = db.query(Paciente).filter(
-            Paciente.consultorioid == current_user.consultorioid
-        )
+        if piscina_mode:
+            # Modo piscina: la piscina puede atender pacientes de
+            # cualquier sucursal, así que no se restringe por consultorio.
+            query = db.query(Paciente)
+        else:
+            query = db.query(Paciente).filter(
+                Paciente.consultorioid == current_user.consultorioid
+            )
 
         if terapeuta_id:
             terapeuta_para_compartidos = terapeuta_id

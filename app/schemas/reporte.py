@@ -270,6 +270,9 @@ class TerapiasReporteOut(BaseModel):
     # Ingreso real de gimnasio verificado en el rango. No aumenta
     # total_generado de terapias; sí entra al cuadre de caja.
     total_gimnasio_pagado: float = 0
+    # Cobros de deuda de rangos anteriores recibidos hoy. Ya está incluido
+    # dentro de total_pagado_verificado; se expone aparte para el cuadre.
+    total_recuperacion_cartera: float = 0
     # Gastos de la clínica dentro del rango: papel, insumos, transporte, etc.
     # No se mezclan con los ingresos por método; sirven para caja neta.
     total_egresos: float = 0

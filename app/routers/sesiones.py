@@ -14,6 +14,7 @@ from ..auth.permissions import (
     permiso_temporal_activo,
     TIPO_REGISTRO_RETROACTIVO,
     terapeuta_tiene_permiso_atencion_sucursal_temporal,
+    usuario_tiene_modo_piscina_activo,
 )
 from ..dependencies.db import get_db
 from ..models.alerta import Alerta
@@ -22,12 +23,17 @@ from ..models.gimnasio import MovimientoGimnasio
 from ..models.consultorio import Consultorio
 from ..models.paciente import Paciente
 from ..models.sesion_terapia import SesionTerapia
+from ..models.tipo_terapia import TipoTerapia
 from ..models.tratamiento import SesionTratamiento, TipoTratamiento
 from ..models.tratamiento_paciente import TratamientoPaciente
 from ..models.usuario import Usuario
 from ..schemas.sesion import (
     FinalizarSesionCreate,
     InicioSesionCreate,
+    PiscinaBatchCreate,
+    PiscinaBatchItemResult,
+    PiscinaBatchResumen,
+    PiscinaBatchSessionItem,
     SesionAtencionOut,
     SesionCambiarTratamientoCreate,
     TipoTratamientoOut,
@@ -1592,6 +1598,354 @@ def iniciar_sesion(
     db.commit()
 
     return respuesta
+
+
+def _obtener_o_crear_tratamiento_piscina(
+    db: Session,
+    paciente_id: int,
+    tratamiento_paciente_id: Optional[int],
+    fecha_atencion: date,
+) -> TratamientoPaciente:
+    """
+    Resuelve el tratamiento a usar para una entrada del bloque de piscina.
+
+    - Si viene tratamiento_paciente_id, se valida que exista, esté activo y
+      pertenezca al paciente.
+    - Si no viene, se busca un tratamiento de piscina activo del paciente.
+    - Si el paciente no tiene ninguno, se crea automáticamente (tipo de
+      terapia "Piscina") para no bloquear el registro de la asistencia.
+    """
+    if tratamiento_paciente_id is not None:
+        tratamiento = (
+            db.query(TratamientoPaciente)
+            .filter(
+                TratamientoPaciente.id == tratamiento_paciente_id,
+                TratamientoPaciente.pacienteid == paciente_id,
+                TratamientoPaciente.activo == True,
+            )
+            .first()
+        )
+
+        if not tratamiento:
+            raise HTTPException(
+                status_code=400,
+                detail="El tratamiento de piscina seleccionado no existe o no está activo.",
+            )
+
+        return tratamiento
+
+    tratamiento_existente = (
+        db.query(TratamientoPaciente)
+        .join(TipoTerapia, TipoTerapia.id == TratamientoPaciente.tipoterapiaid)
+        .filter(
+            TratamientoPaciente.pacienteid == paciente_id,
+            TratamientoPaciente.activo == True,
+            TipoTerapia.nombre.ilike("%piscina%"),
+        )
+        .order_by(TratamientoPaciente.fechainicio.desc())
+        .first()
+    )
+
+    if tratamiento_existente:
+        return tratamiento_existente
+
+    tipo_terapia_piscina = (
+        db.query(TipoTerapia)
+        .filter(TipoTerapia.activo == True, TipoTerapia.nombre.ilike("piscina"))
+        .first()
+    )
+
+    if not tipo_terapia_piscina:
+        tipo_terapia_piscina = (
+            db.query(TipoTerapia)
+            .filter(TipoTerapia.activo == True, TipoTerapia.nombre.ilike("%piscina%"))
+            .order_by(TipoTerapia.id.asc())
+            .first()
+        )
+
+    if not tipo_terapia_piscina:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "No existe un tipo de terapia 'Piscina' configurado. "
+                "Créalo en Tipos de terapia antes de registrar el bloque."
+            ),
+        )
+
+    precio = float(tipo_terapia_piscina.precio_sesion)
+
+    nuevo_tratamiento = TratamientoPaciente(
+        pacienteid=paciente_id,
+        diagnosticoid=None,
+        tipotratamiento=tipo_terapia_piscina.nombre,
+        tipoterapiaid=tipo_terapia_piscina.id,
+        precio_sesion_oficial=precio,
+        precio_sesion_aplicado=precio,
+        sesiones_estimadas=None,
+        motivo_precio_especial=None,
+        multiple_extremidad=False,
+        fechainicio=fecha_atencion,
+        fechafin=None,
+        observaciones="Tratamiento creado automáticamente desde Modo piscina.",
+        activo=True,
+    )
+
+    db.add(nuevo_tratamiento)
+    db.flush()
+
+    return nuevo_tratamiento
+
+
+def _resolver_terapeuta_sesion_piscina(
+    db: Session,
+    terapeuta_id_item: Optional[int],
+    terapeuta_default: Usuario,
+    cache: dict,
+) -> Usuario:
+    """
+    Resuelve qué fisio queda como responsable de una sesión del bloque
+    (y por lo tanto, a quién se le atribuye la comisión).
+
+    Importante: NO se infiere del fisio encargado del paciente en su
+    ficha, porque quien está a cargo del paciente en general no es
+    necesariamente quien lo atendió ese día en la piscina.
+
+    Orden de prioridad:
+    1. terapeuta_id_item: override manual explícito para esta sesión
+       puntual (si se seleccionó un fisio distinto solo para ese paciente).
+    2. terapeuta_default: el fisio del bloque.
+    """
+    if terapeuta_id_item is None:
+        return terapeuta_default
+
+    if terapeuta_id_item in cache:
+        terapeuta = cache[terapeuta_id_item]
+    else:
+        terapeuta = (
+            db.query(Usuario)
+            .filter(
+                Usuario.id == terapeuta_id_item,
+                Usuario.rol == 2,
+                Usuario.activo == True,
+            )
+            .first()
+        )
+        cache[terapeuta_id_item] = terapeuta
+
+    if terapeuta:
+        return terapeuta
+
+    raise HTTPException(
+        status_code=400,
+        detail="El fisioterapeuta indicado para este paciente no existe o no está activo.",
+    )
+
+
+def _registrar_sesion_piscina_item(
+    db: Session,
+    item: PiscinaBatchSessionItem,
+    terapeuta_default: Usuario,
+    fecha_atencion: date,
+    terapeuta_cache: dict,
+) -> SesionAtencionOut:
+    paciente = db.query(Paciente).filter(Paciente.id == item.pacienteid).first()
+
+    if not paciente:
+        raise HTTPException(status_code=404, detail="Paciente no encontrado.")
+
+    if item.hora_salida <= item.hora_ingreso:
+        raise HTTPException(
+            status_code=400,
+            detail="La hora de salida debe ser mayor a la hora de ingreso.",
+        )
+
+    terapeuta = _resolver_terapeuta_sesion_piscina(
+        db=db,
+        terapeuta_id_item=item.terapeutaid,
+        terapeuta_default=terapeuta_default,
+        cache=terapeuta_cache,
+    )
+
+    tratamiento = _obtener_o_crear_tratamiento_piscina(
+        db=db,
+        paciente_id=item.pacienteid,
+        tratamiento_paciente_id=item.tratamientopacienteid,
+        fecha_atencion=fecha_atencion,
+    )
+
+    if _ya_tiene_sesion_en_fecha_para_patologia(
+        db=db,
+        paciente_id=paciente.id,
+        tratamiento=tratamiento,
+        fecha_sesion=fecha_atencion,
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Este paciente ya tiene una atención registrada en esa fecha.",
+        )
+
+    validar_sesiones_disponibles_para_tratamiento(db=db, tratamiento=tratamiento)
+
+    asistencia_existente = (
+        db.query(Asistencia)
+        .filter(
+            Asistencia.pacienteid == paciente.id,
+            Asistencia.fecha == fecha_atencion,
+        )
+        .first()
+    )
+
+    if not asistencia_existente:
+        db.add(
+            Asistencia(
+                pacienteid=paciente.id,
+                fecha=fecha_atencion,
+                horaregistro=now_ecuador(),
+            )
+        )
+
+    nueva_sesion = SesionTerapia(
+        pacienteid=paciente.id,
+        terapeutaid=terapeuta.id,
+        fecha=fecha_atencion,
+        horaingreso=item.hora_ingreso,
+        horasalida=item.hora_salida,
+        escaladolorentrada=item.escaladolorentrada,
+        escaladolorsalida=item.escaladolorsalida,
+        pacientepaqueteid=None,
+        tratamientopacienteid=tratamiento.id,
+    )
+
+    db.add(nueva_sesion)
+    db.flush()
+
+    nueva_sesion = (
+        db.query(SesionTerapia)
+        .options(
+            joinedload(SesionTerapia.paciente),
+            joinedload(SesionTerapia.terapeuta),
+            joinedload(SesionTerapia.tratamiento_paciente),
+        )
+        .filter(SesionTerapia.id == nueva_sesion.id)
+        .first()
+    )
+
+    return build_sesion_out(nueva_sesion, db, tratamientos_aplicados_override=[])
+
+
+@router.post(
+    "/piscina/lote",
+    response_model=PiscinaBatchResumen,
+    status_code=status.HTTP_201_CREATED,
+)
+def registrar_bloque_piscina(
+    data: PiscinaBatchCreate,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(get_current_user),
+):
+    """
+    Registra en una sola llamada todas las atenciones de un bloque de
+    "Modo piscina": cada paciente ya trae su hora de ingreso/salida y su
+    dolor de entrada/salida.
+
+    - Jefe y secretaria: siempre pueden usar este endpoint.
+    - Terapeuta: solo si tiene el permiso temporal "modo_piscina" activo.
+    - El fisio del bloque (quien atendió físicamente la piscina) es
+      obligatorio: de él depende la comisión, así que nunca se infiere
+      automáticamente del fisio encargado del paciente en su ficha.
+    - No valida cruce paciente-fisio: la piscina puede atender pacientes
+      de cualquier sucursal.
+    - Si un paciente no tiene tratamiento de piscina activo, se le crea
+      uno automáticamente en lugar de bloquear el registro.
+    """
+    if current_user.rol not in (1, 2, 3):
+        raise HTTPException(status_code=403, detail="No autorizado.")
+
+    if not usuario_tiene_modo_piscina_activo(db=db, usuario=current_user):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "No tienes el permiso 'Modo piscina' activo. "
+                "Solicítalo a tu jefe."
+            ),
+        )
+
+    terapeuta_default = (
+        db.query(Usuario)
+        .filter(
+            Usuario.id == data.terapeutaid,
+            Usuario.rol == 2,
+            Usuario.activo == True,
+        )
+        .first()
+    )
+
+    if not terapeuta_default:
+        raise HTTPException(
+            status_code=400,
+            detail="El fisioterapeuta seleccionado no existe o no está activo.",
+        )
+
+    hoy = now_ecuador().date()
+
+    if data.fecha_atencion > hoy:
+        raise HTTPException(
+            status_code=400,
+            detail="No se puede registrar un bloque de piscina con fecha futura.",
+        )
+
+    terapeuta_cache: dict = {}
+    resultados: list[PiscinaBatchItemResult] = []
+    creadas = 0
+    fallidas = 0
+
+    for item in data.sesiones:
+        try:
+            with db.begin_nested():
+                sesion_out = _registrar_sesion_piscina_item(
+                    db=db,
+                    item=item,
+                    terapeuta_default=terapeuta_default,
+                    fecha_atencion=data.fecha_atencion,
+                    terapeuta_cache=terapeuta_cache,
+                )
+        except HTTPException as exc:
+            fallidas += 1
+            resultados.append(
+                PiscinaBatchItemResult(
+                    pacienteid=item.pacienteid,
+                    ok=False,
+                    error=str(exc.detail),
+                )
+            )
+            continue
+        except Exception:
+            fallidas += 1
+            resultados.append(
+                PiscinaBatchItemResult(
+                    pacienteid=item.pacienteid,
+                    ok=False,
+                    error="No se pudo registrar la atención de este paciente.",
+                )
+            )
+            continue
+
+        creadas += 1
+        resultados.append(
+            PiscinaBatchItemResult(
+                pacienteid=item.pacienteid,
+                ok=True,
+                sesion=sesion_out,
+            )
+        )
+
+    db.commit()
+
+    return PiscinaBatchResumen(
+        creadas=creadas,
+        fallidas=fallidas,
+        resultados=resultados,
+    )
 
 
 @router.get("/en-curso", response_model=List[SesionAtencionOut])

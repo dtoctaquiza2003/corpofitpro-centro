@@ -2886,6 +2886,60 @@ def reporte_terapias(
         reverse=True,
     )[:10]
 
+    # ── Egresos de caja ────────────────────────────────────────────────────
+    # Solo se calculan cuando el reporte NO está filtrado por fisioterapeuta
+    # (la función devuelve 0.0 en ese caso para no mezclar gastos de clínica
+    # con el cuadre individual del fisio). No toca FIFO, sueldos ni métodos.
+    total_egresos = _total_egresos_caja(
+        db=db,
+        current_user=current_user,
+        desde=desde,
+        hasta=hasta,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+        dia_semana=dia_semana,
+    )
+
+    # caja_bruta = todo el dinero real que entró (terapias + gimnasio).
+    caja_bruta = round(total_pagado_verificado + total_gimnasio_pagado, 2)
+    caja_neta = round(caja_bruta - total_egresos, 2)
+
+    # Egresos por día para que el desglose diario también cuadre.
+    if total_egresos > 0 and terapeutaid is None and current_user.rol != 2:
+        consultorio_resuelto_eg = _resolver_consultorioid_para_rol(
+            current_user, consultorioid
+        )
+        egresos_dia_query = db.query(
+            Egreso.fechaegreso,
+            func.coalesce(func.sum(Egreso.monto), 0),
+        ).filter(
+            Egreso.fechaegreso >= desde,
+            Egreso.fechaegreso <= hasta,
+            or_(Egreso.anulado == False, Egreso.anulado.is_(None)),
+        )
+        if consultorio_resuelto_eg is not None:
+            egresos_dia_query = egresos_dia_query.filter(
+                Egreso.consultorioid == consultorio_resuelto_eg
+            )
+        if dia_semana is not None:
+            egresos_dia_query = egresos_dia_query.filter(
+                func.extract("isodow", Egreso.fechaegreso) == dia_semana + 1
+            )
+        egresos_dia_query = egresos_dia_query.group_by(Egreso.fechaegreso)
+
+        for fecha_egreso, monto_dia in egresos_dia_query.all():
+            fecha_e = fecha_egreso if isinstance(fecha_egreso, date) else fecha_egreso.date()
+            if fecha_e in dias_map:
+                dias_map[fecha_e].egresos = round(
+                    dias_map[fecha_e].egresos + float(monto_dia or 0), 2
+                )
+                dias_map[fecha_e].caja_neta = round(
+                    dias_map[fecha_e].pagos_verificados
+                    + dias_map[fecha_e].pagos_gimnasio
+                    - dias_map[fecha_e].egresos,
+                    2,
+                )
+
     return TerapiasReporteOut(
         desde=desde,
         hasta=hasta,
@@ -2900,6 +2954,10 @@ def reporte_terapias(
         transferencias_pendientes_cantidad=int(totales_metodo.get("transferencias_pendientes_cantidad", transferencias_pendientes_cantidad) or 0),
         total_pago_previo_verificado=round(total_pago_previo_verificado, 2),
         total_gimnasio_pagado=round(total_gimnasio_pagado, 2),
+        total_recuperacion_cartera=round(total_recuperacion_cartera, 2),
+        total_egresos=total_egresos,
+        caja_bruta=caja_bruta,
+        caja_neta=caja_neta,
         total_no_monetario_cubierto=round(total_no_monetario_cubierto, 2),
         total_ecuasanitas=round(total_ecuasanitas, 2),
         sesiones_ecuasanitas=sesiones_ecuasanitas,
@@ -5550,6 +5608,80 @@ def _excel_base_pagos(
     return rows
 
 
+def _excel_base_egresos(
+    db: Session,
+    current_user: Usuario,
+    desde: date,
+    hasta: date,
+    terapeutaid: Optional[int] = None,
+    consultorioid: Optional[int] = None,
+    dia_semana: Optional[int] = None,
+) -> List[List]:
+    """Detalle auditable de egresos de caja: quién los registró, categoría y concepto.
+
+    Usa el mismo filtro de rango/consultorio/día que _total_egresos_caja, pero
+    devuelve cada egreso individual en vez del total. Igual que en esa
+    función, si el reporte está filtrado por fisioterapeuta no se muestran
+    egresos (no pertenecen a un fisio específico). Se incluyen los anulados
+    para auditoría; la columna "Caja válida" indica si el egreso afecta la
+    caja neta del periodo.
+    """
+    dia_semana = _validar_dia_semana(dia_semana)
+    consultorios_map = _obtener_consultorios_map(db)
+
+    if current_user.rol == 2 or terapeutaid is not None:
+        return []
+
+    consultorio_resuelto = _resolver_consultorioid_para_rol(
+        current_user,
+        consultorioid,
+    )
+
+    query = db.query(Egreso).filter(
+        Egreso.fechaegreso >= desde,
+        Egreso.fechaegreso <= hasta,
+    )
+
+    if consultorio_resuelto is not None:
+        query = query.filter(Egreso.consultorioid == consultorio_resuelto)
+
+    if dia_semana is not None:
+        query = query.filter(
+            func.extract("isodow", Egreso.fechaegreso) == dia_semana + 1
+        )
+
+    egresos = query.order_by(Egreso.fechaegreso, Egreso.id).all()
+
+    usuarios_map = _excel_map_usuarios(
+        db,
+        {e.creado_por_id for e in egresos} | {e.anulado_por_id for e in egresos},
+    )
+
+    rows: List[List] = []
+    for egreso in egresos:
+        anulado = bool(egreso.anulado)
+        caja_valida = round(float(egreso.monto or 0), 2) if not anulado else 0.0
+        rows.append(
+            [
+                egreso.id,
+                egreso.fechaegreso,
+                _excel_dia(egreso.fechaegreso),
+                consultorios_map.get(egreso.consultorioid, "Sin consultorio"),
+                _excel_safe_text(egreso.categoria) or "Sin categoría",
+                _excel_safe_text(egreso.concepto),
+                round(float(egreso.monto or 0), 2),
+                _excel_safe_text(egreso.metodopago) or "Efectivo",
+                _nombre_usuario(usuarios_map.get(egreso.creado_por_id)),
+                _excel_safe_text(egreso.observacion),
+                _excel_bool(anulado),
+                _excel_safe_text(egreso.motivo_anulacion),
+                caja_valida,
+            ]
+        )
+
+    return rows
+
+
 def _excel_aplicar_estilo_workbook(wb) -> None:
     from openpyxl.styles import Alignment, Font, PatternFill, Side, Border
     from openpyxl.utils import get_column_letter
@@ -6272,6 +6404,15 @@ def _crear_excel_reporte_corpofit(
         consultorioid=consultorioid,
         dia_semana=dia_semana,
     )
+    base_egresos = _excel_base_egresos(
+        db=db,
+        current_user=current_user,
+        desde=desde,
+        hasta=hasta,
+        terapeutaid=terapeutaid,
+        consultorioid=consultorioid,
+        dia_semana=dia_semana,
+    )
 
     wb = Workbook()
     # Forzar recálculo al abrir, porque el panel usa fórmulas vinculadas a tablas.
@@ -6288,6 +6429,7 @@ def _crear_excel_reporte_corpofit(
     ws_sesiones = wb.create_sheet("Base_Sesiones")
     ws_pagos = wb.create_sheet("Base_Pagos")
     ws_sueldos = wb.create_sheet("Sueldos_Fisios")
+    ws_egresos = wb.create_sheet("Detalle_Egresos")
 
     subtitulo = (
         f"Periodo semanal completo: {desde.strftime('%d/%m/%Y')} - {hasta.strftime('%d/%m/%Y')} | "
@@ -6305,8 +6447,11 @@ def _crear_excel_reporte_corpofit(
         "Sesiones",
         "Generado terapias",
         "Pagado caja",
+        "Gimnasio",
         "Ecuasanitas",
         "Pendiente pacientes",
+        "Egresos",
+        "Caja neta",
         "Sueldo fisio total",
         "Sueldo fisio cobrado",
         "Sueldo fisio retenido",
@@ -6335,8 +6480,11 @@ def _crear_excel_reporte_corpofit(
                 item.sesiones,
                 item.total_generado,
                 item.pagos_verificados,
+                item.pagos_gimnasio,
                 item.cubierto_ecuasanitas,
                 round(float(sueldo_item.get("pendiente_pacientes", 0.0)), 2),
+                item.egresos,
+                item.caja_neta,
                 round(float(sueldo_item.get("sueldo_total", 0.0)), 2),
                 round(float(sueldo_item.get("sueldo_cobrado", 0.0)), 2),
                 round(float(sueldo_item.get("sueldo_retenido", 0.0)), 2),
@@ -6417,6 +6565,30 @@ def _crear_excel_reporte_corpofit(
         for item in clinicas
     ]
     current_row = _excel_agregar_tabla(ws_analisis, current_row, 1, clinica_headers, clinica_rows, "tblAnalisisClinicas", crear_tabla=False)
+
+    # ── Cuadre de caja global ───────────────────────────────────────────────
+    # Solo se muestra cuando hay egresos o cuando el reporte no está filtrado
+    # por fisio (el backend ya devuelve 0 en ese caso, igual que en la UI).
+    ws_analisis.cell(row=current_row, column=1, value="▶ Cuadre de caja global")
+    current_row += 1
+    caja_headers = ["Concepto", "Monto"]
+    caja_rows = [
+        ["Caja terapias (verificado)",      round(general.total_pagado_verificado, 2)],
+        ["   de la cual: recuperación cartera", round(general.total_recuperacion_cartera, 2)],
+        ["Gimnasio (verificado)",           round(general.total_gimnasio_pagado, 2)],
+        ["Caja bruta",                      round(general.caja_bruta, 2)],
+        ["Egresos clínica",                 round(general.total_egresos, 2)],
+        ["Caja neta",                       round(general.caja_neta, 2)],
+        ["", ""],
+        ["Pago previo (no entra a caja del rango)", round(general.total_pago_previo_verificado, 2)],
+        ["No monetario (cortesía/canje, no entra a caja)", round(general.total_no_monetario_cubierto, 2)],
+        ["Saldo a favor de pacientes",       round(general.saldo_a_favor, 2)],
+        ["Pendiente de verificación",        round(general.pendiente_verificacion_total, 2)],
+    ]
+    current_row = _excel_agregar_tabla(
+        ws_analisis, current_row, 1, caja_headers, caja_rows,
+        "tblCuadreCaja", crear_tabla=False,
+    )
 
     # Base de sesiones
     sesiones_headers = [
@@ -6506,6 +6678,25 @@ def _crear_excel_reporte_corpofit(
     _excel_agregar_tabla(ws_sueldos, 1, 1, sueldos_headers, detalle_sueldos, "tblSueldosFisios")
     ws_sueldos.freeze_panes = "A2"
 
+    # Detalle auditable de egresos: quién los registró, categoría y concepto.
+    egresos_headers = [
+        "ID Egreso",
+        "Fecha",
+        "Día",
+        "Consultorio",
+        "Categoría",
+        "Concepto",
+        "Monto",
+        "Método pago",
+        "Registrado por",
+        "Observación",
+        "Anulado",
+        "Motivo anulación",
+        "Caja válida",
+    ]
+    _excel_agregar_tabla(ws_egresos, 1, 1, egresos_headers, base_egresos, "tblDetalleEgresos")
+    ws_egresos.freeze_panes = "A2"
+
     # Panel central de filtros: una sola cajita controla KPIs y gráficas.
     rangos_filtros = _excel_crear_listas_filtros(wb, base_sesiones, base_pagos)
     _excel_escribir_titulo(ws_dashboard, "CORPOFIT PRO — REPORTE EXCEL", subtitulo)
@@ -6517,7 +6708,7 @@ def _crear_excel_reporte_corpofit(
     _excel_crear_graficas_dashboard(ws_dashboard, base_pagos)
 
     # Formatos y estilo visual.
-    for ws in [ws_dashboard, ws_analisis, ws_sesiones, ws_pagos, ws_sueldos]:
+    for ws in [ws_dashboard, ws_analisis, ws_sesiones, ws_pagos, ws_sueldos, ws_egresos]:
         ws.freeze_panes = ws.freeze_panes or "A4"
         for row in ws.iter_rows():
             for cell in row:
@@ -6525,7 +6716,7 @@ def _crear_excel_reporte_corpofit(
 
     _excel_aplicar_estilo_workbook(wb)
 
-    for ws in [ws_analisis, ws_sesiones, ws_pagos, ws_sueldos]:
+    for ws in [ws_analisis, ws_sesiones, ws_pagos, ws_sueldos, ws_egresos]:
         for row in ws.iter_rows(min_row=2):
             for cell in row:
                 header = str(ws.cell(row=1, column=cell.column).value or "").lower()
@@ -6539,7 +6730,7 @@ def _crear_excel_reporte_corpofit(
                     cell.number_format = "dd/mm/yyyy"
 
     # Ajuste final de formatos por columnas conocidas.
-    for ws in [ws_dashboard, ws_analisis, ws_sesiones, ws_pagos, ws_sueldos]:
+    for ws in [ws_dashboard, ws_analisis, ws_sesiones, ws_pagos, ws_sueldos, ws_egresos]:
         for row in ws.iter_rows():
             for cell in row:
                 if isinstance(cell.value, date):

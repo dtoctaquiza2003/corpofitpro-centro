@@ -5,7 +5,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from ..auth.dependencies import get_current_user
-from ..auth.permissions import validar_consultorio_secretario
+from ..auth.permissions import (
+    validar_consultorio_secretario,
+    usuario_tiene_modo_piscina_activo,
+)
 from ..dependencies.db import get_db
 from ..models.usuario import Usuario
 from ..models.usuario_permiso_temporal import UsuarioPermisoTemporal
@@ -19,6 +22,7 @@ from ..schemas.permiso_temporal import (
     TIPO_CREAR_TRATAMIENTOS,
     TIPO_REGISTRO_RETROACTIVO,
     TIPO_ATENCION_SUCURSAL_TEMPORAL,
+    TIPO_MODO_PISCINA,
 )
 
 router = APIRouter(
@@ -31,6 +35,7 @@ TIPOS_PERMITIDOS = {
     TIPO_ADMIN_TEMPORAL,
     TIPO_CREAR_TRATAMIENTOS,
     TIPO_ATENCION_SUCURSAL_TEMPORAL,
+    TIPO_MODO_PISCINA,
 }
 
 
@@ -120,6 +125,9 @@ def _tipo_permiso_legible(tipo_permiso: str) -> str:
     if tipo_permiso == TIPO_ATENCION_SUCURSAL_TEMPORAL:
         return "atención temporal por sucursal"
 
+    if tipo_permiso == TIPO_MODO_PISCINA:
+        return "modo piscina"
+
     return tipo_permiso.replace("_", " ")
 
 
@@ -161,6 +169,14 @@ def _mensaje_permiso_otorgado(
             "Podrás atender pacientes de tu consultorio durante el rango autorizado.\n"
             f"Inicio: {fecha_inicio}.\n"
             f"Fin: {fecha_fin}.\n"
+            f"Autorizado por: {autorizador_nombre}."
+        )
+    elif permiso.tipo_permiso == TIPO_MODO_PISCINA:
+        fecha_inicio = _formatear_fecha_permiso(permiso.fecha_inicio)
+        mensaje = (
+            "Se te habilitó el Modo piscina.\n"
+            "Puedes registrar el bloque de piscina desde la app.\n"
+            f"Válido desde: {fecha_inicio} hasta: {fecha_fin}.\n"
             f"Autorizado por: {autorizador_nombre}."
         )
     else:
@@ -248,6 +264,7 @@ def _notificar_permiso_temporal(
                 "tratamientos",
                 "dashboard",
                 "notificaciones",
+                *(["pool_mode"] if permiso.tipo_permiso == TIPO_MODO_PISCINA else []),
             ],
         },
         hacer_flush=False,
@@ -428,6 +445,16 @@ def verificar_mi_permiso_temporal(
         raise HTTPException(
             status_code=400,
             detail="Tipo de permiso no válido.",
+        )
+
+    # Modo piscina: jefe y secretaria lo tienen siempre activo, ya que ese
+    # permiso temporal solo tiene sentido para terapeutas. Así evitamos que
+    # la secretaria vea el aviso de "permiso no activo" en la app.
+    if tipo_permiso == TIPO_MODO_PISCINA and current_user.rol in (1, 3):
+        return PermisoTemporalEstadoOut(
+            activo=True,
+            tipo_permiso=tipo_permiso,
+            permiso=None,
         )
 
     permiso = obtener_permiso_temporal_activo(

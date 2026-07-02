@@ -102,6 +102,52 @@ class SesionCreate(BaseModel):
 class SesionOut(SesionAtencionOut):
     pass
 
+class PiscinaBatchSessionItem(BaseModel):
+    pacienteid: int
+    # Si no se envía (o es null), el backend busca un tratamiento de
+    # piscina activo del paciente y, si no existe ninguno, lo crea
+    # automáticamente para no bloquear el registro del bloque.
+    tratamientopacienteid: Optional[int] = None
+
+    # Override manual: fisio que atendió puntualmente a ESTE paciente en
+    # la piscina, si fue distinto al fisio del bloque. No se autocompleta
+    # con el fisio encargado del paciente: quien realmente atendió es
+    # quien debe llevarse la comisión de la sesión.
+    terapeutaid: Optional[int] = None
+
+    hora_ingreso: time
+    hora_salida: time
+
+    escaladolorentrada: int = Field(..., ge=0, le=10)
+    escaladolorsalida: int = Field(..., ge=0, le=10)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class PiscinaBatchCreate(BaseModel):
+    # Fisio que atendió el bloque (quien físicamente estuvo en la
+    # piscina). Obligatorio: de él depende la comisión de la sesión, así
+    # que no se infiere automáticamente del fisio encargado del paciente.
+    terapeutaid: int
+    fecha_atencion: date
+    sesiones: List[PiscinaBatchSessionItem] = Field(..., min_length=1)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class PiscinaBatchItemResult(BaseModel):
+    pacienteid: int
+    ok: bool
+    sesion: Optional[SesionAtencionOut] = None
+    error: Optional[str] = None
+
+
+class PiscinaBatchResumen(BaseModel):
+    creadas: int
+    fallidas: int
+    resultados: List[PiscinaBatchItemResult]
+
+
 class TipoTratamientoOut(BaseModel):
     id: int
     nombre: str

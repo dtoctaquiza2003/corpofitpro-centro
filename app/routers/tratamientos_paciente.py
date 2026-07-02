@@ -1,6 +1,6 @@
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session, joinedload
 
 from ..auth.dependencies import get_current_secretary, get_current_user
@@ -167,14 +167,28 @@ def _validar_permiso_crear_tratamiento(
 @router.get("/paciente/{paciente_id}", response_model=List[TratamientoPacienteOut])
 def listar_tratamientos_paciente(
     paciente_id: int,
+    piscina_mode: bool = Query(False),
     db: Session = Depends(get_db),
     current_user: Usuario = Depends(get_current_user),
 ):
-    _validar_paciente(
-        db=db,
-        paciente_id=paciente_id,
-        current_user=current_user,
-    )
+    paciente = db.query(Paciente).filter(Paciente.id == paciente_id).first()
+
+    if not paciente:
+        raise HTTPException(
+            status_code=404,
+            detail="Paciente no encontrado",
+        )
+
+    if piscina_mode and current_user.rol in (1, 3):
+        # Modo piscina: la piscina puede atender pacientes de cualquier
+        # sucursal, así que aquí no se restringe por consultorio.
+        pass
+    else:
+        validar_acceso_paciente_por_rol(
+            paciente=paciente,
+            current_user=current_user,
+            db=db,
+        )
 
     tratamientos = (
         db.query(TratamientoPaciente)

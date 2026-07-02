@@ -188,6 +188,7 @@ TIPO_REGISTRO_RETROACTIVO = "registro_retroactivo_sesiones"
 TIPO_ADMIN_TEMPORAL = "administrador_temporal_consultorio"
 TIPO_CREAR_TRATAMIENTOS = "crear_tratamientos_paciente"
 TIPO_ATENCION_SUCURSAL_TEMPORAL = "atencion_sucursal_temporal"
+TIPO_MODO_PISCINA = "modo_piscina"
 
 
 def permiso_temporal_activo(
@@ -223,6 +224,25 @@ def tiene_permiso_temporal(
     ) is not None
 
 
+
+
+def usuario_tiene_modo_piscina_activo(
+    db: Session,
+    usuario: Usuario,
+) -> bool:
+    """
+    Modo piscina:
+    - Jefe y secretaria: siempre activo, no depende de un permiso temporal.
+    - Terapeuta: solo si tiene el permiso temporal "modo_piscina" activo.
+    """
+    if es_jefe(usuario) or es_secretario(usuario):
+        return True
+
+    return tiene_permiso_temporal(
+        db=db,
+        usuario=usuario,
+        tipo_permiso=TIPO_MODO_PISCINA,
+    )
 
 
 def terapeuta_tiene_permiso_atencion_sucursal_temporal(

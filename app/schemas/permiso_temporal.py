@@ -8,6 +8,7 @@ TIPO_REGISTRO_RETROACTIVO = "registro_retroactivo_sesiones"
 TIPO_ADMIN_TEMPORAL = "administrador_temporal_consultorio"
 TIPO_CREAR_TRATAMIENTOS = "crear_tratamientos_paciente"
 TIPO_ATENCION_SUCURSAL_TEMPORAL = "atencion_sucursal_temporal"
+TIPO_MODO_PISCINA = "modo_piscina" 
 
 
 class PermisoTemporalCreate(BaseModel):

@@ -76,3 +76,10 @@ class Pago(Base):
     anulado_por_id = Column(Integer, ForeignKey("usuarios.id"), nullable=True)
     fecha_anulacion = Column(DateTime(timezone=True), nullable=True)
     motivo_anulacion = Column(Text, nullable=True)
+
+    # Compartir / dividir pago: cuando un pago tiene saldo a favor y parte
+    # de su monto se traspasa a otra terapia, paquete o membresía (propia
+    # o de un familiar), este campo apunta al pago original del cual se
+    # dividió, para trazabilidad y auditoría/conciliación de caja.
+    pago_origen_id = Column(Integer, ForeignKey("pagos.id"), nullable=True)
+    motivo_comparticion = Column(Text, nullable=True)
