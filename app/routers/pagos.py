@@ -261,9 +261,15 @@ def _calcular_cobertura_fifo_por_terapeuta(
     terapeutaid: int,
 ):
     # Calcula generado/cubierto/pendiente para sesiones realizadas por un fisio.
-    # Los pagos solo cubren el mismo tratamientopacienteid y se consumen FIFO.
+    # Los pagos solo cubren el mismo tratamientopacienteid + la misma sede
+    # (consultorio del cobrador vs consultorio del terapeuta que atendió) y
+    # se consumen FIFO. Esto evita que un pago cobrado en una sede le genere
+    # comisión/cobertura a una sesión atendida en otra sede (pacientes
+    # compartidos entre sedes).
     if not tratamiento_ids:
         return {}
+
+    TerapeutaSesionCob = aliased(Usuario)
 
     sesiones = (
         db.query(
@@ -273,10 +279,15 @@ def _calcular_cobertura_fifo_por_terapeuta(
             SesionTerapia.fecha,
             SesionTerapia.horaingreso,
             TratamientoPaciente.precio_sesion_aplicado,
+            TerapeutaSesionCob.consultorioid,
         )
         .join(
             TratamientoPaciente,
             TratamientoPaciente.id == SesionTerapia.tratamientopacienteid,
+        )
+        .outerjoin(
+            TerapeutaSesionCob,
+            TerapeutaSesionCob.id == SesionTerapia.terapeutaid,
         )
         .filter(
             SesionTerapia.tratamientopacienteid.in_(tratamiento_ids),
@@ -291,8 +302,11 @@ def _calcular_cobertura_fifo_por_terapeuta(
         .all()
     )
 
+    CobradorPago = aliased(Usuario)
+
     pagos_rows = (
-        db.query(Pago)
+        db.query(Pago, CobradorPago.consultorioid)
+        .outerjoin(CobradorPago, CobradorPago.id == Pago.creado_por_id)
         .filter(
             Pago.tratamientopacienteid.in_(tratamiento_ids),
             Pago.estadopago == 2,
@@ -310,9 +324,9 @@ def _calcular_cobertura_fifo_por_terapeuta(
         .all()
     )
 
-    pagos_por_tratamiento = defaultdict(list)
-    for pago in pagos_rows:
-        pagos_por_tratamiento[pago.tratamientopacienteid].append(
+    pagos_por_clave = defaultdict(list)
+    for pago, consultorio_cobro in pagos_rows:
+        pagos_por_clave[(pago.tratamientopacienteid, consultorio_cobro)].append(
             {
                 "restante": float(pago.monto or 0),
                 "es_previo": bool(getattr(pago, "espagoprevio", False)),
@@ -341,7 +355,8 @@ def _calcular_cobertura_fifo_por_terapeuta(
         cubierto_previo = 0.0
         cubierto_sin_caja = 0.0
 
-        for pago in pagos_por_tratamiento.get(tratamiento_id, []):
+        clave_sede = (tratamiento_id, sesion.consultorioid)
+        for pago in pagos_por_clave.get(clave_sede, []):
             if restante_sesion <= 0:
                 break
             if pago["restante"] <= 0:

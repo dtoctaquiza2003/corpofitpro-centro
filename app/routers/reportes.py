@@ -1484,12 +1484,16 @@ def _cobertura_sesiones_filtradas(
         for s in sesiones_validas
     }
 
+    CobradorPago = aliased(Usuario)
+
     pagos_rows = (
         db.query(
             Pago.pacienteid,
             Pago.tratamientopacienteid,
+            CobradorPago.consultorioid,
             func.coalesce(func.sum(Pago.monto), 0),
         )
+        .outerjoin(CobradorPago, CobradorPago.id == Pago.creado_por_id)
         .filter(
             Pago.pacienteid.in_(paciente_ids),
             Pago.tratamientopacienteid.in_(tratamiento_ids),
@@ -1501,15 +1505,22 @@ def _cobertura_sesiones_filtradas(
                 fecha_pago_ecuador_expr() <= hasta,
             ),
         )
-        .group_by(Pago.pacienteid, Pago.tratamientopacienteid)
+        .group_by(Pago.pacienteid, Pago.tratamientopacienteid, CobradorPago.consultorioid)
         .all()
     )
 
-    disponible_por_clave: Dict[Tuple[int, int], float] = {
-        (int(paciente_id), int(tratamiento_id)): float(total or 0.0)
-        for paciente_id, tratamiento_id, total in pagos_rows
-        if paciente_id is not None and tratamiento_id is not None
-    }
+    # FIFO por sede: un pago solo cubre sesiones atendidas en la misma sede
+    # donde se cobró. Esto evita que un pago cobrado en Centro "pague" (y le
+    # genere comisión) a una sesión/terapeuta de Atahualpa cuando el paciente
+    # es compartido entre sedes.
+    disponible_por_clave: Dict[Tuple[int, int, Optional[int]], float] = {}
+    for paciente_id, tratamiento_id, consultorio_cobro, total in pagos_rows:
+        if paciente_id is None or tratamiento_id is None:
+            continue
+        key = (int(paciente_id), int(tratamiento_id), consultorio_cobro)
+        disponible_por_clave[key] = (
+            disponible_por_clave.get(key, 0.0) + float(total or 0.0)
+        )
 
     sesiones_historicas = (
         db.query(SesionTerapia)
@@ -1543,17 +1554,29 @@ def _cobertura_sesiones_filtradas(
         if clave not in claves_objetivo:
             continue
 
-        # FIFO contable real:
-        # Los pagos del tratamiento se consumen desde la sesión más antigua,
-        # aunque esa sesión la haya hecho otro terapeuta o se haya atendido en
-        # otra sede. Luego solo se devuelve cobertura para las sesiones visibles
-        # del filtro actual. Esto evita marcar como pagada una sesión reciente
-        # cuando los pagos ya fueron consumidos por sesiones anteriores.
+        # FIFO por sede:
+        # Los pagos se consumen desde la sesión más antigua del mismo
+        # paciente + tratamiento + sede (sede = consultorio del terapeuta que
+        # atendió). Luego solo se devuelve cobertura para las sesiones
+        # visibles del filtro actual. Esto evita marcar como pagada una
+        # sesión reciente cuando los pagos ya fueron consumidos por sesiones
+        # anteriores, y evita que un pago cobrado en una sede cubra sesiones
+        # atendidas en otra.
+        terapeuta_sesion = getattr(sesion, "terapeuta", None)
+        consultorio_sesion = (
+            terapeuta_sesion.consultorioid if terapeuta_sesion is not None else None
+        )
+        clave_sede = (
+            int(sesion.pacienteid),
+            int(sesion.tratamientopacienteid),
+            consultorio_sesion,
+        )
+
         precio = float(_precio_aplicado(sesion.tratamiento_paciente) or 0.0)
-        disponible = float(disponible_por_clave.get(clave, 0.0) or 0.0)
+        disponible = float(disponible_por_clave.get(clave_sede, 0.0) or 0.0)
         aplicado = min(precio, disponible)
         pendiente = max(precio - aplicado, 0.0)
-        disponible_por_clave[clave] = max(disponible - aplicado, 0.0)
+        disponible_por_clave[clave_sede] = max(disponible - aplicado, 0.0)
 
         if int(sesion.id) in sesiones_objetivo_ids:
             cobertura[int(sesion.id)] = (round(aplicado, 2), round(pendiente, 2))
@@ -1632,12 +1655,16 @@ def _deuda_acumulada_reporte(
             pacientes=[],
         )
 
+    CobradorPago = aliased(Usuario)
+
     pagos_rows = (
         db.query(
             Pago.pacienteid,
             Pago.tratamientopacienteid,
+            CobradorPago.consultorioid,
             func.coalesce(func.sum(Pago.monto), 0),
         )
+        .outerjoin(CobradorPago, CobradorPago.id == Pago.creado_por_id)
         .filter(
             Pago.tratamientopacienteid.in_(tratamiento_ids),
             Pago.estadopago == 2,
@@ -1648,15 +1675,22 @@ def _deuda_acumulada_reporte(
                 fecha_pago_ecuador_expr() <= hasta,
             ),
         )
-        .group_by(Pago.pacienteid, Pago.tratamientopacienteid)
+        .group_by(Pago.pacienteid, Pago.tratamientopacienteid, CobradorPago.consultorioid)
         .all()
     )
 
-    disponible_por_tratamiento: Dict[Tuple[int, int], float] = {
-        (int(paciente_id), int(tratamiento_id)): float(total or 0)
-        for paciente_id, tratamiento_id, total in pagos_rows
-        if paciente_id is not None and tratamiento_id is not None
-    }
+    # FIFO por sede: un pago solo cubre sesiones atendidas en la misma sede
+    # donde se cobró (consultorio del usuario que registró el pago). Esto
+    # evita que un pago cobrado en Centro tape deuda de sesiones atendidas
+    # en Atahualpa cuando el paciente es compartido entre sedes.
+    disponible_por_tratamiento: Dict[Tuple[int, int, Optional[int]], float] = {}
+    for paciente_id, tratamiento_id, consultorio_cobro, total in pagos_rows:
+        if paciente_id is None or tratamiento_id is None:
+            continue
+        key = (int(paciente_id), int(tratamiento_id), consultorio_cobro)
+        disponible_por_tratamiento[key] = (
+            disponible_por_tratamiento.get(key, 0.0) + float(total or 0)
+        )
 
     sesiones_historicas = (
         db.query(SesionTerapia)
@@ -1700,10 +1734,12 @@ def _deuda_acumulada_reporte(
 
         return True
 
-    # FIFO contable real:
-    # No se limita por terapeuta/consultorio. Las sesiones anteriores del mismo
-    # paciente + tratamiento deben consumir primero los pagos disponibles.
-    # Después solo se reportan las sesiones que pertenecen al filtro actual.
+    # FIFO por sede:
+    # Las sesiones anteriores del mismo paciente + tratamiento + sede deben
+    # consumir primero los pagos disponibles de esa misma sede. El pool de
+    # pagos se separa por la sede donde se atendió la sesión, para no tapar
+    # deuda de una sede con dinero cobrado en otra (pacientes compartidos
+    # entre sedes). Después solo se reportan las sesiones del filtro actual.
 
     for sesion in sesiones_historicas:
         tratamiento = sesion.tratamiento_paciente
@@ -1715,7 +1751,15 @@ def _deuda_acumulada_reporte(
         # si el copago/valor de la sesión no está cubierto.
 
         precio = _precio_aplicado(tratamiento)
-        clave_pago = (int(sesion.pacienteid), int(sesion.tratamientopacienteid))
+        terapeuta = getattr(sesion, "terapeuta", None)
+        terapeuta_id = sesion.terapeutaid
+        consultorio_operativo = terapeuta.consultorioid if terapeuta is not None else None
+
+        clave_pago = (
+            int(sesion.pacienteid),
+            int(sesion.tratamientopacienteid),
+            consultorio_operativo,
+        )
         disponible = disponible_por_tratamiento.get(clave_pago, 0.0)
         aplicado = min(precio, disponible)
         pendiente = round(max(precio - aplicado, 0.0), 2)
@@ -1726,10 +1770,6 @@ def _deuda_acumulada_reporte(
 
         if not incluir_en_detalle(sesion):
             continue
-
-        terapeuta = getattr(sesion, "terapeuta", None)
-        terapeuta_id = sesion.terapeutaid
-        consultorio_operativo = terapeuta.consultorioid if terapeuta is not None else None
 
         key = (
             int(sesion.pacienteid),
@@ -3701,12 +3741,16 @@ def _pendiente_semana_detalle(
         for s in sesiones_filtradas
     }
 
+    CobradorPago = aliased(Usuario)
+
     pagos_rows = (
         db.query(
             Pago.pacienteid,
             Pago.tratamientopacienteid,
+            CobradorPago.consultorioid,
             func.coalesce(func.sum(Pago.monto), 0),
         )
+        .outerjoin(CobradorPago, CobradorPago.id == Pago.creado_por_id)
         .filter(
             Pago.pacienteid.in_(paciente_ids),
             Pago.tratamientopacienteid.in_(tratamiento_ids),
@@ -3718,18 +3762,22 @@ def _pendiente_semana_detalle(
                 fecha_pago_ecuador_expr() <= hasta,
             ),
         )
-        .group_by(Pago.pacienteid, Pago.tratamientopacienteid)
+        .group_by(Pago.pacienteid, Pago.tratamientopacienteid, CobradorPago.consultorioid)
         .all()
     )
 
-    disponible_por_clave: Dict[Tuple[int, int], float] = {}
-    for paciente_id, tratamiento_id, total in pagos_rows:
+    # FIFO por sede: un pago solo cubre sesiones atendidas en la misma sede
+    # donde se cobró (consultorio del usuario que registró el pago). Esto
+    # evita que un pago cobrado en Centro tape deuda de sesiones atendidas
+    # en Atahualpa cuando el paciente es compartido entre sedes.
+    disponible_por_clave: Dict[Tuple[int, int, Optional[int]], float] = {}
+    for paciente_id, tratamiento_id, consultorio_cobro, total in pagos_rows:
         if paciente_id is None or tratamiento_id is None:
             continue
-        key = (int(paciente_id), int(tratamiento_id))
-        if key not in claves_visibles:
+        if (int(paciente_id), int(tratamiento_id)) not in claves_visibles:
             continue
-        disponible_por_clave[key] = float(total or 0)
+        key = (int(paciente_id), int(tratamiento_id), consultorio_cobro)
+        disponible_por_clave[key] = disponible_por_clave.get(key, 0.0) + float(total or 0)
 
     sesiones_historicas = (
         db.query(SesionTerapia)
@@ -3775,15 +3823,25 @@ def _pendiente_semana_detalle(
         # Pacientes Ecuasanitas: el copago/valor de sesión pendiente se cobra
         # directamente al paciente, por eso SÍ cuenta como pendiente normal.
 
-        # FIFO real:
+        # FIFO real por sede:
         # Aunque el reporte esté filtrado por un solo día de la semana, las
-        # sesiones anteriores del mismo paciente + tratamiento sí deben consumir
-        # saldo. Luego solo se muestra el pendiente de las sesiones visibles en
-        # el filtro actual.
-        disponible = disponible_por_clave.get(key_pago, 0.0)
+        # sesiones anteriores del mismo paciente + tratamiento + sede sí deben
+        # consumir saldo. Luego solo se muestra el pendiente de las sesiones
+        # visibles en el filtro actual. El pool de pagos se separa por la sede
+        # donde se atendió la sesión, para no tapar deuda de una sede con
+        # dinero cobrado en otra (pacientes compartidos entre sedes).
+        terapeuta = getattr(sesion, "terapeuta", None)
+        consultorio_operativo = terapeuta.consultorioid if terapeuta is not None else None
+        key_pago_sede = (
+            int(sesion.pacienteid),
+            int(sesion.tratamientopacienteid),
+            consultorio_operativo,
+        )
+
+        disponible = disponible_por_clave.get(key_pago_sede, 0.0)
         aplicado = min(precio, disponible)
         pendiente = round(max(precio - aplicado, 0.0), 2)
-        disponible_por_clave[key_pago] = max(disponible - aplicado, 0.0)
+        disponible_por_clave[key_pago_sede] = max(disponible - aplicado, 0.0)
 
         # Solo se reporta el pendiente de las sesiones que pertenecen al filtro
         # actual. Las sesiones anteriores solo sirven para consumir saldo en FIFO.
@@ -3792,9 +3850,6 @@ def _pendiente_semana_detalle(
 
         if pendiente <= 0:
             continue
-
-        terapeuta = getattr(sesion, "terapeuta", None)
-        consultorio_operativo = terapeuta.consultorioid if terapeuta is not None else None
         key = (
             int(sesion.pacienteid),
             sesion.terapeutaid,

@@ -18,6 +18,7 @@ from ..auth.permissions import (
     validar_acceso_paciente_por_rol,
     validar_consultorio_secretario,
     tiene_permiso_temporal,
+    usuario_tiene_modo_piscina_activo,
     TIPO_ATENCION_SUCURSAL_TEMPORAL,
 )
 
@@ -224,24 +225,33 @@ def listar_pacientes_paginado(
 
     if current_user.rol == 2:
         terapeuta_para_compartidos = current_user.id
-        compartidos_subq = _compartidos_subquery(db, current_user.id)
 
-        condiciones = [
-            Paciente.terapeutaasignadoid == current_user.id,
-            Paciente.id.in_(compartidos_subq),
-        ]
-
-        if (
-            current_user.consultorioid is not None
-            and tiene_permiso_temporal(
-                db=db,
-                usuario=current_user,
-                tipo_permiso=TIPO_ATENCION_SUCURSAL_TEMPORAL,
-            )
+        if piscina_mode and usuario_tiene_modo_piscina_activo(
+            db=db,
+            usuario=current_user,
         ):
-            condiciones.append(Paciente.consultorioid == current_user.consultorioid)
+            # Modo piscina: el terapeuta con el permiso temporal activo puede
+            # ver pacientes de cualquier sucursal, igual que jefe/secretaria.
+            query = db.query(Paciente)
+        else:
+            compartidos_subq = _compartidos_subquery(db, current_user.id)
 
-        query = db.query(Paciente).filter(or_(*condiciones))
+            condiciones = [
+                Paciente.terapeutaasignadoid == current_user.id,
+                Paciente.id.in_(compartidos_subq),
+            ]
+
+            if (
+                current_user.consultorioid is not None
+                and tiene_permiso_temporal(
+                    db=db,
+                    usuario=current_user,
+                    tipo_permiso=TIPO_ATENCION_SUCURSAL_TEMPORAL,
+                )
+            ):
+                condiciones.append(Paciente.consultorioid == current_user.consultorioid)
+
+            query = db.query(Paciente).filter(or_(*condiciones))
 
         query = _aplicar_busqueda_pacientes(query, search)
 

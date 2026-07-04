@@ -7,6 +7,7 @@ from ..auth.dependencies import get_current_secretary, get_current_user
 from ..auth.permissions import (
     TIPO_CREAR_TRATAMIENTOS,
     permiso_temporal_activo,
+    usuario_tiene_modo_piscina_activo,
     validar_acceso_paciente_por_rol,
 )
 from ..dependencies.db import get_db
@@ -179,9 +180,14 @@ def listar_tratamientos_paciente(
             detail="Paciente no encontrado",
         )
 
-    if piscina_mode and current_user.rol in (1, 3):
+    if piscina_mode and (
+        current_user.rol in (1, 3)
+        or usuario_tiene_modo_piscina_activo(db=db, usuario=current_user)
+    ):
         # Modo piscina: la piscina puede atender pacientes de cualquier
         # sucursal, así que aquí no se restringe por consultorio.
+        # Jefe/secretaria siempre lo tienen activo; un terapeuta solo si
+        # tiene el permiso temporal "modo_piscina" activo (ver permissions.py).
         pass
     else:
         validar_acceso_paciente_por_rol(
