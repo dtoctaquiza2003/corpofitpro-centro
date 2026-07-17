@@ -57,6 +57,18 @@ class Pago(Base):
     fecha_verificacion = Column(DateTime(timezone=True), nullable=True)
     motivo_rechazo = Column(Text, nullable=True)
 
+    # A qué sucursal le sirve este pago para saldar su deuda (cuenta del
+    # tratamiento/paquete/membresía). DISTINTO de creado_por_id, que indica
+    # dónde entró físicamente el efectivo (para caja/ingresos del día).
+    # En un pago normal ambas coinciden (se setea = current_user.consultorioid
+    # al crear el pago). Solo difieren en un pago compartido entre sucursales
+    # (compartir_pago): ahí creado_por_id sigue siendo el cobrador original,
+    # pero consultorioid_aplicacion es la sucursal destino que recibe el
+    # abono para su propia cuenta.
+    consultorioid_aplicacion = Column(
+        Integer, ForeignKey("consultorios.id"), nullable=True
+    )
+
 
     # Pago previo / saldo inicial: dinero cobrado antes de usar el sistema.
     # Cuenta para reducir la deuda del tratamiento, pero NO debe entrar a caja

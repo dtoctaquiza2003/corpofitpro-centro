@@ -1567,6 +1567,10 @@ def iniciar_sesion(
         escaladolorsalida=dolor_salida,
         pacientepaqueteid=None,
         tratamientopacienteid=tratamiento_activo.id,
+        # Sede del terapeuta EN ESTE MOMENTO. Se guarda fija en la sesión
+        # para que un cambio de sede posterior del terapeuta no altere
+        # retroactivamente a qué sede pertenece esta sesión.
+        consultorioid=terapeuta_responsable.consultorioid,
     )
 
     db.add(nueva_sesion)
@@ -1822,6 +1826,9 @@ def _registrar_sesion_piscina_item(
         escaladolorsalida=item.escaladolorsalida,
         pacientepaqueteid=None,
         tratamientopacienteid=tratamiento.id,
+        # Ver comentario equivalente en iniciar_sesion: sede fija al momento
+        # de la sesión, no derivada del consultorio actual del terapeuta.
+        consultorioid=terapeuta.consultorioid,
     )
 
     db.add(nueva_sesion)

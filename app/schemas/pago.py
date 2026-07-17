@@ -110,6 +110,11 @@ class PagoCompartirRequest(BaseModel):
     cubriendo la cuenta original y el resto se traspasa a otra terapia,
     paquete o membresía de gimnasio, del mismo paciente o de un familiar.
 
+    También sirve para el MISMO tratamiento atendido en varias sucursales:
+    en ese caso pacienteid_destino/tratamientopacienteid son iguales a los
+    del pago original, y consultorioid_destino indica a cuál sucursal se
+    le acredita esa parte para su propia cuenta.
+
     No anula el pago original ni crea dinero nuevo: la suma de ambos pagos
     después de compartir sigue siendo igual al monto original, por lo que
     el comprobante y la caja del día no se ven afectados.
@@ -120,6 +125,11 @@ class PagoCompartirRequest(BaseModel):
     pacientepaqueteid: Optional[int] = None
     tratamientopacienteid: Optional[int] = None
     membresiagimnasioid: Optional[int] = None
+    # A qué sucursal se le acredita esta parte del pago, para su propia
+    # cuenta (Generado/Pagado/Debe). Requerido: no se infiere de quién
+    # ejecuta la acción, para evitar ambigüedad cuando origen y destino
+    # son la misma cuenta atendida en varias sedes.
+    consultorioid_destino: int = Field(..., ge=1)
     motivo: Optional[str] = Field(default=None, max_length=500)
 
     model_config = ConfigDict(populate_by_name=True)
@@ -148,6 +158,10 @@ class PagoOut(BaseModel):
     verificado_por_id: Optional[int] = None
     fecha_verificacion: Optional[datetime] = None
     motivo_rechazo: Optional[str] = None
+
+    # A qué sucursal le sirve este pago para su propia cuenta (deuda),
+    # distinto de creado_por_id (quién cobró el efectivo, para caja).
+    consultorioid_aplicacion: Optional[int] = None
 
     # Pago previo / saldo inicial
     espagoprevio: bool = False
@@ -292,6 +306,9 @@ class CuentaTratamientoOut(BaseModel):
     tratamientopacienteid: int
     pacienteid: int
     paciente: str
+    # Sucursal "de casa" del paciente. Se usa en el front como sucursal
+    # destino por defecto al compartir saldo a favor hacia esta cuenta.
+    consultorioid_paciente: Optional[int] = None
 
     # Opcional: cuando se filtra por el fisioterapeuta que realizó
     # la sesión, estos campos indican el fisio operativo usado.
@@ -368,6 +385,7 @@ class CuentaMembresiaGimnasioOut(BaseModel):
     membresiagimnasioid: int
     pacienteid: int
     paciente: str
+    consultorioid_paciente: Optional[int] = None
 
     fechainicio: date
     diascontratados: int

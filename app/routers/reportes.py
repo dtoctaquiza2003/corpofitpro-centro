@@ -38,6 +38,7 @@ from ..schemas.reporte import (
     ReporteFiltroConsultorioOut,
     ReporteFiltroTerapeutaOut,
     ReporteFiltrosOut,
+    PendienteRecuperacionPagoOut,
     PendienteSemanaDetalleOut,
     PendienteSemanaPacienteOut,
     ReporteSemanalResponse,
@@ -655,13 +656,10 @@ def _sesion_finalizada_tratamiento_en_consultorio_exists(consultorioid: int):
     Así Atahualpa ve la sesión de un paciente del Centro si fue atendido
     por una terapeuta de Atahualpa.
     """
-    terapeuta_sesion = aliased(Usuario)
-
     return exists().where(
         and_(
             SesionTerapia.tratamientopacienteid == TratamientoPaciente.id,
-            SesionTerapia.terapeutaid == terapeuta_sesion.id,
-            terapeuta_sesion.consultorioid == consultorioid,
+            SesionTerapia.consultorioid == consultorioid,
             SesionTerapia.horasalida != None,
         )
     )
@@ -721,15 +719,10 @@ def _aplicar_filtros_sesiones(
         query = query.filter(SesionTerapia.terapeutaid == terapeutaid)
 
     if consultorioid is not None:
-        # Consultorio operativo: se filtra por el consultorio del terapeuta
-        # que atendió, no por el consultorio de origen del paciente.
-        terapeuta_sesion = aliased(Usuario)
-        query = query.join(
-            terapeuta_sesion,
-            terapeuta_sesion.id == SesionTerapia.terapeutaid,
-        ).filter(
-            terapeuta_sesion.consultorioid == consultorioid,
-        )
+        # Consultorio operativo: se filtra por la sede fija de la sesión
+        # (consultorioid propio, fijado al crearla), no por el consultorio
+        # de origen del paciente ni por el consultorio actual del terapeuta.
+        query = query.filter(SesionTerapia.consultorioid == consultorioid)
 
     return query
 
@@ -1562,10 +1555,7 @@ def _cobertura_sesiones_filtradas(
         # sesión reciente cuando los pagos ya fueron consumidos por sesiones
         # anteriores, y evita que un pago cobrado en una sede cubra sesiones
         # atendidas en otra.
-        terapeuta_sesion = getattr(sesion, "terapeuta", None)
-        consultorio_sesion = (
-            terapeuta_sesion.consultorioid if terapeuta_sesion is not None else None
-        )
+        consultorio_sesion = sesion.consultorioid
         clave_sede = (
             int(sesion.pacienteid),
             int(sesion.tratamientopacienteid),
@@ -1725,8 +1715,7 @@ def _deuda_acumulada_reporte(
             return False
 
         if consultorio_resuelto is not None:
-            terapeuta = getattr(sesion, "terapeuta", None)
-            if terapeuta is None or terapeuta.consultorioid != consultorio_resuelto:
+            if sesion.consultorioid != consultorio_resuelto:
                 return False
 
         if dia_semana is not None and sesion.fecha.weekday() != dia_semana:
@@ -1751,9 +1740,8 @@ def _deuda_acumulada_reporte(
         # si el copago/valor de la sesión no está cubierto.
 
         precio = _precio_aplicado(tratamiento)
-        terapeuta = getattr(sesion, "terapeuta", None)
         terapeuta_id = sesion.terapeutaid
-        consultorio_operativo = terapeuta.consultorioid if terapeuta is not None else None
+        consultorio_operativo = sesion.consultorioid
 
         clave_pago = (
             int(sesion.pacienteid),
@@ -1784,7 +1772,7 @@ def _deuda_acumulada_reporte(
                 "pacienteid": int(sesion.pacienteid),
                 "paciente": _nombre_paciente(sesion.paciente),
                 "terapeutaid": terapeuta_id,
-                "terapeuta": _nombre_usuario(terapeuta),
+                "terapeuta": _nombre_usuario(sesion.terapeuta),
                 "consultorioid": consultorio_operativo,
                 "consultorio": consultorios_map.get(
                     consultorio_operativo,
@@ -1968,13 +1956,11 @@ def dashboard_acciones(
         )
 
     if consultorio_resuelto is not None:
-        # Consultorio operativo: cuenta la sesión para el consultorio del
-        # terapeuta que atendió, aunque el paciente sea de otra sede.
-        terapeuta_sesion = aliased(Usuario)
-        sesiones_q = sesiones_q.join(
-            terapeuta_sesion,
-            terapeuta_sesion.id == SesionTerapia.terapeutaid,
-        ).filter(terapeuta_sesion.consultorioid == consultorio_resuelto)
+        # Consultorio operativo: cuenta la sesión para su sede fija propia,
+        # aunque el paciente sea de otra sede.
+        sesiones_q = sesiones_q.filter(
+            SesionTerapia.consultorioid == consultorio_resuelto
+        )
 
     row_sesiones = sesiones_q.one()
     sesiones_hoy = row_sesiones.hoy or 0
@@ -3779,6 +3765,86 @@ def _pendiente_semana_detalle(
         key = (int(paciente_id), int(tratamiento_id), consultorio_cobro)
         disponible_por_clave[key] = disponible_por_clave.get(key, 0.0) + float(total or 0)
 
+    # --------------------------------------------------------------
+    # "Deuda recuperada": mismo cálculo de arriba, pero con el corte de
+    # pagos en HOY en vez de "hasta". NO se usa para total_pendiente ni
+    # para el cuadre de caja del rango filtrado (eso sigue igual, tal
+    # como estaba). Solo sirve para detectar, de forma informativa, qué
+    # pendiente de este rango ya se cobró después de "hasta".
+    # --------------------------------------------------------------
+    hoy = fecha_ecuador()
+    pagos_rows_hoy = (
+        db.query(
+            Pago.pacienteid,
+            Pago.tratamientopacienteid,
+            CobradorPago.consultorioid,
+            func.coalesce(func.sum(Pago.monto), 0),
+        )
+        .outerjoin(CobradorPago, CobradorPago.id == Pago.creado_por_id)
+        .filter(
+            Pago.pacienteid.in_(paciente_ids),
+            Pago.tratamientopacienteid.in_(tratamiento_ids),
+            Pago.estadopago == 2,
+            _pago_no_anulado_filter(),
+            or_(Pago.esrecuperacioncartera == False, Pago.esrecuperacioncartera.is_(None)),
+            or_(
+                Pago.espagoprevio == True,
+                fecha_pago_ecuador_expr() <= hoy,
+            ),
+        )
+        .group_by(Pago.pacienteid, Pago.tratamientopacienteid, CobradorPago.consultorioid)
+        .all()
+    )
+
+    disponible_por_clave_hoy: Dict[Tuple[int, int, Optional[int]], float] = {}
+    for paciente_id, tratamiento_id, consultorio_cobro, total in pagos_rows_hoy:
+        if paciente_id is None or tratamiento_id is None:
+            continue
+        if (int(paciente_id), int(tratamiento_id)) not in claves_visibles:
+            continue
+        key = (int(paciente_id), int(tratamiento_id), consultorio_cobro)
+        disponible_por_clave_hoy[key] = disponible_por_clave_hoy.get(key, 0.0) + float(total or 0)
+
+    # Pagos concretos que "aparecieron" después de hasta (los que explican la
+    # recuperación). Los espagoprevio=True quedan fuera: esos ya estaban
+    # disponibles desde antes de "hasta", no son una recuperación nueva.
+    pagos_recuperacion_rows = (
+        db.query(
+            Pago.pacienteid,
+            Pago.tratamientopacienteid,
+            fecha_pago_ecuador_expr().label("fecha"),
+            Pago.monto,
+            Pago.metodopago,
+        )
+        .filter(
+            Pago.pacienteid.in_(paciente_ids),
+            Pago.tratamientopacienteid.in_(tratamiento_ids),
+            Pago.estadopago == 2,
+            _pago_no_anulado_filter(),
+            or_(Pago.esrecuperacioncartera == False, Pago.esrecuperacioncartera.is_(None)),
+            or_(Pago.espagoprevio == False, Pago.espagoprevio.is_(None)),
+            fecha_pago_ecuador_expr() > hasta,
+            fecha_pago_ecuador_expr() <= hoy,
+        )
+        .order_by(fecha_pago_ecuador_expr())
+        .all()
+    )
+
+    pagos_recuperacion_por_tratamiento: Dict[Tuple[int, int], List[Dict]] = {}
+    for paciente_id, tratamiento_id, fecha_pago, monto, metodopago in pagos_recuperacion_rows:
+        if paciente_id is None or tratamiento_id is None:
+            continue
+        key = (int(paciente_id), int(tratamiento_id))
+        if key not in claves_visibles:
+            continue
+        pagos_recuperacion_por_tratamiento.setdefault(key, []).append(
+            {
+                "fecha": fecha_pago,
+                "monto": float(monto or 0),
+                "metodopago": metodopago,
+            }
+        )
+
     sesiones_historicas = (
         db.query(SesionTerapia)
         .options(
@@ -3830,8 +3896,7 @@ def _pendiente_semana_detalle(
         # visibles en el filtro actual. El pool de pagos se separa por la sede
         # donde se atendió la sesión, para no tapar deuda de una sede con
         # dinero cobrado en otra (pacientes compartidos entre sedes).
-        terapeuta = getattr(sesion, "terapeuta", None)
-        consultorio_operativo = terapeuta.consultorioid if terapeuta is not None else None
+        consultorio_operativo = sesion.consultorioid
         key_pago_sede = (
             int(sesion.pacienteid),
             int(sesion.tratamientopacienteid),
@@ -3842,6 +3907,15 @@ def _pendiente_semana_detalle(
         aplicado = min(precio, disponible)
         pendiente = round(max(precio - aplicado, 0.0), 2)
         disponible_por_clave[key_pago_sede] = max(disponible - aplicado, 0.0)
+
+        # Misma consumición FIFO, en paralelo, pero con el pool de pagos
+        # disponible HOY. No cambia "pendiente" (arriba); solo se usa para
+        # saber si esta sesión, que sigue pendiente al corte de "hasta", ya
+        # se cobró después.
+        disponible_hoy = disponible_por_clave_hoy.get(key_pago_sede, 0.0)
+        aplicado_hoy = min(precio, disponible_hoy)
+        pendiente_hoy = round(max(precio - aplicado_hoy, 0.0), 2)
+        disponible_por_clave_hoy[key_pago_sede] = max(disponible_hoy - aplicado_hoy, 0.0)
 
         # Solo se reporta el pendiente de las sesiones que pertenecen al filtro
         # actual. Las sesiones anteriores solo sirven para consumir saldo en FIFO.
@@ -3862,7 +3936,7 @@ def _pendiente_semana_detalle(
                 "pacienteid": int(sesion.pacienteid),
                 "paciente": _nombre_paciente(paciente),
                 "terapeutaid": sesion.terapeutaid,
-                "terapeuta": _nombre_usuario(terapeuta),
+                "terapeuta": _nombre_usuario(sesion.terapeuta),
                 "consultorioid": consultorio_operativo,
                 "consultorio": consultorios_map.get(consultorio_operativo, "Sin consultorio"),
                 "tratamientopacienteid": int(sesion.tratamientopacienteid),
@@ -3871,11 +3945,18 @@ def _pendiente_semana_detalle(
                 "valor_sesion": round(precio, 2),
                 "total_pendiente": 0.0,
                 "fechas_pendientes": [],
+                "monto_recuperado": 0.0,
+                "pagos_recuperacion": pagos_recuperacion_por_tratamiento.get(
+                    (int(sesion.pacienteid), int(sesion.tratamientopacienteid)), []
+                ),
             },
         )
         item["sesiones_pendientes"] = int(item["sesiones_pendientes"]) + 1
         item["total_pendiente"] = float(item["total_pendiente"]) + pendiente
         item["fechas_pendientes"].append(sesion.fecha)
+        item["monto_recuperado"] = float(item["monto_recuperado"]) + round(
+            max(pendiente - pendiente_hoy, 0.0), 2
+        )
 
     pacientes = [
         PendienteSemanaPacienteOut(
@@ -3891,6 +3972,15 @@ def _pendiente_semana_detalle(
             valor_sesion=round(float(item["valor_sesion"]), 2),
             total_pendiente=round(float(item["total_pendiente"]), 2),
             fechas_pendientes=sorted(item["fechas_pendientes"]),
+            monto_recuperado=round(float(item["monto_recuperado"]), 2),
+            pagos_recuperacion=[
+                PendienteRecuperacionPagoOut(
+                    fecha=pago["fecha"],
+                    monto=round(float(pago["monto"]), 2),
+                    metodopago=pago["metodopago"],
+                )
+                for pago in item["pagos_recuperacion"]
+            ],
         )
         for item in agrupado.values()
     ]
@@ -3901,6 +3991,7 @@ def _pendiente_semana_detalle(
         hasta=hasta,
         total_pendiente=round(sum(item.total_pendiente for item in pacientes), 2),
         total_sesiones_pendientes=sum(item.sesiones_pendientes for item in pacientes),
+        total_recuperado=round(sum(item.monto_recuperado for item in pacientes), 2),
         pacientes=pacientes,
     )
 
@@ -4920,11 +5011,7 @@ def reporte_clinicas_semanal(
         # Así, si un paciente de Centro Principal fue atendido por Atahualpa,
         # esa sesión cuenta para Atahualpa y no aparece como otra clínica
         # dentro del Excel del secretario de Atahualpa.
-        consultorio_id = (
-            sesion.terapeuta.consultorioid
-            if getattr(sesion, "terapeuta", None) is not None
-            else None
-        )
+        consultorio_id = sesion.consultorioid
         tratamiento_id = sesion.tratamientopacienteid
         precio = _precio_aplicado(sesion.tratamiento_paciente)
 

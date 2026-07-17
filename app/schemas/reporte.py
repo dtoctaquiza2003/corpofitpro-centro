@@ -191,6 +191,12 @@ class CajaSemanalDetalleOut(BaseModel):
     pagos_no_monetarios: List[CajaSemanalPagoOut] = Field(default_factory=list)
 
 
+class PendienteRecuperacionPagoOut(BaseModel):
+    fecha: date
+    monto: float
+    metodopago: Optional[str] = None
+
+
 class PendienteSemanaPacienteOut(BaseModel):
     pacienteid: int
     paciente: str
@@ -204,6 +210,11 @@ class PendienteSemanaPacienteOut(BaseModel):
     valor_sesion: float = 0
     total_pendiente: float = 0
     fechas_pendientes: List[date] = Field(default_factory=list)
+    # Cuánto de este pendiente ya se cobró DESPUÉS de "hasta" (p.ej. esta
+    # semana se pagó una deuda de la semana pasada). No afecta total_pendiente
+    # ni el cuadre de caja del rango filtrado; es solo informativo.
+    monto_recuperado: float = 0
+    pagos_recuperacion: List[PendienteRecuperacionPagoOut] = Field(default_factory=list)
 
 
 class PendienteSemanaDetalleOut(BaseModel):
@@ -211,6 +222,7 @@ class PendienteSemanaDetalleOut(BaseModel):
     hasta: date
     total_pendiente: float = 0
     total_sesiones_pendientes: int = 0
+    total_recuperado: float = 0
     pacientes: List[PendienteSemanaPacienteOut] = Field(default_factory=list)
 
 

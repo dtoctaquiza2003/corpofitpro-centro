@@ -32,8 +32,10 @@ from ..auth.dependencies import get_current_secretary, get_current_user
 from ..auth.permissions import (
     validar_acceso_paciente_por_rol,
     validar_consultorio_secretario,
+    validar_secretario_tiene_consultorio,
 )
 from ..dependencies.db import get_db
+from ..models.consultorio import Consultorio
 from ..models.gimnasio import MembresiaGimnasio
 from ..models.paciente import Paciente
 from ..models.paciente_paquete import PacientePaquete
@@ -170,13 +172,10 @@ def _sesion_finalizada_tratamiento_en_consultorio_exists(consultorioid: int):
     - el tratamiento ya tiene una sesión finalizada atendida por un terapeuta
       de esa sede.
     """
-    terapeuta_sesion = aliased(Usuario)
-
     return exists().where(
         and_(
             SesionTerapia.tratamientopacienteid == TratamientoPaciente.id,
-            SesionTerapia.terapeutaid == terapeuta_sesion.id,
-            terapeuta_sesion.consultorioid == consultorioid,
+            SesionTerapia.consultorioid == consultorioid,
             SesionTerapia.horasalida != None,
         )
     )
@@ -269,8 +268,6 @@ def _calcular_cobertura_fifo_por_terapeuta(
     if not tratamiento_ids:
         return {}
 
-    TerapeutaSesionCob = aliased(Usuario)
-
     sesiones = (
         db.query(
             SesionTerapia.id,
@@ -279,15 +276,11 @@ def _calcular_cobertura_fifo_por_terapeuta(
             SesionTerapia.fecha,
             SesionTerapia.horaingreso,
             TratamientoPaciente.precio_sesion_aplicado,
-            TerapeutaSesionCob.consultorioid,
+            SesionTerapia.consultorioid,
         )
         .join(
             TratamientoPaciente,
             TratamientoPaciente.id == SesionTerapia.tratamientopacienteid,
-        )
-        .outerjoin(
-            TerapeutaSesionCob,
-            TerapeutaSesionCob.id == SesionTerapia.terapeutaid,
         )
         .filter(
             SesionTerapia.tratamientopacienteid.in_(tratamiento_ids),
@@ -404,7 +397,6 @@ def _pago_visible_para_consultorio_filter(consultorioid: int):
     con atención realizada por terapeutas de la sede y pacientes compartidos
     activamente con terapeutas de la sede.
     """
-    terapeuta_sesion = aliased(Usuario)
     terapeuta_compartido = aliased(Usuario)
     compartido = aliased(PacienteTerapeutaCompartido)
     hoy = now_ecuador().date()
@@ -414,8 +406,7 @@ def _pago_visible_para_consultorio_filter(consultorioid: int):
         exists().where(
             and_(
                 SesionTerapia.tratamientopacienteid == Pago.tratamientopacienteid,
-                SesionTerapia.terapeutaid == terapeuta_sesion.id,
-                terapeuta_sesion.consultorioid == consultorioid,
+                SesionTerapia.consultorioid == consultorioid,
                 SesionTerapia.horasalida != None,
             )
         ),
@@ -441,14 +432,10 @@ def _paciente_tiene_atencion_en_consultorio(
     if consultorioid is None:
         return False
 
-    query = (
-        db.query(SesionTerapia.id)
-        .join(Usuario, Usuario.id == SesionTerapia.terapeutaid)
-        .filter(
-            SesionTerapia.pacienteid == pacienteid,
-            Usuario.consultorioid == consultorioid,
-            SesionTerapia.horasalida != None,
-        )
+    query = db.query(SesionTerapia.id).filter(
+        SesionTerapia.pacienteid == pacienteid,
+        SesionTerapia.consultorioid == consultorioid,
+        SesionTerapia.horasalida != None,
     )
 
     if tratamientopacienteid is not None:
@@ -501,6 +488,7 @@ def _validar_paciente(
     current_user: Usuario,
     tratamientopacienteid: Optional[int] = None,
     permitir_atencion_compartida: bool = False,
+    permitir_cualquier_consultorio: bool = False,
 ) -> Paciente:
     paciente = db.query(Paciente).filter(Paciente.id == pacienteid).first()
 
@@ -509,6 +497,13 @@ def _validar_paciente(
             status_code=404,
             detail="Paciente no encontrado",
         )
+
+    if permitir_cualquier_consultorio and current_user.rol == 1:
+        # Puente explícito de "Compartir saldo a favor" entre sucursales:
+        # el secretario puede elegir como destino a un paciente de otra
+        # sede. No reemplaza ningún otro control de acceso a pacientes;
+        # solo aplica dentro de compartir_pago.
+        return paciente
 
     try:
         validar_acceso_paciente_por_rol(paciente, current_user)
@@ -1810,6 +1805,16 @@ def listar_cuentas_tratamientos(
     solo_transferencias_pendientes: bool = Query(default=False),
     consultorioid: Optional[int] = Query(default=None),
     terapeuta_sesion_id: Optional[int] = Query(default=None),
+    todas_las_sucursales: bool = Query(
+        default=False,
+        description=(
+            "Si es True, un secretario puede ver/buscar cuentas de "
+            "cualquier sucursal, no solo la propia. Pensado únicamente "
+            "para elegir el destino al compartir saldo a favor entre "
+            "sucursales; no se usa en las pantallas normales de cuentas "
+            "por cobrar."
+        ),
+    ),
     db: Session = Depends(get_db),
     current_user: Usuario = Depends(get_current_user),
 ):
@@ -1830,18 +1835,28 @@ def listar_cuentas_tratamientos(
         )
 
     elif current_user.rol == 1:
-        validar_consultorio_secretario(
-            current_user,
-            current_user.consultorioid,
-        )
+        validar_secretario_tiene_consultorio(current_user)
 
-        consultorio_operativo_id = current_user.consultorioid
-
-        query = query.filter(
-            _tratamiento_visible_para_consultorio_filter(
-                current_user.consultorioid
+        if todas_las_sucursales:
+            # Puente explícito para "Compartir saldo a favor" entre
+            # sucursales: se omite el filtro de consultorio a propósito.
+            # El commit real (compartir_pago) sigue auditado con
+            # pago_origen_id/motivo_comparticion, y el resto de pantallas
+            # de cuentas por cobrar no pasan este parámetro.
+            pass
+        else:
+            validar_consultorio_secretario(
+                current_user,
+                current_user.consultorioid,
             )
-        )
+
+            consultorio_operativo_id = current_user.consultorioid
+
+            query = query.filter(
+                _tratamiento_visible_para_consultorio_filter(
+                    current_user.consultorioid
+                )
+            )
 
     elif current_user.rol == 3:
         # Jefe:
@@ -1964,6 +1979,12 @@ def listar_cuentas_tratamientos(
     #   del Centro.
     # - Terapeuta: cuenta solo sus propias sesiones.
     # - Jefe sin filtro: cuenta todo.
+    #
+    # OJO: esto es intencional. Cada sede debe ver SU PROPIA deuda/saldo
+    # de este tratamiento, aunque sea el mismo tratamientopacienteid
+    # atendido en varias sucursales. El puente entre sedes es explícito,
+    # a través de "Compartir saldo a favor" (compartir_pago) — nunca un
+    # cálculo automático que fusione ambas vistas.
     # ============================================================
 
     sesiones_query = (
@@ -1984,17 +2005,8 @@ def listar_cuentas_tratamientos(
         )
 
     elif consultorio_operativo_id is not None:
-        TerapeutaSesion = aliased(Usuario)
-
-        sesiones_query = (
-            sesiones_query
-            .join(
-                TerapeutaSesion,
-                TerapeutaSesion.id == SesionTerapia.terapeutaid,
-            )
-            .filter(
-                TerapeutaSesion.consultorioid == consultorio_operativo_id
-            )
+        sesiones_query = sesiones_query.filter(
+            SesionTerapia.consultorioid == consultorio_operativo_id
         )
 
     sesiones_rows = (
@@ -2010,12 +2022,21 @@ def listar_cuentas_tratamientos(
 
     # ============================================================
     # PAGOS
-    # Se filtran por la sucursal que registró/cobró el pago.
+    # El AGREGADO (lo que decide si la cuenta está pagada o debe) se filtra
+    # por consultorioid_aplicacion: a qué sucursal le sirve ese pago para
+    # saldar SU deuda de este tratamiento. Para un pago normal, esto es la
+    # misma sucursal de quien lo cobró (se setea así al crearlo). Para un
+    # pago compartido entre sucursales (compartir_pago), es la sucursal
+    # DESTINO elegida al compartir — no la que cobró el efectivo. Por eso
+    # ya NO se necesita el join contra Usuario/creado_por_id aquí: cada
+    # sede ve su propia deuda, y "compartir saldo a favor" es el único
+    # puente explícito entre sedes (nunca un cálculo automático que las
+    # fusione).
     #
-    # Nota:
-    # Esta es la mejor solución con tu estructura actual.
-    # Lo ideal más adelante sería agregar Pago.consultorioid_cobro
-    # para no depender de creado_por_id.
+    # El DETALLE (lista de pagos que se muestra, con sus botones de
+    # Anular/Reasignar) sí se sigue filtrando por quién cobró
+    # (creado_por_id): cada secretaria solo debe poder anular/reasignar
+    # pagos que su propia sucursal cobró, no los de otra sede.
     # ============================================================
 
     pago_no_anulado = or_(Pago.anulado == False, Pago.anulado.is_(None))
@@ -2106,25 +2127,18 @@ def listar_cuentas_tratamientos(
         .filter(Pago.tratamientopacienteid.in_(tratamiento_ids))
     )
 
+    if consultorio_operativo_id is not None:
+        pagos_agregados_query = pagos_agregados_query.filter(
+            Pago.consultorioid_aplicacion == consultorio_operativo_id
+        )
+
     pagos_detalle_query = (
         db.query(Pago)
         .filter(Pago.tratamientopacienteid.in_(tratamiento_ids))
     )
 
     if consultorio_operativo_id is not None:
-        CobradorAgregado = aliased(Usuario)
         CobradorDetalle = aliased(Usuario)
-
-        pagos_agregados_query = (
-            pagos_agregados_query
-            .join(
-                CobradorAgregado,
-                CobradorAgregado.id == Pago.creado_por_id,
-            )
-            .filter(
-                CobradorAgregado.consultorioid == consultorio_operativo_id
-            )
-        )
 
         pagos_detalle_query = (
             pagos_detalle_query
@@ -2242,6 +2256,7 @@ def listar_cuentas_tratamientos(
                 tratamientopacienteid=tratamiento.id,
                 pacienteid=paciente.id,
                 paciente=f"{paciente.nombres} {paciente.apellidos}",
+                consultorioid_paciente=paciente.consultorioid,
                 terapeuta_sesionid=(
                     terapeuta_sesion_filtro.id
                     if terapeuta_sesion_filtro is not None
@@ -2337,6 +2352,14 @@ def listar_cuentas_gimnasio(
     offset: int = Query(default=0, ge=0),
     buscar: Optional[str] = Query(default=None),
     solo_transferencias_pendientes: bool = Query(default=False),
+    todas_las_sucursales: bool = Query(
+        default=False,
+        description=(
+            "Si es True, un secretario puede ver/buscar membresías de "
+            "cualquier sucursal. Solo para elegir destino al compartir "
+            "saldo a favor entre sucursales."
+        ),
+    ),
     db: Session = Depends(get_db),
     current_user: Usuario = Depends(get_current_user),
 ):
@@ -2359,11 +2382,20 @@ def listar_cuentas_gimnasio(
         query = query.filter(responsable_gimnasio_expr == current_user.id)
 
     elif current_user.rol == 1:
-        validar_consultorio_secretario(
-            current_user,
-            current_user.consultorioid,
-        )
-        query = query.filter(consultorio_gimnasio_expr == current_user.consultorioid)
+        validar_secretario_tiene_consultorio(current_user)
+
+        if todas_las_sucursales:
+            # Mismo puente explícito que en listar_cuentas_tratamientos:
+            # solo para el flujo de "Compartir saldo a favor".
+            pass
+        else:
+            validar_consultorio_secretario(
+                current_user,
+                current_user.consultorioid,
+            )
+            query = query.filter(
+                consultorio_gimnasio_expr == current_user.consultorioid
+            )
 
     elif current_user.rol == 3:
         pass
@@ -2478,6 +2510,7 @@ def listar_cuentas_gimnasio(
                 membresiagimnasioid=membresia.id,
                 pacienteid=paciente.id,
                 paciente=f"{paciente.nombres} {paciente.apellidos}",
+                consultorioid_paciente=paciente.consultorioid,
                 fechainicio=membresia.fechainicio,
                 diascontratados=int(membresia.diascontratados or 20),
                 precio=precio,
@@ -2581,6 +2614,7 @@ def registrar_pago_previo_tratamiento(
         espagoprevio=True,
         fechapagoreal=data.fechapagoreal,
         observacionpagoprevio=observacion,
+        consultorioid_aplicacion=current_user.consultorioid,
     )
 
     db.add(nuevo_pago)
@@ -2651,6 +2685,7 @@ def registrar_pago_previo_gimnasio(
         espagoprevio=True,
         fechapagoreal=data.fechapagoreal,
         observacionpagoprevio=observacion,
+        consultorioid_aplicacion=current_user.consultorioid,
     )
 
     db.add(nuevo_pago)
@@ -2734,6 +2769,7 @@ def registrar_recuperacion_cartera(
         esrecuperacioncartera=True,
         fechapagoreal=data.fechapagoreal,
         observacion_cartera=observacion,
+        consultorioid_aplicacion=current_user.consultorioid,
     )
 
     db.add(nuevo_pago)
@@ -2864,6 +2900,7 @@ def registrar_pago(
     data["fechapago"] = now_utc()
     data["fecha_verificacion"] = now_utc()
     data["motivo_rechazo"] = None
+    data["consultorioid_aplicacion"] = current_user.consultorioid
 
     nuevo_pago = Pago(**data)
 
@@ -3127,6 +3164,7 @@ async def registrar_transferencia_grupal(
                 fechapagoreal=None,
                 observacionpagoprevio=None,
                 observacion_cartera=None,
+                consultorioid_aplicacion=current_user_db.consultorioid,
             )
 
             db.add(pago)
@@ -3340,6 +3378,7 @@ async def registrar_pago_con_comprobante(
             fechapago=now_utc(),
             fecha_verificacion=None if estado_pago == 1 else now_utc(),
             motivo_rechazo=None,
+            consultorioid_aplicacion=current_user_db.consultorioid,
         )
 
         db.add(nuevo_pago)
@@ -3533,6 +3572,7 @@ def compartir_pago(
         current_user=current_user,
         tratamientopacienteid=data.tratamientopacienteid,
         permitir_atencion_compartida=True,
+        permitir_cualquier_consultorio=True,
     )
 
     paciente_paquete_destino = _validar_paciente_paquete(
@@ -3552,6 +3592,17 @@ def compartir_pago(
         pacienteid=data.pacienteid_destino,
         membresiagimnasioid=data.membresiagimnasioid,
     )
+
+    consultorio_destino = (
+        db.query(Consultorio)
+        .filter(Consultorio.id == data.consultorioid_destino)
+        .first()
+    )
+    if not consultorio_destino:
+        raise HTTPException(
+            status_code=404,
+            detail="La sucursal destino no existe.",
+        )
 
     # En terapias se permite saldo a favor/abono futuro; en paquetes y
     # membresías de gimnasio sí se valida para no sobrepasar el precio.
@@ -3588,7 +3639,13 @@ def compartir_pago(
         numerocomprobante=pago.numerocomprobante,
         comprobanteurl=pago.comprobanteurl,
         estadopago=pago.estadopago,
-        creado_por_id=current_user.id,
+        # OJO: se hereda el cobrador del pago ORIGINAL (quien recibió el
+        # dinero físicamente), no el usuario que ejecuta "compartir". Así,
+        # el reporte de caja (que agrupa por consultorio del cobrador,
+        # ver _aplicar_filtro_consultorio_cobrador) sigue atribuyendo este
+        # dinero a la sucursal donde de verdad entró a caja, sin importar
+        # qué secretaria haga clic en compartir ni a qué cuenta se destine.
+        creado_por_id=pago.creado_por_id,
         verificado_por_id=pago.verificado_por_id,
         fecha_verificacion=pago.fecha_verificacion,
         motivo_rechazo=None,
@@ -3601,9 +3658,18 @@ def compartir_pago(
         esrecuperacioncartera=False,
         observacion_cartera=None,
         pago_origen_id=pago.id,
+        # A diferencia de creado_por_id (que se mantiene como el cobrador
+        # original, para no inflar la caja de otra sede), esta parte del
+        # pago SÍ se acredita a la sucursal elegida como destino — es lo
+        # que hace que la cuenta de esa sucursal para este tratamiento dé
+        # como pagada, aunque sea el mismo tratamientopacienteid de otra
+        # sede.
+        consultorioid_aplicacion=consultorio_destino.id,
         motivo_comparticion=(
             f"Saldo compartido desde pago #{pago.id} de "
             f"{_nombre_paciente(paciente_origen)}"
+            f" (compartido por {_nombre_usuario(current_user)}, "
+            f"acreditado a {consultorio_destino.nombre})"
             + (f": {motivo_texto}" if motivo_texto else ".")
         ),
     )

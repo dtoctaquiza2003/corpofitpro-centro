@@ -13,6 +13,16 @@ class SesionTerapia(Base):
     terapeutaid = Column("terapeutaid", Integer, ForeignKey("usuarios.id"))
     fecha = Column("fecha", Date)
 
+    # Sede a la que pertenecía el terapeuta EN EL MOMENTO de la sesión.
+    # Se fija al crear la sesión y ya no cambia. No usar el consultorio
+    # actual del terapeuta (usuarios.consultorioid) para saber la sede de
+    # una sesión: ese campo es mutable y, si el terapeuta cambia de sede
+    # más adelante, "arrastraría" retroactivamente sus sesiones históricas
+    # a la sede nueva, descuadrando caja y deudas de la sede original.
+    consultorioid = Column(
+        "consultorioid", Integer, ForeignKey("consultorios.id"), nullable=True
+    )
+
     horaingreso = Column("horaingreso", Time)
     horasalida = Column("horasalida", Time, nullable=True)
 
@@ -76,6 +86,7 @@ class SesionTerapia(Base):
     # Alias para compatibilidad con código viejo
     paciente_id = synonym("pacienteid")
     terapeuta_id = synonym("terapeutaid")
+    consultorio_id = synonym("consultorioid")
     hora_ingreso = synonym("horaingreso")
     hora_salida = synonym("horasalida")
     escala_dolor_entrada = synonym("escaladolorentrada")
