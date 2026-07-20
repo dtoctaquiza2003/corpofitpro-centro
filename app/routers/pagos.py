@@ -2586,6 +2586,8 @@ def registrar_pago_previo_tratamiento(
         db=db,
         pacienteid=data.pacienteid,
         current_user=current_user,
+        tratamientopacienteid=data.tratamientopacienteid,
+        permitir_atencion_compartida=True,
     )
 
     _validar_tratamiento_paciente(
@@ -2651,6 +2653,7 @@ def registrar_pago_previo_gimnasio(
         db=db,
         pacienteid=data.pacienteid,
         current_user=current_user,
+        permitir_atencion_compartida=True,
     )
 
     membresia = _validar_membresia_gimnasio(
@@ -2728,6 +2731,7 @@ def registrar_recuperacion_cartera(
         db=db,
         pacienteid=data.pacienteid,
         current_user=current_user,
+        permitir_atencion_compartida=True,
     )
 
     metodo = (data.metodopago or "").strip()
