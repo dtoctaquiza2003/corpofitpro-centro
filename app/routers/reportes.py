@@ -1645,16 +1645,13 @@ def _deuda_acumulada_reporte(
             pacientes=[],
         )
 
-    CobradorPago = aliased(Usuario)
-
     pagos_rows = (
         db.query(
             Pago.pacienteid,
             Pago.tratamientopacienteid,
-            CobradorPago.consultorioid,
+            Pago.consultorioid_aplicacion,
             func.coalesce(func.sum(Pago.monto), 0),
         )
-        .outerjoin(CobradorPago, CobradorPago.id == Pago.creado_por_id)
         .filter(
             Pago.tratamientopacienteid.in_(tratamiento_ids),
             Pago.estadopago == 2,
@@ -1665,19 +1662,21 @@ def _deuda_acumulada_reporte(
                 fecha_pago_ecuador_expr() <= hasta,
             ),
         )
-        .group_by(Pago.pacienteid, Pago.tratamientopacienteid, CobradorPago.consultorioid)
+        .group_by(Pago.pacienteid, Pago.tratamientopacienteid, Pago.consultorioid_aplicacion)
         .all()
     )
 
-    # FIFO por sede: un pago solo cubre sesiones atendidas en la misma sede
-    # donde se cobró (consultorio del usuario que registró el pago). Esto
-    # evita que un pago cobrado en Centro tape deuda de sesiones atendidas
-    # en Atahualpa cuando el paciente es compartido entre sedes.
+    # FIFO por sede: un pago solo cubre sesiones atendidas en la sede a la
+    # que quedó acreditado (Pago.consultorioid_aplicacion), NO la sede
+    # actual del usuario que lo cobró. Un pago compartido entre sedes vía
+    # "compartir_pago"/"reasignar_pago" mueve consultorioid_aplicacion al
+    # destino sin cambiar quién lo cobró originalmente, así que ese pago
+    # sí debe cubrir las sesiones de la sede destino.
     disponible_por_tratamiento: Dict[Tuple[int, int, Optional[int]], float] = {}
-    for paciente_id, tratamiento_id, consultorio_cobro, total in pagos_rows:
+    for paciente_id, tratamiento_id, consultorio_aplicacion, total in pagos_rows:
         if paciente_id is None or tratamiento_id is None:
             continue
-        key = (int(paciente_id), int(tratamiento_id), consultorio_cobro)
+        key = (int(paciente_id), int(tratamiento_id), consultorio_aplicacion)
         disponible_por_tratamiento[key] = (
             disponible_por_tratamiento.get(key, 0.0) + float(total or 0)
         )
@@ -3727,16 +3726,13 @@ def _pendiente_semana_detalle(
         for s in sesiones_filtradas
     }
 
-    CobradorPago = aliased(Usuario)
-
     pagos_rows = (
         db.query(
             Pago.pacienteid,
             Pago.tratamientopacienteid,
-            CobradorPago.consultorioid,
+            Pago.consultorioid_aplicacion,
             func.coalesce(func.sum(Pago.monto), 0),
         )
-        .outerjoin(CobradorPago, CobradorPago.id == Pago.creado_por_id)
         .filter(
             Pago.pacienteid.in_(paciente_ids),
             Pago.tratamientopacienteid.in_(tratamiento_ids),
@@ -3748,21 +3744,26 @@ def _pendiente_semana_detalle(
                 fecha_pago_ecuador_expr() <= hasta,
             ),
         )
-        .group_by(Pago.pacienteid, Pago.tratamientopacienteid, CobradorPago.consultorioid)
+        .group_by(Pago.pacienteid, Pago.tratamientopacienteid, Pago.consultorioid_aplicacion)
         .all()
     )
 
-    # FIFO por sede: un pago solo cubre sesiones atendidas en la misma sede
-    # donde se cobró (consultorio del usuario que registró el pago). Esto
-    # evita que un pago cobrado en Centro tape deuda de sesiones atendidas
-    # en Atahualpa cuando el paciente es compartido entre sedes.
+    # FIFO por sede: un pago solo cubre sesiones atendidas en la sede a la
+    # que quedó acreditado (Pago.consultorioid_aplicacion), NO la sede
+    # actual del usuario que lo cobró (creado_por_id es mutable y además
+    # un pago compartido entre sedes vía "compartir_pago"/"reasignar_pago"
+    # mueve consultorioid_aplicacion al destino sin cambiar quién lo cobró
+    # originalmente). Esto evita que un pago acreditado en Centro tape
+    # deuda de sesiones atendidas en Atahualpa cuando el paciente es
+    # compartido entre sedes, y asegura que un pago compartido SÍ cubra
+    # las sesiones de la sede destino.
     disponible_por_clave: Dict[Tuple[int, int, Optional[int]], float] = {}
-    for paciente_id, tratamiento_id, consultorio_cobro, total in pagos_rows:
+    for paciente_id, tratamiento_id, consultorio_aplicacion, total in pagos_rows:
         if paciente_id is None or tratamiento_id is None:
             continue
         if (int(paciente_id), int(tratamiento_id)) not in claves_visibles:
             continue
-        key = (int(paciente_id), int(tratamiento_id), consultorio_cobro)
+        key = (int(paciente_id), int(tratamiento_id), consultorio_aplicacion)
         disponible_por_clave[key] = disponible_por_clave.get(key, 0.0) + float(total or 0)
 
     # --------------------------------------------------------------
@@ -3777,10 +3778,9 @@ def _pendiente_semana_detalle(
         db.query(
             Pago.pacienteid,
             Pago.tratamientopacienteid,
-            CobradorPago.consultorioid,
+            Pago.consultorioid_aplicacion,
             func.coalesce(func.sum(Pago.monto), 0),
         )
-        .outerjoin(CobradorPago, CobradorPago.id == Pago.creado_por_id)
         .filter(
             Pago.pacienteid.in_(paciente_ids),
             Pago.tratamientopacienteid.in_(tratamiento_ids),
@@ -3792,17 +3792,17 @@ def _pendiente_semana_detalle(
                 fecha_pago_ecuador_expr() <= hoy,
             ),
         )
-        .group_by(Pago.pacienteid, Pago.tratamientopacienteid, CobradorPago.consultorioid)
+        .group_by(Pago.pacienteid, Pago.tratamientopacienteid, Pago.consultorioid_aplicacion)
         .all()
     )
 
     disponible_por_clave_hoy: Dict[Tuple[int, int, Optional[int]], float] = {}
-    for paciente_id, tratamiento_id, consultorio_cobro, total in pagos_rows_hoy:
+    for paciente_id, tratamiento_id, consultorio_aplicacion, total in pagos_rows_hoy:
         if paciente_id is None or tratamiento_id is None:
             continue
         if (int(paciente_id), int(tratamiento_id)) not in claves_visibles:
             continue
-        key = (int(paciente_id), int(tratamiento_id), consultorio_cobro)
+        key = (int(paciente_id), int(tratamiento_id), consultorio_aplicacion)
         disponible_por_clave_hoy[key] = disponible_por_clave_hoy.get(key, 0.0) + float(total or 0)
 
     # Pagos concretos que "aparecieron" después de hasta (los que explican la

@@ -776,6 +776,7 @@ def _calcular_saldo_favor_destino(
     tratamientopacienteid: Optional[int] = None,
     pacientepaqueteid: Optional[int] = None,
     membresiagimnasioid: Optional[int] = None,
+    consultorioid: Optional[int] = None,
 ) -> float:
     """
     Calcula cuánto saldo a favor (pagado_verificado - total_generado) tiene
@@ -783,6 +784,16 @@ def _calcular_saldo_favor_destino(
     "compartir" con otra terapia, paquete o membresía sin descubrir la
     cuenta original. Misma fórmula que usan los endpoints de cuenta de
     tratamiento/paquete/gimnasio (saldo_favor).
+
+    Cuando se indica `consultorioid` (la sucursal a la que hoy está
+    acreditado el pago que se quiere compartir), el cálculo se acota a esa
+    sede: sesiones solo si se atendieron ahí (SesionTerapia.consultorioid)
+    y pagos solo si se acreditaron ahí (Pago.consultorioid_aplicacion).
+    Sin esto, en un tratamiento de un paciente compartido entre sedes, una
+    sesión todavía sin pagar en la sede DESTINO —justo la deuda que se
+    quiere cancelar al compartir— resta del "generado" global y hace
+    desaparecer un saldo a favor que sí existe, íntegro, en la sede
+    ORIGEN.
     """
 
     if tratamientopacienteid is not None:
@@ -795,15 +806,17 @@ def _calcular_saldo_favor_destino(
         if tratamiento is None:
             return 0.0
 
-        sesiones_realizadas = (
-            db.query(func.count(SesionTerapia.id))
-            .filter(
-                SesionTerapia.tratamientopacienteid == tratamientopacienteid,
-                SesionTerapia.horasalida != None,
-            )
-            .scalar()
-            or 0
+        sesiones_query = db.query(func.count(SesionTerapia.id)).filter(
+            SesionTerapia.tratamientopacienteid == tratamientopacienteid,
+            SesionTerapia.horasalida != None,
         )
+
+        if consultorioid is not None:
+            sesiones_query = sesiones_query.filter(
+                SesionTerapia.consultorioid == consultorioid
+            )
+
+        sesiones_realizadas = sesiones_query.scalar() or 0
 
         precio_aplicado = (
             float(tratamiento.precio_sesion_aplicado)
@@ -813,16 +826,18 @@ def _calcular_saldo_favor_destino(
 
         total_generado = float(sesiones_realizadas) * precio_aplicado
 
-        pagado_verificado = (
-            db.query(func.coalesce(func.sum(Pago.monto), 0))
-            .filter(
-                Pago.tratamientopacienteid == tratamientopacienteid,
-                Pago.estadopago == 2,
-                Pago.anulado == False,
-            )
-            .scalar()
-            or 0
+        pagado_query = db.query(func.coalesce(func.sum(Pago.monto), 0)).filter(
+            Pago.tratamientopacienteid == tratamientopacienteid,
+            Pago.estadopago == 2,
+            Pago.anulado == False,
         )
+
+        if consultorioid is not None:
+            pagado_query = pagado_query.filter(
+                Pago.consultorioid_aplicacion == consultorioid
+            )
+
+        pagado_verificado = pagado_query.scalar() or 0
 
         return max(float(pagado_verificado) - total_generado, 0.0)
 
@@ -836,16 +851,18 @@ def _calcular_saldo_favor_destino(
         if paciente_paquete is None:
             return 0.0
 
-        pagado_verificado = (
-            db.query(func.coalesce(func.sum(Pago.monto), 0))
-            .filter(
-                Pago.pacientepaqueteid == pacientepaqueteid,
-                Pago.estadopago == 2,
-                Pago.anulado == False,
-            )
-            .scalar()
-            or 0
+        pagado_query = db.query(func.coalesce(func.sum(Pago.monto), 0)).filter(
+            Pago.pacientepaqueteid == pacientepaqueteid,
+            Pago.estadopago == 2,
+            Pago.anulado == False,
         )
+
+        if consultorioid is not None:
+            pagado_query = pagado_query.filter(
+                Pago.consultorioid_aplicacion == consultorioid
+            )
+
+        pagado_verificado = pagado_query.scalar() or 0
 
         precio_final = float(paciente_paquete.preciofinal or 0)
         return max(float(pagado_verificado) - precio_final, 0.0)
@@ -860,16 +877,18 @@ def _calcular_saldo_favor_destino(
         if membresia is None:
             return 0.0
 
-        pagado_verificado = (
-            db.query(func.coalesce(func.sum(Pago.monto), 0))
-            .filter(
-                Pago.membresiagimnasioid == membresiagimnasioid,
-                Pago.estadopago == 2,
-                Pago.anulado == False,
-            )
-            .scalar()
-            or 0
+        pagado_query = db.query(func.coalesce(func.sum(Pago.monto), 0)).filter(
+            Pago.membresiagimnasioid == membresiagimnasioid,
+            Pago.estadopago == 2,
+            Pago.anulado == False,
         )
+
+        if consultorioid is not None:
+            pagado_query = pagado_query.filter(
+                Pago.consultorioid_aplicacion == consultorioid
+            )
+
+        pagado_verificado = pagado_query.scalar() or 0
 
         precio = float(membresia.precio or 0)
         return max(float(pagado_verificado) - precio, 0.0)
@@ -2820,6 +2839,69 @@ def obtener_url_comprobante(
 
 
 # ============================================================
+# SALDO A FAVOR DE UN PAGO ESPECÍFICO
+# Usado por el botón "Compartir saldo a favor" en cada pago
+# (no en la cuenta completa) para que el número que ve la
+# secretaria sea siempre el que compartir_pago va a aceptar.
+# ============================================================
+
+@router.get("/{pago_id}/saldo-favor")
+def obtener_saldo_favor_pago(
+    pago_id: int,
+    db: Session = Depends(get_db),
+    current_user: Usuario = Depends(get_current_secretary),
+):
+    """
+    Saldo a favor real y compartible de UN pago puntual.
+
+    Antes, la pantalla mostraba el saldo a favor de la CUENTA completa
+    (pagado_verificado - total_generado) pegado a un pago cualquiera
+    elegido casi al azar (el primer pago verificado no-previo). Eso
+    producía el caso real: "dice que tengo $60 disponibles, pero al
+    compartir dice que tengo $0" — porque el pago mostrado no era el
+    que realmente tenía el excedente, o el excedente vivía acreditado
+    en otra sucursal.
+
+    Este endpoint calcula exactamente lo mismo que valida
+    `compartir_pago` para ESTE pago: el saldo a favor de su tratamiento/
+    paquete/membresía, acotado a la sucursal a la que este pago está
+    acreditado (`consultorioid_aplicacion`), y nunca mayor a su propio
+    monto. Así el número que ve la secretaria siempre coincide con lo
+    que el backend va a aceptar al compartir.
+    """
+    pago, _ = _obtener_pago_con_acceso(
+        db=db,
+        pago_id=pago_id,
+        current_user=current_user,
+    )
+
+    if (
+        pago.anulado
+        or pago.estadopago != 2
+        or bool(getattr(pago, "esrecuperacioncartera", False))
+    ):
+        return {"pago_id": pago_id, "saldo_favor": 0.0}
+
+    saldo_favor_cuenta = _calcular_saldo_favor_destino(
+        db=db,
+        tratamientopacienteid=pago.tratamientopacienteid,
+        pacientepaqueteid=pago.pacientepaqueteid,
+        membresiagimnasioid=pago.membresiagimnasioid,
+        consultorioid=pago.consultorioid_aplicacion,
+    )
+
+    # El límite real que aplicará compartir_pago: nunca más que el
+    # propio monto de este pago, aunque la cuenta/sede tenga más saldo
+    # a favor repartido en otros pagos.
+    saldo_favor_pago = min(saldo_favor_cuenta, float(pago.monto or 0))
+
+    return {
+        "pago_id": pago_id,
+        "saldo_favor": round(max(saldo_favor_pago, 0.0), 2),
+    }
+
+
+# ============================================================
 # REGISTRAR PAGO SIN COMPROBANTE
 # Efectivo / Tarjeta => verificado automáticamente
 # ============================================================
@@ -3537,22 +3619,31 @@ def compartir_pago(
         )
 
     monto_compartir = round(float(data.monto), 2)
+    monto_pago_actual = round(float(pago.monto), 2)
 
-    if monto_compartir >= round(float(pago.monto), 2):
+    if monto_compartir > monto_pago_actual + 0.01:
         raise HTTPException(
             status_code=400,
             detail=(
-                "El monto a compartir debe ser menor al monto total del pago. "
-                "Si quiere mover el pago completo a otra cuenta, use la opción "
-                "de reasignar."
+                "El monto a compartir no puede superar el monto de este "
+                f"pago (${monto_pago_actual:.2f})."
             ),
         )
+
+    # Si el monto a compartir cubre el pago completo, no es un error: se
+    # traspasa el registro entero al destino (ver más abajo), en vez de
+    # dejar un pago en $0.00 y crear uno nuevo idéntico al lado. A
+    # diferencia de "Reasignar pago" (que no recibe sucursal destino ni
+    # toca consultorioid_aplicacion), esta vía sí deja acreditado el pago
+    # a la sucursal elegida, que es indispensable al compartir entre sedes.
+    es_comparticion_total = monto_compartir >= monto_pago_actual - 0.01
 
     saldo_favor_actual = _calcular_saldo_favor_destino(
         db=db,
         tratamientopacienteid=pago.tratamientopacienteid,
         pacientepaqueteid=pago.pacientepaqueteid,
         membresiagimnasioid=pago.membresiagimnasioid,
+        consultorioid=pago.consultorioid_aplicacion,
     )
 
     if monto_compartir > saldo_favor_actual + 0.01:
@@ -3623,6 +3714,31 @@ def compartir_pago(
     )
 
     motivo_texto = (data.motivo or "").strip()[:500] or None
+
+    if es_comparticion_total:
+        # Se comparte el 100% de este pago puntual: se traspasa el mismo
+        # registro completo al destino (paciente/tratamiento/paquete/
+        # membresía + consultorioid_aplicacion). El monto, método,
+        # comprobante, fecha de caja, cobrador y verificador no se tocan:
+        # sigue siendo el mismo dinero, solo cambia a qué cuenta y
+        # sucursal se acredita para el cálculo de deuda.
+        pago.pacienteid = data.pacienteid_destino
+        pago.pacientepaqueteid = data.pacientepaqueteid
+        pago.tratamientopacienteid = data.tratamientopacienteid
+        pago.membresiagimnasioid = data.membresiagimnasioid
+        pago.consultorioid_aplicacion = consultorio_destino.id
+        pago.motivo_comparticion = (
+            f"Pago completo movido de {_nombre_paciente(paciente_origen)} a "
+            f"{_nombre_paciente(paciente_destino)} (compartido por "
+            f"{_nombre_usuario(current_user)}, acreditado a "
+            f"{consultorio_destino.nombre})"
+            + (f": {motivo_texto}" if motivo_texto else ".")
+        )
+
+        db.commit()
+        db.refresh(pago)
+
+        return PagoCompartirResponse(pago_original=pago, pago_nuevo=pago)
 
     # Reduce el pago original: sigue cubriendo su cuenta, solo que por menos.
     pago.monto = round(float(pago.monto) - monto_compartir, 2)
