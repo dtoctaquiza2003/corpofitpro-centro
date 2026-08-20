@@ -2654,6 +2654,8 @@ def registrar_pago_previo_tratamiento(
 # REGISTRAR PAGO PREVIO DE GIMNASIO
 # ============================================================
 
+
+
 @router.post(
     "/pago-previo-gimnasio",
     response_model=PagoOut,
