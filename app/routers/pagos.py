@@ -506,7 +506,7 @@ def _validar_paciente(
         return paciente
 
     try:
-        validar_acceso_paciente_por_rol(paciente, current_user)
+        validar_acceso_paciente_por_rol(paciente, current_user, db=db)
         return paciente
     except HTTPException as exc:
         # Pacientes compartidos:
@@ -3187,10 +3187,22 @@ async def registrar_transferencia_grupal(
     db.rollback()
     db.close()
 
-    comprobante_path = await subir_comprobante_pago(
-        comprobante,
-        primer_paciente_id,
-    )
+    try:
+        comprobante_path = await subir_comprobante_pago(
+            comprobante,
+            primer_paciente_id,
+        )
+    except HTTPException as exc:
+        if exc.status_code == 503:
+            print(
+                "Aviso: no se pudo subir el comprobante a Supabase Storage "
+                f"(paciente {primer_paciente_id}); se registran los pagos "
+                "sin la foto. Detalle:",
+                exc.detail,
+            )
+            comprobante_path = None
+        else:
+            raise
 
     try:
         current_user_db = (
@@ -3390,10 +3402,29 @@ async def registrar_pago_con_comprobante(
                 detail="Debe subir la foto del comprobante.",
             )
 
-        comprobante_path = await subir_comprobante_pago(
-            comprobante,
-            pacienteid,
-        )
+        try:
+            comprobante_path = await subir_comprobante_pago(
+                comprobante,
+                pacienteid,
+            )
+        except HTTPException as exc:
+            if exc.status_code == 503:
+                # El almacenamiento (Supabase) no está disponible (por
+                # ejemplo, cuota de egress excedida). No bloqueamos el
+                # registro del pago por esto: se guarda sin la foto del
+                # comprobante, y el número de comprobante que escribió la
+                # secretaria queda como respaldo. La foto se puede volver
+                # a subir más adelante cuando el almacenamiento se
+                # restablezca.
+                print(
+                    "Aviso: no se pudo subir el comprobante a Supabase "
+                    f"Storage (paciente {pacienteid}); se registra el pago "
+                    "sin la foto. Detalle:",
+                    exc.detail,
+                )
+                comprobante_path = None
+            else:
+                raise
 
         estado_pago = 1
 
