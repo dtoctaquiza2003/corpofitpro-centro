@@ -97,14 +97,28 @@ async def subir_comprobante_pago(
         f"comprobante_{fecha}_{uuid4().hex}.{extension}"
     )
 
-    supabase.storage.from_(settings.SUPABASE_BUCKET_COMPROBANTES).upload(
-        path=path,
-        file=contenido,
-        file_options={
-            "content-type": archivo.content_type,
-            "upsert": "false",
-        },
-    )
+    try:
+        supabase.storage.from_(settings.SUPABASE_BUCKET_COMPROBANTES).upload(
+            path=path,
+            file=contenido,
+            file_options={
+                "content-type": archivo.content_type,
+                "upsert": "false",
+            },
+        )
+    except Exception as exc:
+        # Supabase Storage puede fallar con errores que NO son HTTPException
+        # (402 por cuota excedida, caídas, timeouts, o el KeyError interno de
+        # storage3 al parsear el error). Los convertimos a 503 para que el
+        # router pueda registrar el pago sin la foto.
+        print(
+            "Error subiendo comprobante a Supabase Storage "
+            f"(paciente {paciente_id}): {type(exc).__name__}: {exc}"
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="El almacenamiento de comprobantes no está disponible.",
+        )
 
     return path
 
